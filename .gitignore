@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+
+# Config (user-specific, has device indices)
+# config.json is in AppData, not tracked here
+
+# Large media files
+*.mp4
+*.mp3
+*.wav
+*.m4a
+
+# Claude
+.claude/
