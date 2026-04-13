@@ -48,15 +48,16 @@ DEFAULT_CONFIG = {
     "hotkey": "ctrl+space",
     "beam_size": 3,
     "start_minimized": True,
-    "paste_mode": "auto_paste",  # "clipboard_only", "auto_paste", "direct_type"
+    "paste_mode": "auto_paste",  # "auto_paste" or "clipboard_only"
     "play_sound": True,
     "cpu_threads": 16,
     "input_device_index": None,  # None = default system microphone
+    "loopback_device_index": None,  # None = default output device, or specific WASAPI loopback index
     "recording_mode": "hold",  # "hold" = hold-to-record, "toggle" = press-to-start/press-to-stop
     "recording_source": "microphone",  # "microphone", "stereo_mix", "both"
     "engine": "faster_whisper",  # "faster_whisper" or "openvino"
     "openvino_device": "GPU",  # "CPU", "GPU", "NPU"
-    "streaming_mode": "preview",  # "off", "preview" (overlay only), "live_dictation" (types in real-time)
+    "streaming_mode": "preview",  # "preview" = transcribe while recording (always on)
 }
 
 
@@ -102,6 +103,36 @@ def list_input_devices():
     return devices
 
 
+def list_loopback_devices():
+    """Return a list of (device_index, name) for available WASAPI loopback output devices.
+
+    Each entry represents an output device whose audio can be captured via loopback.
+    """
+    devices = []
+    try:
+        import pyaudiowpatch as pyaudio
+        pa = pyaudio.PyAudio()
+        try:
+            seen_names = set()
+            for loopback in pa.get_loopback_device_info_generator():
+                name = str(loopback.get("name", "")).strip()
+                # Remove "[Loopback]" suffix for cleaner display
+                clean_name = name.replace("[Loopback]", "").strip()
+                if not clean_name:
+                    continue
+                if clean_name in seen_names:
+                    continue
+                seen_names.add(clean_name)
+                devices.append((int(loopback["index"]), clean_name))
+        finally:
+            pa.terminate()
+    except ImportError:
+        log.warning("pyaudiowpatch not installed - cannot list loopback devices")
+    except Exception as e:
+        log.error("Failed to list loopback devices: %s", e)
+    return devices
+
+
 def resample_audio(audio, orig_rate, target_rate):
     """Resample audio from orig_rate to target_rate using linear interpolation."""
     if orig_rate == target_rate or len(audio) == 0:
@@ -142,11 +173,16 @@ MODELS = {
     "ivrit-ai/whisper-large-v3-ct2": "Hebrew Large (best Hebrew)",
     # English-optimized
     "distil-large-v3": "English Distil ⭐ (fast + accurate)",
-    # General OpenAI models
-    "small": "General Small (fastest)",
-    "medium": "General Medium (balanced)",
-    "large-v3": "General Large-v3 (best general)",
-    "large-v3-turbo": "General Large-v3 Turbo",
+    # General OpenAI model
+    "large-v3-turbo": "General Turbo (fast, all languages)",
+}
+
+# Auto-detect language from model
+MODEL_LANGUAGE = {
+    "ivrit-ai/whisper-large-v3-turbo-ct2": "he",
+    "ivrit-ai/whisper-large-v3-ct2": "he",
+    "distil-large-v3": "en",
+    "large-v3-turbo": "auto",
 }
 
 
@@ -242,7 +278,7 @@ class AudioRecorder:
 class LoopbackRecorder:
     """Record system audio via WASAPI loopback (captures Teams, Zoom, etc.)."""
 
-    def __init__(self):
+    def __init__(self, loopback_device_index=None):
         self.is_recording = False
         self.audio_data = []
         self._stream = None
@@ -250,6 +286,7 @@ class LoopbackRecorder:
         self._device_info = None
         self._native_rate = None
         self._channels = 1
+        self._loopback_device_index = loopback_device_index
 
     @staticmethod
     def is_available():
@@ -261,8 +298,12 @@ class LoopbackRecorder:
             return False
 
     @staticmethod
-    def find_loopback_device():
-        """Find the WASAPI loopback device for the default output (speakers/headphones).
+    def find_loopback_device(device_index=None):
+        """Find a WASAPI loopback device.
+
+        Args:
+            device_index: If provided, use this specific loopback device index.
+                          If None, find the loopback for the default output device.
 
         Returns a device info dict or None.
         """
@@ -270,16 +311,28 @@ class LoopbackRecorder:
             import pyaudiowpatch as pyaudio
             pa = pyaudio.PyAudio()
             try:
+                # If a specific loopback device was requested, use it directly
+                if device_index is not None:
+                    try:
+                        device = pa.get_device_info_by_index(device_index)
+                        if device.get("isLoopbackDevice"):
+                            return device
+                        # device_index might be the output device, find its loopback
+                        for loopback in pa.get_loopback_device_info_generator():
+                            if device["name"] in loopback["name"]:
+                                return loopback
+                    except Exception as e:
+                        log.warning("Configured loopback device %d not found: %s, falling back to default", device_index, e)
+
+                # Default: find loopback for the system default output
                 wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
                 default_speakers = pa.get_device_info_by_index(
                     wasapi_info["defaultOutputDevice"]
                 )
 
-                # If the default output already is a loopback device, use it
                 if default_speakers.get("isLoopbackDevice"):
                     return default_speakers
 
-                # Otherwise, find the loopback counterpart
                 for loopback in pa.get_loopback_device_info_generator():
                     if default_speakers["name"] in loopback["name"]:
                         return loopback
@@ -296,7 +349,7 @@ class LoopbackRecorder:
         self.is_recording = True
         self._pa = pyaudio.PyAudio()
 
-        device = self.find_loopback_device()
+        device = self.find_loopback_device(device_index=self._loopback_device_index)
         if device is None:
             raise RuntimeError("No WASAPI loopback device found")
 
@@ -465,12 +518,12 @@ class FasterWhisperTranscriber(BaseTranscriber):
                 self._batched_model = False  # sentinel: tried and failed
 
         common_kwargs = dict(
-            beam_size=1,
+            beam_size=5,
             language=lang,
-            condition_on_previous_text=False,
+            condition_on_previous_text=True,
             vad_filter=True,
             vad_parameters=dict(
-                min_silence_duration_ms=1000,
+                min_silence_duration_ms=500,
             ),
         )
 
@@ -636,10 +689,10 @@ def output_text(text, mode="auto_paste"):
 
     else:  # "auto_paste" (default)
         # Copy to clipboard and simulate Ctrl+V
-        import pyautogui
+        import keyboard as kb
         pyperclip.copy(text)
         time.sleep(0.05)
-        pyautogui.hotkey("ctrl", "v")
+        kb.send('ctrl+v')
         log.info("Pasted via Ctrl+V")
 
 
@@ -757,7 +810,7 @@ class OverlayNotification:
 
     def _fade_out(self):
         """Gradually fade out the overlay."""
-        if not self._root or not self._visible:
+        if not self._root or not self._visible or self._waveform_mode:
             return
         try:
             current = self._root.attributes('-alpha')
@@ -865,9 +918,13 @@ class WhisperTypeApp:
         )
         # Loopback recorder for system audio (WASAPI loopback)
         if LoopbackRecorder.is_available():
-            loopback_info = LoopbackRecorder.find_loopback_device()
+            loopback_info = LoopbackRecorder.find_loopback_device(
+                device_index=self.config.get("loopback_device_index")
+            )
             if loopback_info:
-                self._loopback_recorder = LoopbackRecorder()
+                self._loopback_recorder = LoopbackRecorder(
+                    loopback_device_index=self.config.get("loopback_device_index")
+                )
                 self._loopback_device_name = loopback_info.get("name", "System Audio")
                 log.info("WASAPI loopback available: %s", self._loopback_device_name)
             else:
@@ -929,17 +986,6 @@ class WhisperTypeApp:
             pystray.MenuItem("Status: Loading...", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Language",
-                pystray.Menu(
-                    pystray.MenuItem("Auto Detect", lambda: self._set_language("auto"),
-                                    checked=lambda item: self.config["language"] == "auto"),
-                    pystray.MenuItem("Hebrew", lambda: self._set_language("he"),
-                                    checked=lambda item: self.config["language"] == "he"),
-                    pystray.MenuItem("English", lambda: self._set_language("en"),
-                                    checked=lambda item: self.config["language"] == "en"),
-                ),
-            ),
-            pystray.MenuItem(
                 "Microphone",
                 pystray.Menu(self._build_microphone_menu),
             ),
@@ -948,49 +994,14 @@ class WhisperTypeApp:
                 pystray.Menu(self._build_model_menu),
             ),
             pystray.MenuItem(
-                "Engine",
-                pystray.Menu(
-                    pystray.MenuItem(
-                        "faster-whisper (CPU)",
-                        lambda: self._set_engine("faster_whisper"),
-                        checked=lambda item: self.config.get("engine", "faster_whisper") == "faster_whisper",
-                        radio=True,
-                    ),
-                    pystray.MenuItem(
-                        "OpenVINO (Intel GPU)",
-                        lambda: self._set_engine("openvino", "GPU"),
-                        checked=lambda item: (self.config.get("engine") == "openvino"
-                                              and self.config.get("openvino_device") == "GPU"),
-                        radio=True,
-                        enabled=OpenVINOTranscriber.is_available(),
-                    ),
-                    pystray.MenuItem(
-                        "OpenVINO (Intel NPU)",
-                        lambda: self._set_engine("openvino", "NPU"),
-                        checked=lambda item: (self.config.get("engine") == "openvino"
-                                              and self.config.get("openvino_device") == "NPU"),
-                        radio=True,
-                        enabled=OpenVINOTranscriber.is_available(),
-                    ),
-                    pystray.MenuItem(
-                        "OpenVINO (CPU)",
-                        lambda: self._set_engine("openvino", "CPU"),
-                        checked=lambda item: (self.config.get("engine") == "openvino"
-                                              and self.config.get("openvino_device") == "CPU"),
-                        radio=True,
-                        enabled=OpenVINOTranscriber.is_available(),
-                    ),
-                ),
-            ),
-            pystray.MenuItem(
                 "After Recording",
                 pystray.Menu(
                     pystray.MenuItem("Auto-Paste (Ctrl+V)", lambda: self._set_paste_mode("auto_paste"),
-                                    checked=lambda item: self.config["paste_mode"] == "auto_paste"),
+                                    checked=lambda item: self.config["paste_mode"] == "auto_paste",
+                                    radio=True),
                     pystray.MenuItem("Clipboard Only", lambda: self._set_paste_mode("clipboard_only"),
-                                    checked=lambda item: self.config["paste_mode"] == "clipboard_only"),
-                    pystray.MenuItem("Direct Type", lambda: self._set_paste_mode("direct_type"),
-                                    checked=lambda item: self.config["paste_mode"] == "direct_type"),
+                                    checked=lambda item: self.config["paste_mode"] == "clipboard_only",
+                                    radio=True),
                 ),
             ),
             pystray.MenuItem(
@@ -1024,17 +1035,11 @@ class WhisperTypeApp:
                         radio=True,
                         enabled=self._loopback_recorder is not None,
                     ),
-                ),
-            ),
-            pystray.MenuItem(
-                "Background Processing",
-                pystray.Menu(
-                    pystray.MenuItem("Off (transcribe after stop)", lambda: self._set_streaming_mode("off"),
-                                    checked=lambda item: self.config.get("streaming_mode", "preview") == "off",
-                                    radio=True),
-                    pystray.MenuItem("On (transcribe while recording)", lambda: self._set_streaming_mode("preview"),
-                                    checked=lambda item: self.config.get("streaming_mode", "preview") == "preview",
-                                    radio=True),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem(
+                        "System Audio Device",
+                        pystray.Menu(lambda: self._build_loopback_device_menu()),
+                    ),
                 ),
             ),
             pystray.Menu.SEPARATOR,
@@ -1199,27 +1204,45 @@ class WhisperTypeApp:
     def _waveform_updater(self):
         """Update the waveform visualization with real-time audio levels."""
         NUM_BARS = OverlayNotification.NUM_BARS
+        # Give overlay a moment to initialize on first recording
+        time.sleep(0.3)
 
         while self.is_recording:
             try:
                 source = self.config.get("recording_source", "microphone")
-                if source == "stereo_mix" and self._loopback_recorder:
-                    recorder = self._loopback_recorder
+
+                # Get mic samples
+                mic_samples = np.array([], dtype=np.float32)
+                if source in ("microphone", "both") and self.recorder.audio_data:
+                    chunks = list(self.recorder.audio_data[-4:])
+                    if chunks:
+                        raw = b"".join(chunks)
+                        mic_samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+                # Get loopback samples
+                loopback_samples = np.array([], dtype=np.float32)
+                if source in ("stereo_mix", "both") and self._loopback_recorder and self._loopback_recorder.audio_data:
+                    chunks = list(self._loopback_recorder.audio_data[-4:])
+                    if chunks:
+                        raw = b"".join(chunks)
+                        lb = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                        # Multi-channel to mono
+                        channels = getattr(self._loopback_recorder, '_channels', 1)
+                        if channels > 1:
+                            lb = lb.reshape(-1, channels).mean(axis=1)
+                        loopback_samples = lb
+
+                # Combine: use whichever is louder at each point
+                if len(mic_samples) > 0 and len(loopback_samples) > 0:
+                    min_len = min(len(mic_samples), len(loopback_samples))
+                    samples = np.maximum(np.abs(mic_samples[-min_len:]), np.abs(loopback_samples[-min_len:]))
+                elif len(loopback_samples) > 0:
+                    samples = np.abs(loopback_samples)
+                elif len(mic_samples) > 0:
+                    samples = np.abs(mic_samples)
                 else:
-                    recorder = self.recorder
-
-                if not recorder.audio_data:
                     time.sleep(0.05)
                     continue
-
-                # Get the last few chunks (~200ms of audio)
-                chunks = list(recorder.audio_data[-4:])
-                if not chunks:
-                    time.sleep(0.05)
-                    continue
-
-                raw = b"".join(chunks)
-                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
                 if len(samples) < NUM_BARS:
                     time.sleep(0.05)
@@ -1230,13 +1253,19 @@ class WhisperTypeApp:
                 levels = []
                 for i in range(NUM_BARS):
                     seg = samples[i * seg_size:(i + 1) * seg_size]
-                    peak = float(np.max(np.abs(seg)))
-                    level = min(1.0, peak * 3.5)  # amplify for visibility
+                    rms = float(np.sqrt(np.mean(seg ** 2)))
+                    # Log scale: makes low volume visible while capping loud
+                    if rms > 1e-6:
+                        db = 20 * np.log10(rms + 1e-10)
+                        # Map -60dB..0dB to 0..1
+                        level = max(0.0, min(1.0, (db + 60) / 55))
+                    else:
+                        level = 0.0
                     levels.append(level)
 
                 self.overlay.update_waveform(levels)
-            except Exception:
-                pass
+            except Exception as e:
+                log.error("Waveform updater error: %s", e)
 
             time.sleep(0.05)  # ~20 FPS
 
@@ -1247,9 +1276,9 @@ class WhisperTypeApp:
         In 'live_dictation' mode: types new text into the active window in real-time.
         """
         streaming_mode = self.config.get("streaming_mode", "preview")
-        INTERVAL = 1.0        # check every second
-        MIN_NEW_SECONDS = 3   # wait for 3 seconds of NEW audio before transcribing a chunk
-        MIN_NEW_SAMPLES = 16000 * MIN_NEW_SECONDS
+        INTERVAL = 0.5        # check every half second
+        MIN_NEW_SECONDS = 1.5 # wait for 1.5 seconds of NEW audio before transcribing a chunk
+        MIN_NEW_SAMPLES = int(16000 * MIN_NEW_SECONDS)
 
         # For live dictation: track where we left off so we only transcribe NEW audio
         last_transcribed_pos = 0
@@ -1294,7 +1323,7 @@ class WhisperTypeApp:
                     with self._transcribe_lock:
                         chunk_text = self.transcriber.transcribe(
                             chunk_audio,
-                            language=self.config["language"],
+                            language=self._get_language(),
                             beam_size=1,
                         )
 
@@ -1320,8 +1349,12 @@ class WhisperTypeApp:
 
                 else:
                     # ---- PREVIEW MODE: transcribe ALL audio, show in overlay only ----
-                    if total_samples < 16000:
+                    if total_samples < 80000:  # 5 seconds - don't stream short recordings
                         continue
+
+                    # Don't start a new transcription if stop was requested
+                    if self._streaming_stop_event.is_set():
+                        break
 
                     audio_np = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -1336,7 +1369,7 @@ class WhisperTypeApp:
                     with self._transcribe_lock:
                         text = self.transcriber.transcribe(
                             audio_np,
-                            language=self.config["language"],
+                            language=self._get_language(),
                             beam_size=1,
                         )
 
@@ -1357,12 +1390,12 @@ class WhisperTypeApp:
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("processing")
 
-        # Stop streaming worker first
+        # Stop streaming worker - wait for it to finish so we can use its result
         self._streaming_stop_event.set()
         if self._streaming_thread and self._streaming_thread.is_alive():
-            self._streaming_thread.join(timeout=2.0)
+            self._streaming_thread.join(timeout=5.0)
 
-        # Capture streaming results before stopping recorders
+        # Capture streaming results AFTER thread finished (so partial is up-to-date)
         last_partial = self._last_partial_text
         last_snapshot_samples = self._last_snapshot_sample_count
         last_dictated = getattr(self, '_last_dictated_text', "")
@@ -1386,6 +1419,13 @@ class WhisperTypeApp:
                 self.tray_icon.icon = self._create_icon("idle")
             return
 
+        duration_sec = len(audio) / 16000
+        # Short recordings: skip streaming partial, do single fast transcription
+        if duration_sec < 5:
+            last_partial = ""
+            last_snapshot_samples = 0
+            log.info("Short recording (%.1fs), direct transcription with beam_size=1", duration_sec)
+
         # Transcribe in background to not block
         def do_transcribe():
             try:
@@ -1398,7 +1438,7 @@ class WhisperTypeApp:
                             with self._transcribe_lock:
                                 tail_text = self.transcriber.transcribe(
                                     tail_audio,
-                                    language=self.config["language"],
+                                    language=self._get_language(),
                                     beam_size=self.config["beam_size"],
                                 )
                             if tail_text:
@@ -1412,7 +1452,7 @@ class WhisperTypeApp:
                         with self._transcribe_lock:
                             text = self.transcriber.transcribe(
                                 audio,
-                                language=self.config["language"],
+                                language=self._get_language(),
                                 beam_size=self.config["beam_size"],
                             )
                         if text:
@@ -1425,19 +1465,21 @@ class WhisperTypeApp:
                     return
 
                 # Standard mode (preview or off)
-                if last_partial and last_snapshot_samples > 0:
+                # When source="both", streaming only sees mic audio (not the mix),
+                # so always do full re-transcription on the mixed audio.
+                if last_partial and last_snapshot_samples > 0 and source != "both":
                     # Partial exists from background streaming.
                     # Transcribe only the tail, combine, paste ONCE.
                     text = last_partial
 
-                    if len(audio) > last_snapshot_samples and source != "both":
+                    if len(audio) > last_snapshot_samples:
                         tail_audio = audio[last_snapshot_samples:]
                         if len(tail_audio) >= 1600:
                             log.info("Transcribing tail (%d samples)...", len(tail_audio))
                             with self._transcribe_lock:
                                 tail_text = self.transcriber.transcribe(
                                     tail_audio,
-                                    language=self.config["language"],
+                                    language=self._get_language(),
                                     beam_size=self.config["beam_size"],
                                 )
                             if tail_text:
@@ -1465,11 +1507,14 @@ class WhisperTypeApp:
                         self.overlay.show_error("No speech detected")
                 else:
                     # --- NO PARTIAL: full transcription (short recording or streaming=off) ---
+                    # Use beam_size=1 for short audio (<5s) for speed
+                    duration_sec = len(audio) / 16000
+                    beam = 1 if duration_sec < 5 else self.config["beam_size"]
                     with self._transcribe_lock:
                         text = self.transcriber.transcribe(
                             audio,
-                            language=self.config["language"],
-                            beam_size=self.config["beam_size"],
+                            language=self._get_language(),
+                            beam_size=beam,
                         )
 
                     if text:
@@ -1556,6 +1601,12 @@ class WhisperTypeApp:
 
         threading.Thread(target=do_pick_and_transcribe, daemon=True).start()
 
+    def _get_language(self):
+        """Get language based on selected model."""
+        model = self.config.get("model_size", "")
+        lang = MODEL_LANGUAGE.get(model, "auto")
+        return None if lang == "auto" else lang
+
     def _set_language(self, lang):
         self.config["language"] = lang
         save_config(self.config)
@@ -1623,6 +1674,55 @@ class WhisperTypeApp:
         save_config(self.config)
         labels = {"microphone": "Microphone", "stereo_mix": "Stereo Mix", "both": "Both (Mic + Stereo Mix)"}
         log.info("Recording source set to: %s", labels.get(source, source))
+
+    def _build_loopback_device_menu(self):
+        """Dynamically build the loopback output device selection submenu."""
+        import pystray
+
+        items = [
+            pystray.MenuItem(
+                "System Default",
+                lambda: self._set_loopback_device(None),
+                checked=lambda item: self.config.get("loopback_device_index") is None,
+                radio=True,
+            ),
+            pystray.Menu.SEPARATOR,
+        ]
+
+        devices = list_loopback_devices()
+        if not devices:
+            items.append(pystray.MenuItem("(no loopback devices found)", None, enabled=False))
+        else:
+            for idx, name in devices:
+                display_name = name if len(name) <= 40 else name[:37] + "..."
+                items.append(
+                    pystray.MenuItem(
+                        display_name,
+                        (lambda i: lambda: self._set_loopback_device(i))(idx),
+                        checked=(lambda i: lambda item: self.config.get("loopback_device_index") == i)(idx),
+                        radio=True,
+                    )
+                )
+        return items
+
+    def _set_loopback_device(self, device_index):
+        self.config["loopback_device_index"] = device_index
+        save_config(self.config)
+        # Reinitialize loopback recorder with the new device
+        if LoopbackRecorder.is_available():
+            loopback_info = LoopbackRecorder.find_loopback_device(device_index=device_index)
+            if loopback_info:
+                self._loopback_recorder = LoopbackRecorder(loopback_device_index=device_index)
+                self._loopback_device_name = loopback_info.get("name", "System Audio")
+                log.info("Loopback device set to: %s", self._loopback_device_name)
+            else:
+                self._loopback_recorder = None
+                self._loopback_device_name = None
+                log.warning("Selected loopback device not found")
+        if device_index is None:
+            log.info("Loopback device set to: System Default")
+        else:
+            log.info("Loopback device set to index: %s", device_index)
 
     def _set_streaming_mode(self, mode):
         self.config["streaming_mode"] = mode
