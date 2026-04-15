@@ -1446,44 +1446,12 @@ class WhisperTypeApp:
             pystray.MenuItem("Status: Loading...", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Microphone",
-                pystray.Menu(self._build_microphone_menu),
+                "Audio Input",
+                pystray.Menu(self._build_audio_input_menu),
             ),
             pystray.MenuItem(
                 "Model",
                 pystray.Menu(self._build_model_menu),
-            ),
-            pystray.MenuItem(
-                "Recording Source",
-                pystray.Menu(
-                    pystray.MenuItem("Microphone Only", lambda: self._set_recording_source("microphone"),
-                                    checked=lambda item: self.config.get("recording_source", "microphone") == "microphone",
-                                    radio=True),
-                    pystray.MenuItem(
-                        "System Audio Only",
-                        lambda: self._set_recording_source("stereo_mix"),
-                        checked=lambda item: self.config.get("recording_source") == "stereo_mix",
-                        radio=True,
-                        enabled=self._loopback_recorder is not None,
-                    ),
-                    pystray.MenuItem(
-                        "Both (Mic + System Audio)",
-                        lambda: self._set_recording_source("both"),
-                        checked=lambda item: self.config.get("recording_source") == "both",
-                        radio=True,
-                        enabled=self._loopback_recorder is not None,
-                    ),
-                    pystray.Menu.SEPARATOR,
-                    pystray.MenuItem(
-                        "System Audio Device",
-                        pystray.Menu(lambda: self._build_loopback_device_menu()),
-                    ),
-                ),
-            ),
-            pystray.MenuItem(
-                "Translate to English",
-                lambda: self._toggle_translate_mode(),
-                checked=lambda item: self.config.get("translate_mode", False),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
@@ -2157,37 +2125,111 @@ class WhisperTypeApp:
         save_config(self.config)
         log.info("Language set to: %s", lang)
 
-    def _build_microphone_menu(self):
-        """Dynamically build the microphone selection submenu."""
+    def _build_audio_input_menu(self):
+        """Unified Audio Input menu: mic + system audio devices as toggleable checkboxes.
+
+        Logic:
+        - Only one mic can be checked (checking another unchecks the first)
+        - Only one system audio device can be checked (same rule)
+        - Clicking an already-checked device unchecks it (disables that category)
+        - The recording_source is derived:
+            mic only       → 'microphone'
+            loopback only  → 'stereo_mix'
+            both checked   → 'both'
+        - You cannot uncheck both — at least one must remain.
+        """
         import pystray
 
-        items = [
-            pystray.MenuItem(
-                "System Default",
-                lambda: self._set_input_device(None),
-                checked=lambda item: self.config.get("input_device_index") is None,
-                radio=True,
-            ),
-            pystray.Menu.SEPARATOR,
-        ]
+        items = [pystray.MenuItem("— Microphones —", None, enabled=False)]
 
-        devices = list_input_devices()
-        if not devices:
-            items.append(pystray.MenuItem("(no devices found)", None, enabled=False))
-        else:
-            for idx, name in devices:
-                # Truncate long names for the menu
-                display_name = name if len(name) <= 40 else name[:37] + "..."
-                label = f"{display_name}"
-                items.append(
-                    pystray.MenuItem(
-                        label,
-                        (lambda i: lambda: self._set_input_device(i))(idx),
-                        checked=(lambda i: lambda item: self.config.get("input_device_index") == i)(idx),
-                        radio=True,
-                    )
-                )
+        mic_devices = [(None, "System Default")] + list_input_devices()
+        for idx, name in mic_devices:
+            display = name if len(name) <= 40 else name[:37] + "..."
+            items.append(pystray.MenuItem(
+                display,
+                (lambda i: lambda: self._toggle_mic_device(i))(idx),
+                checked=(lambda i: lambda item:
+                         self.config.get("recording_source", "microphone") in ("microphone", "both")
+                         and self.config.get("input_device_index") == i)(idx),
+            ))
+
+        # System Audio section (only if WASAPI loopback is available)
+        if LoopbackRecorder.is_available():
+            items.append(pystray.Menu.SEPARATOR)
+            items.append(pystray.MenuItem("— System Audio —", None, enabled=False))
+
+            loop_devices = [(None, "System Default")] + list_loopback_devices()
+            for idx, name in loop_devices:
+                display = name if len(name) <= 40 else name[:37] + "..."
+                items.append(pystray.MenuItem(
+                    display,
+                    (lambda i: lambda: self._toggle_loopback_device(i))(idx),
+                    checked=(lambda i: lambda item:
+                             self.config.get("recording_source") in ("stereo_mix", "both")
+                             and self.config.get("loopback_device_index") == i)(idx),
+                ))
+
         return items
+
+    def _toggle_mic_device(self, device_idx):
+        """Click handler for a mic device: toggle if same, switch if different."""
+        source = self.config.get("recording_source", "microphone")
+        current_idx = self.config.get("input_device_index")
+        mic_on = source in ("microphone", "both")
+
+        if mic_on and current_idx == device_idx:
+            # Uncheck → disable mic category
+            if source == "both":
+                self.config["recording_source"] = "stereo_mix"
+            else:
+                # mic-only; disabling would leave no source
+                self.overlay.show_error("Must keep at least one audio input")
+                return
+        else:
+            # Check this mic (either a new device or re-enabling mic)
+            self.config["input_device_index"] = device_idx
+            try:
+                self.recorder.input_device_index = device_idx
+            except Exception:
+                pass
+            if source == "stereo_mix":
+                self.config["recording_source"] = "both"
+            elif not mic_on:
+                self.config["recording_source"] = "microphone"
+            # else already 'microphone' or 'both'; just swapped the device
+        save_config(self.config)
+        log.info("Audio input changed: source=%s, mic_idx=%s, loop_idx=%s",
+                 self.config["recording_source"],
+                 self.config.get("input_device_index"),
+                 self.config.get("loopback_device_index"))
+
+    def _toggle_loopback_device(self, device_idx):
+        """Click handler for a system audio device: toggle if same, switch if different."""
+        source = self.config.get("recording_source", "microphone")
+        current_idx = self.config.get("loopback_device_index")
+        loop_on = source in ("stereo_mix", "both")
+
+        if loop_on and current_idx == device_idx:
+            # Uncheck → disable system audio category
+            if source == "both":
+                self.config["recording_source"] = "microphone"
+            else:
+                # stereo_mix only; disabling leaves no source
+                self.overlay.show_error("Must keep at least one audio input")
+                return
+            save_config(self.config)
+        else:
+            # Check this loopback (changes device; _set_loopback_device also saves)
+            self._set_loopback_device(device_idx)
+            if source == "microphone":
+                self.config["recording_source"] = "both"
+            elif not loop_on:
+                self.config["recording_source"] = "stereo_mix"
+            save_config(self.config)
+        log.info("Audio input changed: source=%s, mic_idx=%s, loop_idx=%s",
+                 self.config["recording_source"],
+                 self.config.get("input_device_index"),
+                 self.config.get("loopback_device_index"))
 
     def _set_input_device(self, device_index):
         self.config["input_device_index"] = device_index
@@ -2275,35 +2317,38 @@ class WhisperTypeApp:
         labels = {"off": "Off", "preview": "Preview", "live_dictation": "Live Dictation"}
         log.info("Streaming mode set to: %s", labels.get(mode, mode))
 
-    # Simplified model menu: (label, model_size, backend)
+    # Model menu: (label, model_size, backend, translate)
     # model_size for Groq is the local fallback model that also determines the language hint.
     _MENU_MODELS = [
-        ("Hebrew Turbo", "ivrit-ai/whisper-large-v3-turbo-ct2", "local"),
-        ("English Distil", "distil-large-v3", "local"),
-        ("General Turbo", "large-v3-turbo", "local"),
-        ("Groq Turbo", "large-v3-turbo", "groq"),
+        ("Hebrew Turbo Local", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False),
+        ("English Distil Local", "distil-large-v3", "local", False),
+        ("General Turbo Local", "large-v3-turbo", "local", False),
+        ("Groq Turbo", "large-v3-turbo", "groq", False),
+        ("Groq Hebrew to English", "large-v3-turbo", "groq", True),
     ]
 
     def _build_model_menu(self):
-        """Build the 4-option Model menu: Hebrew Turbo / English Distil / General Turbo / Groq Turbo."""
+        """Build the Model menu with 5 options including 'Groq Hebrew to English'."""
         import pystray
         return [
             pystray.MenuItem(
                 label,
-                (lambda m, b: lambda: self._set_model_and_backend(m, b))(model_id, backend),
-                checked=(lambda m, b: lambda item:
+                (lambda m, b, t: lambda: self._set_model_backend_translate(m, b, t))(model_id, backend, translate),
+                checked=(lambda m, b, t: lambda item:
                          self.config.get("model_size") == m
-                         and self.config.get("transcription_backend", "local") == b)(model_id, backend),
+                         and self.config.get("transcription_backend", "local") == b
+                         and bool(self.config.get("translate_mode", False)) == t)(model_id, backend, translate),
                 radio=True,
             )
-            for label, model_id, backend in self._MENU_MODELS
+            for label, model_id, backend, translate in self._MENU_MODELS
         ]
 
-    def _set_model_and_backend(self, model, backend):
-        """Set both model and backend atomically from the unified Model menu."""
+    def _set_model_backend_translate(self, model, backend, translate):
+        """Set model, backend, and translate mode atomically from the unified Model menu."""
         current_model = self.config.get("model_size")
         current_backend = self.config.get("transcription_backend", "local")
-        if current_model == model and current_backend == backend:
+        current_translate = bool(self.config.get("translate_mode", False))
+        if current_model == model and current_backend == backend and current_translate == translate:
             return
         # Switching to Groq: make sure we have an API key first
         if backend == "groq":
@@ -2313,6 +2358,11 @@ class WhisperTypeApp:
                 self.overlay.show_error("Set Groq API key first")
                 self._set_groq_api_key()
                 return
+        # Update translate mode
+        if current_translate != translate:
+            self.config["translate_mode"] = translate
+            save_config(self.config)
+            log.info("Translate mode: %s", "ON" if translate else "OFF")
         # Update model (always, for both fallback and language hint)
         if current_model != model:
             self._set_model(model)
