@@ -66,6 +66,7 @@ DEFAULT_CONFIG = {
     "groq_model": "whisper-large-v3-turbo",  # Groq Whisper model
     "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
     "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
+    "groq_he_en_bias": True,  # True = bias Groq language detection to Hebrew/English only (prevents false French/etc. detection)
 }
 
 
@@ -791,9 +792,19 @@ class GroqTranscriber(BaseTranscriber):
     TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
     TRANSLATE_URL = "https://api.groq.com/openai/v1/audio/translations"
 
+    # Bilingual prompt sent to Whisper when language is auto-detect.
+    # Whisper uses the prompt as context, which biases language detection
+    # toward Hebrew + English and away from look-alikes (French, Russian, etc.).
+    HE_EN_BIAS_PROMPT = (
+        "Bilingual transcription in Hebrew or English only. "
+        "שלום, תודה רבה, איך הולך, מחשב, פגישה. "
+        "Hello, thank you, how are you, meeting, computer, project."
+    )
+
     def __init__(self, model_size="whisper-large-v3-turbo", api_key=""):
         super().__init__(model_size=model_size, cpu_threads=0)
         self.api_key = api_key
+        self.he_en_bias = True  # Toggleable: send Hebrew/English bias prompt on auto-detect calls
 
     def load_model(self, callback=None):
         """No local model to load - just verify API key is set."""
@@ -885,12 +896,17 @@ class GroqTranscriber(BaseTranscriber):
             # Groq's /translations endpoint only supports whisper-large-v3
             # (turbo/distil don't translate). Force the right model.
             data = {"model": "whisper-large-v3", "response_format": "text"}
-            log.info("Groq translate: forcing model whisper-large-v3")
+            if self.he_en_bias:
+                data["prompt"] = self.HE_EN_BIAS_PROMPT
+            log.info("Groq translate: model=whisper-large-v3 bias=%s", self.he_en_bias)
         else:
             url = self.TRANSCRIBE_URL
             data = {"model": self.model_size, "response_format": "text"}
             if language and language != "auto":
                 data["language"] = language
+            elif self.he_en_bias:
+                # Auto-detect: bias toward Hebrew/English so it doesn't drift to French etc.
+                data["prompt"] = self.HE_EN_BIAS_PROMPT
 
         # Scale timeout with audio duration so long clips have room to process
         duration = len(audio_np) / 16000.0
@@ -932,11 +948,15 @@ class GroqTranscriber(BaseTranscriber):
                 url = self.TRANSLATE_URL
                 # Groq's /translations endpoint only supports whisper-large-v3
                 data = {"model": "whisper-large-v3", "response_format": "text"}
+                if self.he_en_bias:
+                    data["prompt"] = self.HE_EN_BIAS_PROMPT
             else:
                 url = self.TRANSCRIBE_URL
                 data = {"model": self.model_size, "response_format": "text"}
                 if language and language != "auto":
                     data["language"] = language
+                elif self.he_en_bias:
+                    data["prompt"] = self.HE_EN_BIAS_PROMPT
             return self._post(url, files, data, timeout=120)
 
 
@@ -1480,6 +1500,7 @@ class WhisperTypeApp:
                 model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
                 api_key=self.config["groq_api_key"],
             )
+            self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
 
         # Pick primary transcriber based on backend setting
         if self._groq_transcriber is not None:
@@ -1552,6 +1573,11 @@ class WhisperTypeApp:
                         "Invisible Mode",
                         lambda: self._toggle_silent_mode(),
                         checked=lambda item: bool(self.config.get("silent_mode", False)),
+                    ),
+                    pystray.MenuItem(
+                        "Bias Groq to Hebrew/English",
+                        lambda: self._toggle_he_en_bias(),
+                        checked=lambda item: bool(self.config.get("groq_he_en_bias", True)),
                     ),
                     pystray.MenuItem(
                         "Beep Output",
@@ -2583,6 +2609,17 @@ class WhisperTypeApp:
             return
         play_beep(1000, 100, device_index=device)
 
+    def _toggle_he_en_bias(self):
+        """Toggle the Hebrew/English bias prompt sent to Groq.
+        ON  = Whisper sees a bilingual hint, less likely to detect French/Spanish/etc.
+        OFF = no prompt, fastest possible response, full auto-detect over all languages."""
+        new_value = not bool(self.config.get("groq_he_en_bias", True))
+        self.config["groq_he_en_bias"] = new_value
+        save_config(self.config)
+        if self._groq_transcriber is not None:
+            self._groq_transcriber.he_en_bias = new_value
+        log.info("Groq he/en bias: %s", "ON" if new_value else "OFF")
+
     def _toggle_silent_mode(self):
         """Toggle silent mode: when ON, the overlay (waveform + status) is hidden.
         Tray icon color still changes to indicate state."""
@@ -2614,6 +2651,7 @@ class WhisperTypeApp:
                     model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
                     api_key=api_key,
                 )
+                self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
                 try:
                     self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
                 except Exception as e:
@@ -2872,6 +2910,7 @@ class WhisperTypeApp:
                         groq.load_model(callback=lambda m: log.info(m))
                     except Exception as e:
                         log.error("load_model failed: %s", e)
+                    groq.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
                     self.config["groq_api_key"] = new_key
                     self._groq_transcriber = groq
                     self.transcriber = groq
