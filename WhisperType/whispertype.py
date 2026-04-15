@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
     "transcription_backend": "local",  # "local" or "groq"
     "groq_api_key": "",  # Groq API key (from https://console.groq.com/keys)
     "groq_model": "whisper-large-v3-turbo",  # Groq Whisper model
+    "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
+    "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
 }
 
 
@@ -1113,6 +1115,7 @@ class OverlayNotification:
         self._bars = []
         self._waveform_mode = False
         self._visible = False
+        self.silent = False  # When True, all show_* methods no-op
         self._tk_queue = queue.Queue()
         self._thread = threading.Thread(target=self._run_tk, daemon=True)
         self._thread.start()
@@ -1176,6 +1179,8 @@ class OverlayNotification:
 
     def show(self, text, bg_color="#e63946", fg_color="white", duration=0):
         """Show the overlay. duration=0 means stay until hidden."""
+        if self.silent:
+            return
         def _do():
             if not self._root or not self._label:
                 return
@@ -1224,6 +1229,8 @@ class OverlayNotification:
 
     def show_waveform(self):
         """Switch overlay to waveform visualization mode."""
+        if self.silent:
+            return
         def _do():
             if not self._root or not self._canvas:
                 return
@@ -1246,6 +1253,8 @@ class OverlayNotification:
 
     def update_waveform(self, levels):
         """Update bar heights. levels: list of floats 0.0-1.0."""
+        if self.silent:
+            return
         def _do():
             if not self._canvas or not self._waveform_mode:
                 return
@@ -1330,14 +1339,81 @@ def _ensure_beep_wav():
     return path
 
 
-def play_beep(freq=800, duration_ms=150):
-    """Play beep WAV through the default audio output device."""
+def list_output_devices():
+    """Return [(index, name), ...] for available output devices on the default host API.
+
+    Filters dupes and non-output devices. Used by the Beep Output submenu.
+    """
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    devices = []
     try:
-        import winsound
-        wav = _ensure_beep_wav()
-        winsound.PlaySound(wav, winsound.SND_FILENAME)
-    except Exception:
-        pass
+        default_host = pa.get_default_host_api_info()
+        default_host_idx = default_host['index']
+        count = pa.get_device_count()
+        seen = set()
+        for i in range(count):
+            info = pa.get_device_info_by_index(i)
+            if info['maxOutputChannels'] > 0 and info['hostApi'] == default_host_idx:
+                name = info['name']
+                if name not in seen:
+                    seen.add(name)
+                    devices.append((i, name))
+    except Exception as e:
+        log.warning("list_output_devices failed: %s", e)
+    finally:
+        pa.terminate()
+    return devices
+
+
+def play_beep(freq=800, duration_ms=150, device_index=None):
+    """Play beep WAV — on a specific output device if given, else default.
+
+    device_index=None uses winsound (fast, goes to Windows default output).
+    device_index=N uses PyAudio to force a specific output device (so the user
+    can hear the beep on, say, their Jabra headset even if they record from DJI).
+    """
+    wav = _ensure_beep_wav()
+    if device_index is None:
+        try:
+            import winsound
+            winsound.PlaySound(wav, winsound.SND_FILENAME)
+        except Exception as e:
+            log.warning("winsound beep failed: %s", e)
+        return
+
+    # Play on a specific output device via PyAudio
+    try:
+        import wave as wavemod
+        import pyaudio
+        with wavemod.open(wav, 'rb') as wf:
+            data = wf.readframes(wf.getnframes())
+            sample_rate = wf.getframerate()
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+        pa = pyaudio.PyAudio()
+        try:
+            stream = pa.open(
+                format=pa.get_format_from_width(sampwidth),
+                channels=channels,
+                rate=sample_rate,
+                output=True,
+                output_device_index=device_index,
+            )
+            try:
+                stream.write(data)
+                stream.stop_stream()
+            finally:
+                stream.close()
+        finally:
+            pa.terminate()
+    except Exception as e:
+        log.warning("PyAudio beep on device %s failed: %s — falling back to default", device_index, e)
+        try:
+            import winsound
+            winsound.PlaySound(wav, winsound.SND_FILENAME)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1421,6 +1497,7 @@ class WhisperTypeApp:
         self.tray_icon = None
         self._hotkey_registered = False
         self.overlay = OverlayNotification()
+        self.overlay.silent = bool(self.config.get("silent_mode", False))
 
         # Streaming transcription state
         self._streaming_thread = None
@@ -1455,7 +1532,7 @@ class WhisperTypeApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Recording Options",
+                "Options",
                 pystray.Menu(
                     pystray.MenuItem("Hold to Record", lambda: self._set_recording_mode("hold"),
                                     checked=lambda item: self.config.get("recording_mode", "hold") == "hold",
@@ -1470,6 +1547,16 @@ class WhisperTypeApp:
                     pystray.MenuItem("Clipboard Only", lambda: self._set_paste_mode("clipboard_only"),
                                     checked=lambda item: self.config["paste_mode"] == "clipboard_only",
                                     radio=True),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem(
+                        "Invisible Mode",
+                        lambda: self._toggle_silent_mode(),
+                        checked=lambda item: bool(self.config.get("silent_mode", False)),
+                    ),
+                    pystray.MenuItem(
+                        "Beep Output",
+                        pystray.Menu(self._build_beep_output_menu),
+                    ),
                     pystray.Menu.SEPARATOR,
                     pystray.MenuItem(
                         "Transcribe File",
@@ -1920,8 +2007,7 @@ class WhisperTypeApp:
                     if total > 0:
                         add_history_entry(last_dictated, duration_sec, self.config["model_size"], source, self._get_task())
                     self.overlay.show_done(char_count=total)
-                    if self.config["play_sound"]:
-                        play_beep(1000, 100)
+                    self._play_done_beep()
                     return
 
                 # Standard mode (preview or off)
@@ -1963,8 +2049,7 @@ class WhisperTypeApp:
                         output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         self.overlay.show_done(char_count=len(display_text))
-                        if self.config["play_sound"]:
-                            play_beep(1000, 100)
+                        self._play_done_beep()
                     else:
                         self.overlay.show_error("No speech detected")
                 else:
@@ -1985,8 +2070,7 @@ class WhisperTypeApp:
                         output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         self.overlay.show_done(char_count=len(display_text))
-                        if self.config["play_sound"]:
-                            play_beep(1000, 100)
+                        self._play_done_beep()
                     else:
                         log.info("No speech detected")
                         self.overlay.show_error("No speech detected")
@@ -2048,8 +2132,7 @@ class WhisperTypeApp:
                     log.info("Transcription saved to: %s (%d chars)", out_path, len(text))
                     add_history_entry(text, 0, self.config["model_size"], "file", "transcribe")
                     self.overlay.show_done(char_count=len(text))
-                    if self.config["play_sound"]:
-                        play_beep(1000, 100)
+                    self._play_done_beep()
 
                     # Open the file in the default text editor
                     os.startfile(out_path)
@@ -2440,6 +2523,78 @@ class WhisperTypeApp:
         set_auto_start(enabled)
         self.config["auto_start"] = enabled
         save_config(self.config)
+
+    def _build_beep_output_menu(self):
+        """Submenu listing output devices for the beep sound (independent of recording)."""
+        import pystray
+        items = [
+            pystray.MenuItem(
+                "None (no beep)",
+                lambda: self._set_beep_device("off"),
+                checked=lambda item: self.config.get("beep_device_index") == "off",
+                radio=True,
+            ),
+            pystray.MenuItem(
+                "System Default",
+                lambda: self._set_beep_device(None),
+                checked=lambda item: self.config.get("beep_device_index") is None,
+                radio=True,
+            ),
+            pystray.Menu.SEPARATOR,
+        ]
+        devices = list_output_devices()
+        if not devices:
+            items.append(pystray.MenuItem("(no output devices found)", None, enabled=False))
+        else:
+            for idx, name in devices:
+                display = name if len(name) <= 40 else name[:37] + "..."
+                items.append(pystray.MenuItem(
+                    display,
+                    (lambda i: lambda: self._set_beep_device(i))(idx),
+                    checked=(lambda i: lambda item: self.config.get("beep_device_index") == i)(idx),
+                    radio=True,
+                ))
+        return items
+
+    def _set_beep_device(self, device_index):
+        """Change the output device used for the beep, then play a test beep on it.
+        device_index can be: None (System Default), "off" (no beep), or int (specific device)."""
+        self.config["beep_device_index"] = device_index
+        save_config(self.config)
+        if device_index == "off":
+            log.info("Beep output: disabled")
+            return  # No test beep when disabled
+        if device_index is None:
+            log.info("Beep output: System Default")
+        else:
+            log.info("Beep output set to device index %s", device_index)
+        # Test beep on the new device
+        threading.Thread(
+            target=lambda: play_beep(device_index=device_index),
+            daemon=True,
+        ).start()
+
+    def _play_done_beep(self):
+        """Play the 'transcription done' beep, respecting play_sound and beep_device_index='off'."""
+        if not self.config.get("play_sound", True):
+            return
+        device = self.config.get("beep_device_index")
+        if device == "off":
+            return
+        play_beep(1000, 100, device_index=device)
+
+    def _toggle_silent_mode(self):
+        """Toggle silent mode: when ON, the overlay (waveform + status) is hidden.
+        Tray icon color still changes to indicate state."""
+        new_value = not bool(self.config.get("silent_mode", False))
+        self.config["silent_mode"] = new_value
+        save_config(self.config)
+        self.overlay.silent = new_value
+        # If turning on while overlay visible, hide it immediately
+        if new_value:
+            self.overlay.hide_waveform()
+            self.overlay.hide()
+        log.info("Silent mode: %s", "ON" if new_value else "OFF")
 
     def _set_backend(self, backend):
         """Switch between local and Groq transcription backends."""
