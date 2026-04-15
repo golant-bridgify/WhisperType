@@ -93,7 +93,9 @@ Hotkey release → _stop_and_transcribe()
   "recording_mode": "hold",      // "hold" or "toggle"
   "recording_source": "both",    // "microphone", "stereo_mix", "both"
   "engine": "faster_whisper",    // only faster_whisper in UI now
-  "streaming_mode": "preview"    // always "preview" (no UI toggle)
+  "streaming_mode": "preview",   // always "preview" (no UI toggle)
+  "translate_mode": false,       // true = translate to English (Whisper task="translate")
+  "auto_start": false            // true = start with Windows (startup shortcut)
 }
 ```
 
@@ -103,7 +105,10 @@ Hotkey release → _stop_and_transcribe()
 - After Recording (Auto-Paste / Clipboard Only)
 - Recording Mode (Hold / Toggle)
 - Recording Source (Mic / System Audio / Both + System Audio Device submenu)
+- Translate to English (toggle)
 - Transcribe File (Hebrew / English)
+- History (opens viewer window)
+- Start with Windows (toggle)
 - Quit
 
 ### Models Available
@@ -144,28 +149,28 @@ MODELS = {
 4. **Loopback still shows Focusrite in log** - user set device 26, needs verification
 5. **~3.5s for short sentences** - hardware limit for local Whisper on CPU
 
-## Next Session: Planned Features
+## Changes Made in Session 3 (2026-04-13)
 
-### 1. Auto-Start with Windows
-- Add tray menu toggle "Start with Windows"
-- Create/remove shortcut in Windows Startup folder programmatically
-- Should launch the exe (or python script) with admin elevation
-- Config key: `"auto_start": false`
+1. **Translation Mode** - "Translate to English" tray toggle, passes `task="translate"` to Whisper
+2. **Auto-Start with Windows** - "Start with Windows" tray toggle, creates/removes .lnk in Startup folder via PowerShell
+3. **Transcription History** - Saves to `history.json` (max 1000 entries), dark-themed Tkinter viewer with search + click-to-copy
 
-### 2. Transcription History
-- Save every transcription to a history file (JSON or SQLite)
-- Fields: timestamp, text, duration, model, language, source (mic/loopback/both)
-- Tray menu: "History" → opens a simple viewer window
-- Consider: Tkinter window with scrollable list, search, copy-to-clipboard
+### History Implementation
+- `add_history_entry()` called after every successful transcription (recording + file)
+- Fields: timestamp, text, duration, model, source, task
 - Storage: `C:\Users\Naor\AppData\Roaming\WhisperType\history.json`
-- Keep last N entries (e.g., 1000) to prevent unlimited growth
+- Viewer: Catppuccin-dark styled Tkinter window, newest-first, search bar, click text to copy
 
-### 3. Translation Mode
-- Whisper's `task="translate"` outputs English regardless of input language
-- Add tray menu option: "Translate to English" toggle
-- When enabled: speak Hebrew → get English text
-- Config key: `"translate_mode": false`
-- Only affects live recording, not file transcription (which already has language choice)
+### Auto-Start Implementation
+- `set_auto_start()` / `is_auto_start_enabled()` — manages .lnk in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`
+- Uses PowerShell `WScript.Shell` COM to create shortcut (same approach as add_to_startup.bat)
+- Works for both .exe and .py execution modes
+
+### Translation Mode Implementation
+- `task` parameter added to `BaseTranscriber.transcribe()` and `transcribe_file()`
+- `_get_task()` helper returns "translate" or "transcribe" based on config
+- All 6 transcribe call sites updated
+- Translation output skips RTL mark (output is always English)
 
 ## Dependencies
 - faster-whisper>=1.1.0 (core transcription)

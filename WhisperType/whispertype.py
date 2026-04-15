@@ -58,6 +58,12 @@ DEFAULT_CONFIG = {
     "engine": "faster_whisper",  # "faster_whisper" or "openvino"
     "openvino_device": "GPU",  # "CPU", "GPU", "NPU"
     "streaming_mode": "preview",  # "preview" = transcribe while recording (always on)
+    "translate_mode": False,  # True = translate to English (Whisper task="translate")
+    "model_before_translate": None,  # saved model to restore when translate mode is disabled
+    "auto_start": False,  # True = start with Windows
+    "transcription_backend": "local",  # "local" or "groq"
+    "groq_api_key": "",  # Groq API key (from https://console.groq.com/keys)
+    "groq_model": "whisper-large-v3-turbo",  # Groq Whisper model
 }
 
 
@@ -166,6 +172,104 @@ def mix_audio(audio1, audio2):
     return mixed
 
 
+def trim_trailing_silence(audio_np, sample_rate=16000, threshold_db=-40, tail_ms=150):
+    """Trim silence from the end of audio to reduce Whisper end-of-clip hallucinations
+    like 'thank you' / 'תודה רבה'. Keeps `tail_ms` of trailing buffer.
+
+    Expects float32 or int16 numpy array, mono.
+    """
+    if len(audio_np) == 0:
+        return audio_np
+
+    # Convert to float32 in [-1, 1] for RMS calc
+    if audio_np.dtype == np.int16:
+        samples = audio_np.astype(np.float32) / 32768.0
+    else:
+        samples = audio_np.astype(np.float32)
+
+    window = int(0.02 * sample_rate)  # 20ms windows
+    if window < 1 or len(samples) < window:
+        return audio_np
+
+    threshold = 10 ** (threshold_db / 20.0)  # -40 dB ≈ 0.01 amplitude
+
+    # Walk back from end, looking for the last non-silent window
+    tail_samples = int(tail_ms / 1000.0 * sample_rate)
+    i = len(samples) - window
+    while i > 0:
+        rms = float(np.sqrt(np.mean(samples[i:i + window] ** 2) + 1e-12))
+        if rms > threshold:
+            cut = min(len(audio_np), i + window + tail_samples)
+            return audio_np[:cut]
+        i -= window
+
+    # Entire clip is "silence" — return as-is
+    return audio_np
+
+
+# Regex patterns for common Whisper end-of-clip hallucinations.
+# Matched at the VERY END of the text, case-insensitive for English.
+# Each pattern captures optional trailing punctuation so we strip that too.
+_HALLUCINATION_PATTERNS = [
+    # English
+    r"thank\s+you(\s+very\s+much|\s+for\s+watching|\s+for\s+listening|\s+all)?\s*[!.?,]*\s*$",
+    r"thanks(\s+for\s+watching|\s+for\s+listening|\s+a\s+lot)?\s*[!.?,]*\s*$",
+    r"bye(\s+bye)?\s*[!.?,]*\s*$",
+    r"goodbye\s*[!.?,]*\s*$",
+    r"see\s+you\s+next\s+time\s*[!.?,]*\s*$",
+    # Hebrew
+    r"תודה(\s+רבה(\s+לכם)?)?\s*[!.?,]*\s*$",
+    r"תודה\s+שצפיתם\s*[!.?,]*\s*$",
+    r"תודה\s+על\s+הצפייה\s*[!.?,]*\s*$",
+    r"להתראות\s*[!.?,]*\s*$",
+    r"בהצלחה\s*[!.?,]*\s*$",
+    r"שלום\s*[!.?,]*\s*$",
+]
+
+_HALLUCINATION_REGEXES = None
+
+
+def _get_hallucination_regexes():
+    """Lazy-compile patterns once."""
+    global _HALLUCINATION_REGEXES
+    if _HALLUCINATION_REGEXES is None:
+        import re
+        _HALLUCINATION_REGEXES = [re.compile(p, re.IGNORECASE | re.UNICODE)
+                                    for p in _HALLUCINATION_PATTERNS]
+    return _HALLUCINATION_REGEXES
+
+
+def strip_hallucinated_tail(text):
+    """Remove known trailing hallucinations from a transcription.
+
+    Aggressively strips phrases like 'thank you', 'תודה רבה', 'bye' when they
+    appear at the very end of the text (with or without preceding punctuation).
+    Applies up to 3 rounds to catch stacked hallucinations like 'thank you. bye.'.
+    """
+    if not text:
+        return text
+    import re
+    cleaned = text.rstrip()
+    regexes = _get_hallucination_regexes()
+
+    for _ in range(3):
+        found = False
+        for rx in regexes:
+            m = rx.search(cleaned)
+            if m:
+                removed = m.group(0).strip()
+                # Cut the match and trim trailing punctuation/whitespace
+                cleaned = cleaned[:m.start()]
+                cleaned = re.sub(r'[\s.!?,;:،۔؟]+$', '', cleaned)
+                log.info("Stripped hallucinated tail: %r", removed)
+                found = True
+                break
+        if not found:
+            break
+
+    return cleaned.strip()
+
+
 # Available models with display names
 MODELS = {
     # Hebrew-optimized (ivrit.ai) - recommended
@@ -173,8 +277,9 @@ MODELS = {
     "ivrit-ai/whisper-large-v3-ct2": "Hebrew Large (best Hebrew)",
     # English-optimized
     "distil-large-v3": "English Distil ⭐ (fast + accurate)",
-    # General OpenAI model
+    # General OpenAI models
     "large-v3-turbo": "General Turbo (fast, all languages)",
+    "large-v3": "General Large (best translation)",
 }
 
 # Auto-detect language from model
@@ -183,6 +288,7 @@ MODEL_LANGUAGE = {
     "ivrit-ai/whisper-large-v3-ct2": "he",
     "distil-large-v3": "en",
     "large-v3-turbo": "auto",
+    "large-v3": "auto",
 }
 
 
@@ -417,10 +523,10 @@ class BaseTranscriber:
     def load_model(self, callback=None):
         raise NotImplementedError
 
-    def transcribe(self, audio_np, language=None, beam_size=3):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
         raise NotImplementedError
 
-    def transcribe_file(self, file_path, language=None):
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
         raise NotImplementedError
 
 
@@ -454,7 +560,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
         finally:
             self._loading = False
 
-    def transcribe(self, audio_np, language=None, beam_size=5):
+    def transcribe(self, audio_np, language=None, beam_size=5, task="transcribe"):
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if len(audio_np) == 0:
@@ -465,6 +571,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
             audio_np,
             beam_size=beam_size,
             language=lang,
+            task=task,
             vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=500,
@@ -475,6 +582,15 @@ class FasterWhisperTranscriber(BaseTranscriber):
             return ""
 
         text = " ".join(seg_list)
+
+        # Strip end-of-clip hallucinations ("thank you" / "תודה רבה")
+        text = strip_hallucinated_tail(text)
+        if not text:
+            return ""
+
+        # Translation output is always English — skip RTL
+        if task == "translate":
+            return text.strip()
 
         # Detect if the text is primarily RTL (Hebrew/Arabic)
         detected_lang = info.language if info else lang
@@ -493,7 +609,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
 
         return text.strip()
 
-    def transcribe_file(self, file_path, language=None):
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
         """Transcribe an audio/video file fast.
 
         Uses BatchedInferencePipeline + aggressive speed settings:
@@ -520,6 +636,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
         common_kwargs = dict(
             beam_size=5,
             language=lang,
+            task=task,
             condition_on_previous_text=True,
             vad_filter=True,
             vad_parameters=dict(
@@ -603,7 +720,7 @@ class OpenVINOTranscriber(BaseTranscriber):
         local_dir = snapshot_download(self.model_size)
         return local_dir
 
-    def transcribe(self, audio_np, language=None, beam_size=3):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if len(audio_np) == 0:
@@ -616,6 +733,9 @@ class OpenVINOTranscriber(BaseTranscriber):
 
         if language and language != "auto":
             config.language = f"<|{language}|>"
+
+        if task == "translate":
+            config.task = "translate"
 
         # openvino-genai expects raw float32 samples at 16kHz
         result = self.model.generate(audio_np, config)
@@ -637,7 +757,7 @@ class OpenVINOTranscriber(BaseTranscriber):
 
         return text.strip()
 
-    def transcribe_file(self, file_path, language=None):
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
         """Transcribe a file using OpenVINO."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
@@ -654,7 +774,168 @@ class OpenVINOTranscriber(BaseTranscriber):
             proc = subprocess.run(cmd, capture_output=True, check=True)
             audio_np = np.frombuffer(proc.stdout, dtype=np.float32)
 
-        return self.transcribe(audio_np, language=language, beam_size=1)
+        return self.transcribe(audio_np, language=language, beam_size=1, task=task)
+
+
+# ============================================================
+# Groq Cloud Transcriber (uses Groq's Whisper API)
+# ============================================================
+class GroqTranscriber(BaseTranscriber):
+    """Cloud-based transcription using Groq's Whisper API.
+
+    Much faster than local CPU transcription thanks to Groq's LPU inference.
+    Requires an API key from https://console.groq.com/keys.
+    """
+    TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+    TRANSLATE_URL = "https://api.groq.com/openai/v1/audio/translations"
+
+    def __init__(self, model_size="whisper-large-v3-turbo", api_key=""):
+        super().__init__(model_size=model_size, cpu_threads=0)
+        self.api_key = api_key
+
+    def load_model(self, callback=None):
+        """No local model to load - just verify API key is set."""
+        if not self.api_key:
+            if callback:
+                callback("Missing Groq API key")
+            raise RuntimeError("Groq API key not set - configure via tray menu")
+        # Mark as "loaded" so the app proceeds
+        self.model = "groq_ready"
+        if callback:
+            callback("Groq ready (cloud)")
+
+    def verify_key(self, timeout=10):
+        """Lightweight check: GET /models to confirm the API key is valid.
+
+        Returns (ok: bool, message: str).
+        Uses (connect_timeout, read_timeout) tuple for reliable Windows timeout behavior.
+        """
+        if not self.api_key:
+            return False, "No API key"
+        try:
+            import requests
+        except ImportError as e:
+            return False, f"'requests' not installed: {e}"
+        try:
+            log.info("verify_key: GET /models (timeout=%s)", timeout)
+            r = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=(5, timeout),  # (connect, read) - more reliable on Windows
+            )
+            log.info("verify_key: HTTP %d", r.status_code)
+            if r.status_code == 200:
+                return True, "Key valid"
+            if r.status_code == 401:
+                return False, "Invalid API key"
+            return False, f"HTTP {r.status_code}: {r.text[:80]}"
+        except requests.exceptions.Timeout:
+            return False, "Network timeout — check internet"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"Cannot reach Groq: {type(e).__name__}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _audio_to_wav_bytes(self, audio_np):
+        """Convert numpy audio to WAV bytes (16kHz, mono, int16)."""
+        if audio_np.dtype == np.float32:
+            samples = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+        else:
+            samples = audio_np.astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(samples.tobytes())
+        buf.seek(0)
+        return buf
+
+    def _post(self, url, files, data, timeout=30):
+        """Send a POST request to Groq, return response text."""
+        import requests
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+        if response.status_code == 401:
+            raise RuntimeError("Invalid Groq API key")
+        if response.status_code == 429:
+            raise RuntimeError("Groq rate limit exceeded")
+        response.raise_for_status()
+        return response.text.strip()
+
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+        if self.model is None:
+            raise RuntimeError("Groq transcriber not initialized")
+        if len(audio_np) == 0:
+            return ""
+
+        # Trim trailing silence to reduce "thank you" / "תודה" hallucinations
+        orig_len = len(audio_np)
+        audio_np = trim_trailing_silence(audio_np, sample_rate=16000)
+        if len(audio_np) < orig_len:
+            log.info("Groq: trimmed %d samples of trailing silence", orig_len - len(audio_np))
+
+        wav_buf = self._audio_to_wav_bytes(audio_np)
+        files = {"file": ("audio.wav", wav_buf, "audio/wav")}
+
+        if task == "translate":
+            url = self.TRANSLATE_URL
+            # Groq's /translations endpoint only supports whisper-large-v3
+            # (turbo/distil don't translate). Force the right model.
+            data = {"model": "whisper-large-v3", "response_format": "text"}
+            log.info("Groq translate: forcing model whisper-large-v3")
+        else:
+            url = self.TRANSCRIBE_URL
+            data = {"model": self.model_size, "response_format": "text"}
+            if language and language != "auto":
+                data["language"] = language
+
+        # Scale timeout with audio duration so long clips have room to process
+        duration = len(audio_np) / 16000.0
+        http_timeout = max(30, int(duration * 3) + 10)  # e.g. 60s audio → 190s timeout
+
+        text = self._post(url, files, data, timeout=http_timeout)
+        if not text:
+            return ""
+
+        # Strip end-of-clip hallucinations ("thank you" / "תודה רבה")
+        text = strip_hallucinated_tail(text)
+        if not text:
+            return ""
+
+        # Translation output is always English — skip RTL
+        if task == "translate":
+            return text
+
+        # Detect RTL and prepend RTL mark (same as FasterWhisperTranscriber)
+        rtl_langs = {"he", "ar", "fa", "ur", "yi"}
+        is_rtl = language in rtl_langs if language and language != "auto" else any(
+            '\u0590' <= c <= '\u05FF' or
+            '\u0600' <= c <= '\u06FF' or
+            '\uFB1D' <= c <= '\uFDFF' or
+            '\uFE70' <= c <= '\uFEFF'
+            for c in text
+        )
+        if is_rtl:
+            text = '\u200F' + text
+        return text
+
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
+        if self.model is None:
+            raise RuntimeError("Groq transcriber not initialized")
+
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+            if task == "translate":
+                url = self.TRANSLATE_URL
+                # Groq's /translations endpoint only supports whisper-large-v3
+                data = {"model": "whisper-large-v3", "response_format": "text"}
+            else:
+                url = self.TRANSCRIBE_URL
+                data = {"model": self.model_size, "response_format": "text"}
+                if language and language != "auto":
+                    data["language"] = language
+            return self._post(url, files, data, timeout=120)
 
 
 # ============================================================
@@ -694,6 +975,124 @@ def output_text(text, mode="auto_paste"):
         time.sleep(0.05)
         kb.send('ctrl+v')
         log.info("Pasted via Ctrl+V")
+
+
+# ============================================================
+# Auto-Start (Windows Startup Shortcut)
+# ============================================================
+STARTUP_DIR = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+STARTUP_SHORTCUT = os.path.join(STARTUP_DIR, "WhisperType.lnk")
+
+
+def _get_startup_target():
+    """Return (target_path, arguments, working_dir, icon_path) for the startup shortcut.
+
+    When running as a PyInstaller .exe, target the exe directly.
+    When running from Python source, target pythonw.exe (no console) with the
+    script as the argument. This is the fix — pointing a .lnk directly at a
+    .py file just opens it in Notepad.
+    """
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    icon_path = os.path.join(script_dir, "whispertype.ico")
+
+    if getattr(sys, 'frozen', False):
+        # PyInstaller bundled exe
+        target = sys.executable
+        args = ""
+        working = os.path.dirname(target)
+    else:
+        # Running from Python source
+        script = os.path.abspath(sys.argv[0])
+        # Prefer pythonw.exe (no console window) over python.exe
+        py_dir = os.path.dirname(sys.executable)
+        pythonw = os.path.join(py_dir, "pythonw.exe")
+        target = pythonw if os.path.exists(pythonw) else sys.executable
+        args = f'"{script}"'
+        working = script_dir
+
+    return target, args, working, icon_path
+
+
+def is_auto_start_enabled():
+    """Check if the startup shortcut exists."""
+    return os.path.exists(STARTUP_SHORTCUT)
+
+
+def set_auto_start(enabled):
+    """Create or remove the Windows startup shortcut."""
+    if enabled:
+        target, args, working, icon_path = _get_startup_target()
+        # Use PowerShell to create a .lnk shortcut
+        ps_cmd = (
+            f'$ws = New-Object -ComObject WScript.Shell; '
+            f'$s = $ws.CreateShortcut("{STARTUP_SHORTCUT}"); '
+            f'$s.TargetPath = "{target}"; '
+            f'$s.Arguments = \'{args}\'; '
+            f'$s.WorkingDirectory = "{working}"; '
+            f'$s.Description = "WhisperType - Local Speech-to-Text"; '
+            f'$s.WindowStyle = 7; '
+        )
+        if os.path.exists(icon_path):
+            ps_cmd += f'$s.IconLocation = "{icon_path},0"; '
+        ps_cmd += '$s.Save()'
+
+        import subprocess
+        result = subprocess.run(["powershell", "-Command", ps_cmd],
+                                capture_output=True, text=True,
+                                creationflags=0x08000000)  # CREATE_NO_WINDOW
+        if result.returncode != 0:
+            log.error("Auto-start PowerShell failed: %s", result.stderr)
+        else:
+            log.info("Auto-start enabled: target=%s args=%s", target, args)
+    else:
+        if os.path.exists(STARTUP_SHORTCUT):
+            os.remove(STARTUP_SHORTCUT)
+            log.info("Auto-start disabled: removed %s", STARTUP_SHORTCUT)
+
+
+# ============================================================
+# Transcription History
+# ============================================================
+HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
+MAX_HISTORY = 1000
+
+
+def load_history():
+    """Load transcription history from JSON file."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def save_history(history):
+    """Save transcription history, keeping only the last MAX_HISTORY entries."""
+    history = history[-MAX_HISTORY:]
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+
+
+def add_history_entry(text, duration_sec=0, model="", source="microphone", task="transcribe"):
+    """Add a transcription entry to history."""
+    import datetime
+    clean_text = text.replace('\u200F', '').replace('\u200E', '').strip()
+    if not clean_text:
+        return
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "text": clean_text,
+        "duration": round(duration_sec, 1),
+        "model": model,
+        "source": source,
+        "task": task,
+    }
+    history = load_history()
+    history.append(entry)
+    save_history(history)
 
 
 # ============================================================
@@ -898,11 +1297,45 @@ class OverlayNotification:
 # ============================================================
 # Sound Effects
 # ============================================================
+_beep_wav_path = None
+
+
+def _ensure_beep_wav():
+    """Generate a short beep WAV file once, reuse it."""
+    global _beep_wav_path
+    if _beep_wav_path and os.path.exists(_beep_wav_path):
+        return _beep_wav_path
+    import struct
+    freq, duration_ms, volume = 500, 100, 0.3
+    sample_rate = 22050
+    n = int(sample_rate * duration_ms / 1000)
+    fade = min(n // 4, int(sample_rate * 0.015))
+    samples = []
+    for i in range(n):
+        t = i / sample_rate
+        val = volume * np.sin(2 * np.pi * freq * t)
+        if i < fade:
+            val *= i / fade
+        elif i > n - fade:
+            val *= (n - i) / fade
+        samples.append(int(val * 32767))
+    path = os.path.join(CONFIG_DIR, "beep.wav")
+    with wave.open(path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack(f'<{len(samples)}h', *samples))
+    _beep_wav_path = path
+    log.info("Beep WAV generated: %s", path)
+    return path
+
+
 def play_beep(freq=800, duration_ms=150):
-    """Play a short beep sound."""
+    """Play beep WAV through the default audio output device."""
     try:
         import winsound
-        winsound.Beep(freq, duration_ms)
+        wav = _ensure_beep_wav()
+        winsound.PlaySound(wav, winsound.SND_FILENAME)
     except Exception:
         pass
 
@@ -937,10 +1370,18 @@ class WhisperTypeApp:
             log.warning("pyaudiowpatch not installed - system audio capture unavailable. "
                         "Install with: pip install PyAudioWPatch")
 
-        # Initialize transcriber based on engine selection
+        # If translate mode is on, ensure we use a model that supports translation
+        if self.config.get("translate_mode") and self.config.get("model_size") != "large-v3":
+            if not self.config.get("model_before_translate"):
+                self.config["model_before_translate"] = self.config.get("model_size", "")
+            self.config["model_size"] = "large-v3"
+            save_config(self.config)
+            log.info("Translate mode active: switched to General Large (only large-v3 translates reliably)")
+
+        # Initialize local transcriber (always created, used as primary or fallback)
         engine = self.config.get("engine", "faster_whisper")
         if engine == "openvino" and OpenVINOTranscriber.is_available():
-            self.transcriber = OpenVINOTranscriber(
+            self._local_transcriber = OpenVINOTranscriber(
                 model_size=self.config["model_size"],
                 cpu_threads=self.config["cpu_threads"],
                 device=self.config.get("openvino_device", "GPU"),
@@ -951,10 +1392,29 @@ class WhisperTypeApp:
                             "Falling back to faster-whisper.")
                 self.config["engine"] = "faster_whisper"
                 save_config(self.config)
-            self.transcriber = FasterWhisperTranscriber(
+            self._local_transcriber = FasterWhisperTranscriber(
                 model_size=self.config["model_size"],
                 cpu_threads=self.config["cpu_threads"],
             )
+
+        # Initialize Groq transcriber if backend is groq and API key is set
+        self._groq_transcriber = None
+        if self.config.get("transcription_backend") == "groq" and self.config.get("groq_api_key"):
+            self._groq_transcriber = GroqTranscriber(
+                model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
+                api_key=self.config["groq_api_key"],
+            )
+
+        # Pick primary transcriber based on backend setting
+        if self._groq_transcriber is not None:
+            self.transcriber = self._groq_transcriber
+        else:
+            self.transcriber = self._local_transcriber
+            if self.config.get("transcription_backend") == "groq":
+                log.warning("Groq backend selected but no API key — falling back to local")
+                self.config["transcription_backend"] = "local"
+                save_config(self.config)
+
         self.is_recording = False
         self.model_loaded = False
         self.status_text = "Loading model..."
@@ -994,28 +1454,6 @@ class WhisperTypeApp:
                 pystray.Menu(self._build_model_menu),
             ),
             pystray.MenuItem(
-                "After Recording",
-                pystray.Menu(
-                    pystray.MenuItem("Auto-Paste (Ctrl+V)", lambda: self._set_paste_mode("auto_paste"),
-                                    checked=lambda item: self.config["paste_mode"] == "auto_paste",
-                                    radio=True),
-                    pystray.MenuItem("Clipboard Only", lambda: self._set_paste_mode("clipboard_only"),
-                                    checked=lambda item: self.config["paste_mode"] == "clipboard_only",
-                                    radio=True),
-                ),
-            ),
-            pystray.MenuItem(
-                "Recording Mode",
-                pystray.Menu(
-                    pystray.MenuItem("Hold to Record", lambda: self._set_recording_mode("hold"),
-                                    checked=lambda item: self.config.get("recording_mode", "hold") == "hold",
-                                    radio=True),
-                    pystray.MenuItem("Toggle (press start/stop)", lambda: self._set_recording_mode("toggle"),
-                                    checked=lambda item: self.config.get("recording_mode") == "toggle",
-                                    radio=True),
-                ),
-            ),
-            pystray.MenuItem(
                 "Recording Source",
                 pystray.Menu(
                     pystray.MenuItem("Microphone Only", lambda: self._set_recording_source("microphone"),
@@ -1042,12 +1480,44 @@ class WhisperTypeApp:
                     ),
                 ),
             ),
+            pystray.MenuItem(
+                "Translate to English",
+                lambda: self._toggle_translate_mode(),
+                checked=lambda item: self.config.get("translate_mode", False),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Transcribe File",
+                "Recording Options",
                 pystray.Menu(
-                    pystray.MenuItem("Hebrew", lambda: self._transcribe_file("he")),
-                    pystray.MenuItem("English", lambda: self._transcribe_file("en")),
+                    pystray.MenuItem("Hold to Record", lambda: self._set_recording_mode("hold"),
+                                    checked=lambda item: self.config.get("recording_mode", "hold") == "hold",
+                                    radio=True),
+                    pystray.MenuItem("Toggle (press start/stop)", lambda: self._set_recording_mode("toggle"),
+                                    checked=lambda item: self.config.get("recording_mode") == "toggle",
+                                    radio=True),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("Auto-Paste (Ctrl+V)", lambda: self._set_paste_mode("auto_paste"),
+                                    checked=lambda item: self.config["paste_mode"] == "auto_paste",
+                                    radio=True),
+                    pystray.MenuItem("Clipboard Only", lambda: self._set_paste_mode("clipboard_only"),
+                                    checked=lambda item: self.config["paste_mode"] == "clipboard_only",
+                                    radio=True),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem(
+                        "Transcribe File",
+                        pystray.Menu(
+                            pystray.MenuItem("Hebrew", lambda: self._transcribe_file("he")),
+                            pystray.MenuItem("English", lambda: self._transcribe_file("en")),
+                        ),
+                    ),
+                    pystray.MenuItem("History", lambda: self._show_history()),
+                    pystray.MenuItem("Set Groq API Key...", lambda: self._set_groq_api_key()),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem(
+                        "Start with Windows",
+                        lambda: self._toggle_auto_start(),
+                        checked=lambda item: is_auto_start_enabled(),
+                    ),
                 ),
             ),
             pystray.Menu.SEPARATOR,
@@ -1105,15 +1575,20 @@ class WhisperTypeApp:
                 self.tray_icon.icon = self._create_icon("loading")
             model_label = MODELS.get(self.config["model_size"], self.config["model_size"])
             self.overlay.show(f"  🔄  Loading: {model_label}  ", bg_color="#1e64c8")
-            self.transcriber.load_model(callback=lambda msg: log.info(msg))
+
+            # Always load local transcriber (used as primary or as fallback for Groq)
+            self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
+
+            # Validate Groq if it's the primary
+            if self._groq_transcriber is not None:
+                self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
+
             self.model_loaded = True
             self.status_text = "Ready"
             log.info("Model loaded. Ready to transcribe!")
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("idle")
             self.overlay.show_done()
-            if self.config["play_sound"]:
-                play_beep(600, 100)
         except Exception as e:
             self.status_text = f"Error: {e}"
             log.error("Failed to load model: %s", e)
@@ -1169,8 +1644,6 @@ class WhisperTypeApp:
         source_label = {"microphone": "Mic", "stereo_mix": "System Audio", "both": "Mic + System"}.get(source, "Mic")
         log.info("Recording (%s)...", source_label)
         self.overlay.show_recording()
-        if self.config["play_sound"]:
-            threading.Thread(target=lambda: play_beep(800, 100), daemon=True).start()
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("recording")
 
@@ -1183,17 +1656,25 @@ class WhisperTypeApp:
             self.recorder.start()
 
         # Start streaming transcription worker (if streaming is enabled)
+        # Skip streaming when on Groq backend — cloud round-trips during recording
+        # waste requests and cause truncation on long clips. Groq is fast enough to
+        # just do a single full transcription on stop.
         streaming_mode = self.config.get("streaming_mode", "preview")
-        if self.model_loaded and streaming_mode != "off":
+        backend = self.config.get("transcription_backend", "local")
+        self._last_partial_text = ""
+        self._last_snapshot_sample_count = 0
+        self._last_dictated_text = ""
+        self._live_char_count = 0
+        if self.model_loaded and streaming_mode != "off" and backend == "local":
             self._streaming_stop_event.clear()
-            self._last_partial_text = ""
-            self._last_snapshot_sample_count = 0
-            self._last_dictated_text = ""  # tracks what's already been typed in live mode
-            self._live_char_count = 0     # how many visible chars we've output
             self._streaming_thread = threading.Thread(
                 target=self._streaming_worker, daemon=True
             )
             self._streaming_thread.start()
+        else:
+            self._streaming_thread = None
+            if backend == "groq":
+                log.info("Groq backend: skipping streaming worker (single transcription on stop)")
 
         # Start waveform visualization updater
         self._waveform_thread = threading.Thread(
@@ -1321,10 +1802,11 @@ class WhisperTypeApp:
                     chunk_audio = all_audio[last_transcribed_pos:]
 
                     with self._transcribe_lock:
-                        chunk_text = self.transcriber.transcribe(
+                        chunk_text = self._transcribe_with_fallback(
                             chunk_audio,
                             language=self._get_language(),
                             beam_size=1,
+                            task=self._get_task(),
                         )
 
                     if chunk_text:
@@ -1367,10 +1849,11 @@ class WhisperTypeApp:
                             audio_np = resample_audio(audio_np, native_rate, 16000)
 
                     with self._transcribe_lock:
-                        text = self.transcriber.transcribe(
+                        text = self._transcribe_with_fallback(
                             audio_np,
                             language=self._get_language(),
                             beam_size=1,
+                            task=self._get_task(),
                         )
 
                     self._last_partial_text = text if text else ""
@@ -1394,6 +1877,11 @@ class WhisperTypeApp:
         self._streaming_stop_event.set()
         if self._streaming_thread and self._streaming_thread.is_alive():
             self._streaming_thread.join(timeout=5.0)
+            if self._streaming_thread.is_alive():
+                log.warning("Streaming thread did not finish in 5s — discarding partial")
+                # Don't trust a partial from a still-running thread — go full transcribe
+                self._last_partial_text = ""
+                self._last_snapshot_sample_count = 0
 
         # Capture streaming results AFTER thread finished (so partial is up-to-date)
         last_partial = self._last_partial_text
@@ -1436,10 +1924,11 @@ class WhisperTypeApp:
                         tail_audio = audio[last_snapshot_samples:]
                         if len(tail_audio) >= 1600:  # at least 0.1s
                             with self._transcribe_lock:
-                                tail_text = self.transcriber.transcribe(
+                                tail_text = self._transcribe_with_fallback(
                                     tail_audio,
                                     language=self._get_language(),
                                     beam_size=self.config["beam_size"],
+                                    task=self._get_task(),
                                 )
                             if tail_text:
                                 clean_tail = tail_text.replace('\u200F', '').replace('\u200E', '').strip()
@@ -1450,15 +1939,18 @@ class WhisperTypeApp:
                     elif not last_dictated:
                         # Nothing was typed during recording (too short) - do full transcription
                         with self._transcribe_lock:
-                            text = self.transcriber.transcribe(
+                            text = self._transcribe_with_fallback(
                                 audio,
                                 language=self._get_language(),
                                 beam_size=self.config["beam_size"],
+                                task=self._get_task(),
                             )
                         if text:
                             clipboard_paste(text)
 
                     total = len((last_dictated or "").replace('\u200F', '').replace('\u200E', ''))
+                    if total > 0:
+                        add_history_entry(last_dictated, duration_sec, self.config["model_size"], source, self._get_task())
                     self.overlay.show_done(char_count=total)
                     if self.config["play_sound"]:
                         play_beep(1000, 100)
@@ -1477,10 +1969,11 @@ class WhisperTypeApp:
                         if len(tail_audio) >= 1600:
                             log.info("Transcribing tail (%d samples)...", len(tail_audio))
                             with self._transcribe_lock:
-                                tail_text = self.transcriber.transcribe(
+                                tail_text = self._transcribe_with_fallback(
                                     tail_audio,
                                     language=self._get_language(),
                                     beam_size=self.config["beam_size"],
+                                    task=self._get_task(),
                                 )
                             if tail_text:
                                 clean_partial = last_partial.rstrip('\u200F\u200E').rstrip()
@@ -1500,6 +1993,7 @@ class WhisperTypeApp:
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
                         output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
+                        add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         self.overlay.show_done(char_count=len(display_text))
                         if self.config["play_sound"]:
                             play_beep(1000, 100)
@@ -1508,19 +2002,20 @@ class WhisperTypeApp:
                 else:
                     # --- NO PARTIAL: full transcription (short recording or streaming=off) ---
                     # Use beam_size=1 for short audio (<5s) for speed
-                    duration_sec = len(audio) / 16000
                     beam = 1 if duration_sec < 5 else self.config["beam_size"]
                     with self._transcribe_lock:
-                        text = self.transcriber.transcribe(
+                        text = self._transcribe_with_fallback(
                             audio,
                             language=self._get_language(),
                             beam_size=beam,
+                            task=self._get_task(),
                         )
 
                     if text:
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
                         output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
+                        add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         self.overlay.show_done(char_count=len(display_text))
                         if self.config["play_sound"]:
                             play_beep(1000, 100)
@@ -1571,7 +2066,7 @@ class WhisperTypeApp:
                 self.tray_icon.icon = self._create_icon("processing")
 
             try:
-                text = self.transcriber.transcribe_file(
+                text = self._transcribe_file_with_fallback(
                     file_path,
                     language=language,
                 )
@@ -1583,6 +2078,7 @@ class WhisperTypeApp:
                         f.write(text)
 
                     log.info("Transcription saved to: %s (%d chars)", out_path, len(text))
+                    add_history_entry(text, 0, self.config["model_size"], "file", "transcribe")
                     self.overlay.show_done(char_count=len(text))
                     if self.config["play_sound"]:
                         play_beep(1000, 100)
@@ -1606,6 +2102,55 @@ class WhisperTypeApp:
         model = self.config.get("model_size", "")
         lang = MODEL_LANGUAGE.get(model, "auto")
         return None if lang == "auto" else lang
+
+    def _get_task(self):
+        """Get Whisper task: 'translate' if translate mode is on, else 'transcribe'."""
+        return "translate" if self.config.get("translate_mode") else "transcribe"
+
+    def _transcribe_with_fallback(self, audio_np, **kwargs):
+        """Transcribe using the primary backend, fall back to local on failure."""
+        try:
+            return self.transcriber.transcribe(audio_np, **kwargs)
+        except Exception as e:
+            # Only fall back if primary is NOT already local
+            if self.transcriber is self._local_transcriber:
+                raise
+            log.warning("Groq transcription failed (%s) — falling back to local", e)
+            self.overlay.show("  ⚠  Cloud failed, using local  ", bg_color="#d08770")
+            return self._local_transcriber.transcribe(audio_np, **kwargs)
+
+    def _transcribe_file_with_fallback(self, file_path, **kwargs):
+        """Transcribe a file using primary backend, fall back to local on failure."""
+        try:
+            return self.transcriber.transcribe_file(file_path, **kwargs)
+        except Exception as e:
+            if self.transcriber is self._local_transcriber:
+                raise
+            log.warning("Groq file transcription failed (%s) — falling back to local", e)
+            return self._local_transcriber.transcribe_file(file_path, **kwargs)
+
+    def _toggle_translate_mode(self):
+        enabling = not self.config.get("translate_mode", False)
+        self.config["translate_mode"] = enabling
+        log.info("Translate mode: %s", "ON" if enabling else "OFF")
+
+        if enabling:
+            # Save the current (non-translate) model so we can restore it later
+            current = self.config.get("model_size", "")
+            if current != "large-v3":
+                self.config["model_before_translate"] = current
+            save_config(self.config)
+            # Switch to large-v3 (only model that reliably translates)
+            if current != "large-v3":
+                log.info("Switching to General Large for translation")
+                self._set_model("large-v3")
+        else:
+            # Restore previous model, or default to Hebrew Turbo
+            previous = self.config.get("model_before_translate") or "ivrit-ai/whisper-large-v3-turbo-ct2"
+            save_config(self.config)
+            if self.config.get("model_size") != previous:
+                log.info("Translate mode off: restoring model %s", previous)
+                self._set_model(previous)
 
     def _set_language(self, lang):
         self.config["language"] = lang
@@ -1730,19 +2275,50 @@ class WhisperTypeApp:
         labels = {"off": "Off", "preview": "Preview", "live_dictation": "Live Dictation"}
         log.info("Streaming mode set to: %s", labels.get(mode, mode))
 
+    # Simplified model menu: (label, model_size, backend)
+    # model_size for Groq is the local fallback model that also determines the language hint.
+    _MENU_MODELS = [
+        ("Hebrew Turbo", "ivrit-ai/whisper-large-v3-turbo-ct2", "local"),
+        ("English Distil", "distil-large-v3", "local"),
+        ("General Turbo", "large-v3-turbo", "local"),
+        ("Groq Turbo", "large-v3-turbo", "groq"),
+    ]
+
     def _build_model_menu(self):
-        """Dynamically build Model submenu based on active engine."""
+        """Build the 4-option Model menu: Hebrew Turbo / English Distil / General Turbo / Groq Turbo."""
         import pystray
-        engine = self.config.get("engine", "faster_whisper")
-        model_dict = OPENVINO_MODELS if engine == "openvino" else MODELS
         return [
             pystray.MenuItem(
                 label,
-                (lambda m: lambda: self._set_model(m))(model_id),
-                checked=(lambda m: lambda item: self.config["model_size"] == m)(model_id),
+                (lambda m, b: lambda: self._set_model_and_backend(m, b))(model_id, backend),
+                checked=(lambda m, b: lambda item:
+                         self.config.get("model_size") == m
+                         and self.config.get("transcription_backend", "local") == b)(model_id, backend),
+                radio=True,
             )
-            for model_id, label in model_dict.items()
+            for label, model_id, backend in self._MENU_MODELS
         ]
+
+    def _set_model_and_backend(self, model, backend):
+        """Set both model and backend atomically from the unified Model menu."""
+        current_model = self.config.get("model_size")
+        current_backend = self.config.get("transcription_backend", "local")
+        if current_model == model and current_backend == backend:
+            return
+        # Switching to Groq: make sure we have an API key first
+        if backend == "groq":
+            api_key = self.config.get("groq_api_key", "").strip()
+            if not api_key:
+                log.warning("Groq selected but no API key — opening key dialog")
+                self.overlay.show_error("Set Groq API key first")
+                self._set_groq_api_key()
+                return
+        # Update model (always, for both fallback and language hint)
+        if current_model != model:
+            self._set_model(model)
+        # Then switch backend
+        if current_backend != backend:
+            self._set_backend(backend)
 
     def _set_model(self, model):
         if model != self.config["model_size"]:
@@ -1752,16 +2328,23 @@ class WhisperTypeApp:
 
             engine = self.config.get("engine", "faster_whisper")
             if engine == "openvino" and OpenVINOTranscriber.is_available():
-                self.transcriber = OpenVINOTranscriber(
+                self._local_transcriber = OpenVINOTranscriber(
                     model_size=model,
                     cpu_threads=self.config["cpu_threads"],
                     device=self.config.get("openvino_device", "GPU"),
                 )
             else:
-                self.transcriber = FasterWhisperTranscriber(
+                self._local_transcriber = FasterWhisperTranscriber(
                     model_size=model,
                     cpu_threads=self.config["cpu_threads"],
                 )
+            # Only replace self.transcriber if we're actually on the local backend.
+            # If on Groq, keep Groq active — the local transcriber is only for fallback.
+            backend = self.config.get("transcription_backend", "local")
+            if backend == "local":
+                self.transcriber = self._local_transcriber
+            else:
+                log.info("Model changed (language hint only) — staying on %s backend", backend)
             threading.Thread(target=self._load_model, daemon=True).start()
             log.info("Switching to model: %s", model)
 
@@ -1801,6 +2384,499 @@ class WhisperTypeApp:
 
         threading.Thread(target=self._load_model, daemon=True).start()
         log.info("Switched engine to: %s (device: %s)", engine, device)
+
+    def _toggle_auto_start(self):
+        enabled = not is_auto_start_enabled()
+        set_auto_start(enabled)
+        self.config["auto_start"] = enabled
+        save_config(self.config)
+
+    def _set_backend(self, backend):
+        """Switch between local and Groq transcription backends."""
+        if backend == self.config.get("transcription_backend", "local"):
+            return
+
+        if backend == "groq":
+            api_key = self.config.get("groq_api_key", "").strip()
+            if not api_key:
+                log.warning("Groq selected but no API key — opening key dialog")
+                self.overlay.show_error("Set Groq API key first")
+                self._set_groq_api_key()
+                return
+            # Create Groq transcriber if not yet created
+            if self._groq_transcriber is None:
+                self._groq_transcriber = GroqTranscriber(
+                    model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
+                    api_key=api_key,
+                )
+                try:
+                    self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
+                except Exception as e:
+                    log.error("Failed to init Groq: %s", e)
+                    self.overlay.show_error("Groq init failed")
+                    self._groq_transcriber = None
+                    return
+            self.transcriber = self._groq_transcriber
+            log.info("Transcription backend: Groq Cloud")
+        else:
+            self.transcriber = self._local_transcriber
+            log.info("Transcription backend: Local")
+
+        self.config["transcription_backend"] = backend
+        save_config(self.config)
+
+    def _set_groq_api_key(self):
+        """Open a custom Tkinter dialog to enter/update the Groq API key (with paste + live validation)."""
+        def open_dialog():
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.title("Groq API Key")
+            root.configure(bg="#1e1e2e")
+            root.resizable(False, False)
+
+            # Center the window
+            W, H = 560, 340
+            root.update_idletasks()
+            x = (root.winfo_screenwidth() - W) // 2
+            y = (root.winfo_screenheight() - H) // 2
+            root.geometry(f"{W}x{H}+{x}+{y}")
+
+            current = self.config.get("groq_api_key", "")
+            masked = (current[:8] + "..." + current[-4:]) if len(current) > 12 else "(not set)"
+
+            # Title
+            tk.Label(root, text="Groq API Key",
+                     font=("Segoe UI", 14, "bold"),
+                     fg="#cdd6f4", bg="#1e1e2e").pack(pady=(15, 5))
+
+            # Info
+            info_text = f"Get one at: https://console.groq.com/keys\nCurrent: {masked}"
+            tk.Label(root, text=info_text,
+                     font=("Segoe UI", 9),
+                     fg="#a6adc8", bg="#1e1e2e", justify="left").pack(pady=(0, 10))
+
+            # Entry row (entry + Show/Hide button)
+            entry_frame = tk.Frame(root, bg="#1e1e2e")
+            entry_frame.pack(padx=20, pady=5, fill="x")
+
+            entry_var = tk.StringVar()
+            entry = tk.Entry(entry_frame, textvariable=entry_var,
+                             font=("Consolas", 11),
+                             bg="#313244", fg="#cdd6f4",
+                             insertbackground="#cdd6f4",
+                             relief="flat", bd=5, show='*')
+            entry.pack(side="left", fill="x", expand=True, ipady=6)
+
+            shown = {"on": False}
+            def toggle_show():
+                shown["on"] = not shown["on"]
+                entry.config(show='' if shown["on"] else '*')
+                show_btn.config(text=("Hide" if shown["on"] else "Show"))
+            show_btn = tk.Button(entry_frame, text="Show", command=toggle_show,
+                                 font=("Segoe UI", 9), bg="#45475a", fg="#cdd6f4",
+                                 activebackground="#585b70", activeforeground="#cdd6f4",
+                                 relief="flat", bd=0, padx=12, pady=4, cursor="hand2")
+            show_btn.pack(side="left", padx=(8, 0))
+
+            # Helper: update length display (called manually, no trace to avoid hangs)
+            def refresh_length():
+                try:
+                    k = entry.get()
+                    if k:
+                        length_label.config(text=f"Key length: {len(k)} chars", fg="#a6adc8")
+                    else:
+                        length_label.config(text="", fg="#a6adc8")
+                except Exception:
+                    pass
+
+            # Read clipboard safely — try pyperclip first (doesn't block Tk),
+            # fall back to root.clipboard_get().
+            def read_clipboard_safe():
+                try:
+                    import pyperclip
+                    return pyperclip.paste() or ""
+                except Exception as e:
+                    log.warning("pyperclip.paste failed: %s", e)
+                try:
+                    return root.clipboard_get()
+                except tk.TclError:
+                    return ""
+                except Exception as e:
+                    log.warning("clipboard_get failed: %s", e)
+                    return ""
+
+            # Paste from Clipboard (replaces current text)
+            def do_paste_replace():
+                try:
+                    clip = read_clipboard_safe()
+                    if clip:
+                        text = clip.strip()
+                        entry.delete(0, "end")
+                        entry.insert(0, text)
+                        entry.icursor("end")
+                        refresh_length()
+                        status_label.config(text=f"Pasted {len(text)} chars from clipboard", fg="#a6e3a1")
+                        log.info("Paste button: inserted %d chars", len(text))
+                    else:
+                        status_label.config(text="Clipboard is empty", fg="#f9e2af")
+                except Exception as e:
+                    log.error("Paste failed: %s", e)
+                    try:
+                        status_label.config(text=f"Paste failed: {e}", fg="#f38ba8")
+                    except Exception:
+                        pass
+
+            # Paste (merge at cursor, used by Ctrl+V / right-click)
+            def do_paste_insert(event=None):
+                try:
+                    clip = read_clipboard_safe()
+                    if clip:
+                        try:
+                            if entry.selection_present():
+                                entry.delete("sel.first", "sel.last")
+                        except tk.TclError:
+                            pass
+                        entry.insert("insert", clip)
+                        refresh_length()
+                except Exception as e:
+                    log.error("Paste insert failed: %s", e)
+                return "break"
+
+            # Refresh length on keystrokes too
+            entry.bind("<KeyRelease>", lambda e: refresh_length())
+
+            def do_select_all(event=None):
+                entry.select_range(0, "end")
+                entry.icursor("end")
+                return "break"
+
+            entry.bind("<Control-v>", do_paste_insert)
+            entry.bind("<Control-V>", do_paste_insert)
+            entry.bind("<Shift-Insert>", do_paste_insert)
+            entry.bind("<Control-a>", do_select_all)
+            entry.bind("<Control-A>", do_select_all)
+
+            # Right-click context menu
+            ctx_menu = tk.Menu(root, tearoff=0)
+            ctx_menu.add_command(label="Paste", command=do_paste_insert)
+            ctx_menu.add_command(label="Select All", command=do_select_all)
+            entry.bind("<Button-3>", lambda e: ctx_menu.tk_popup(e.x_root, e.y_root))
+
+            # Button factory
+            def make_btn(parent, text, cmd, bg, hover_bg, fg="#1e1e2e"):
+                b = tk.Button(parent, text=text, command=cmd,
+                              font=("Segoe UI", 10, "bold"),
+                              bg=bg, fg=fg,
+                              activebackground=hover_bg, activeforeground=fg,
+                              relief="flat", bd=0, padx=15, pady=6,
+                              cursor="hand2")
+                b.bind("<Enter>", lambda e: b.config(bg=hover_bg))
+                b.bind("<Leave>", lambda e: b.config(bg=bg))
+                return b
+
+            # Paste-from-Clipboard big button
+            paste_btn_frame = tk.Frame(root, bg="#1e1e2e")
+            paste_btn_frame.pack(pady=(8, 0))
+            make_btn(paste_btn_frame, "Paste from Clipboard",
+                     do_paste_replace, "#89b4fa", "#74c7ec").pack()
+
+            # Length indicator (confirms text is actually in the field)
+            length_label = tk.Label(root, text="",
+                                    font=("Segoe UI", 9),
+                                    fg="#a6adc8", bg="#1e1e2e")
+            length_label.pack(pady=(4, 0))
+
+            # Status label (shows validation result)
+            status_label = tk.Label(root, text="",
+                                    font=("Segoe UI", 9),
+                                    fg="#a6adc8", bg="#1e1e2e")
+            status_label.pack(pady=(6, 0))
+
+            # OK / Save & Verify / Cancel
+            def on_cancel():
+                root.destroy()
+
+            def on_clear():
+                # Clear the saved key and switch to local
+                self.config["groq_api_key"] = ""
+                self._groq_transcriber = None
+                if self.config.get("transcription_backend") == "groq":
+                    self.transcriber = self._local_transcriber
+                    self.config["transcription_backend"] = "local"
+                save_config(self.config)
+                log.info("Groq API key cleared")
+                status_label.config(text="Key cleared. Backend: Local.", fg="#a6adc8")
+                root.after(800, root.destroy)
+
+            # Track buttons so we can disable them during verification
+            verifying_flag = {"busy": False}
+
+            def on_save_verify():
+                try:
+                    _do_save_verify()
+                except Exception as e:
+                    log.exception("on_save_verify crashed: %s", e)
+                    try:
+                        status_label.config(text=f"Internal error: {e}", fg="#f38ba8")
+                    except Exception:
+                        pass
+
+            def _do_save_verify():
+                if verifying_flag["busy"]:
+                    return
+                # Read from widget directly (most reliable), fall back to StringVar
+                new_key = (entry.get() or entry_var.get()).strip()
+                log.info("Save & Verify clicked; key length=%d", len(new_key))
+                if not new_key:
+                    status_label.config(text="Enter a key first (or click Clear Key).", fg="#f9e2af")
+                    return
+
+                status_label.config(text="Verifying with Groq (up to 10s)...", fg="#89b4fa")
+                verifying_flag["busy"] = True
+                try:
+                    save_btn.config(state="disabled")
+                    clear_btn.config(state="disabled")
+                except NameError:
+                    log.warning("save_btn/clear_btn not defined yet — skipping disable")
+
+                # Shared state between worker and watchdog
+                result_state = {"done": False, "ok": None, "msg": None, "groq": None}
+
+                def finish_ui():
+                    """Apply result to UI — always safe to call, idempotent."""
+                    if not result_state["done"]:
+                        return  # Not yet - watchdog may reschedule
+                    try:
+                        save_btn.config(state="normal")
+                        clear_btn.config(state="normal")
+                        verifying_flag["busy"] = False
+                    except tk.TclError:
+                        return  # Dialog closed
+
+                    ok = result_state["ok"]
+                    msg = result_state["msg"]
+                    groq = result_state["groq"]
+
+                    if not ok:
+                        log.error("Groq key invalid: %s", msg)
+                        status_label.config(text=f"{msg}", fg="#f38ba8")
+                        return
+                    # Valid! Save + activate Groq backend
+                    try:
+                        groq.load_model(callback=lambda m: log.info(m))
+                    except Exception as e:
+                        log.error("load_model failed: %s", e)
+                    self.config["groq_api_key"] = new_key
+                    self._groq_transcriber = groq
+                    self.transcriber = groq
+                    self.config["transcription_backend"] = "groq"
+                    save_config(self.config)
+                    log.info("Groq API key saved & activated")
+                    status_label.config(text="Key valid. Switched to Groq Cloud.", fg="#a6e3a1")
+                    try:
+                        self.overlay.show_done()
+                    except Exception:
+                        pass
+                    root.after(1000, root.destroy)
+
+                def worker():
+                    """Run the HTTP verify off the Tk thread."""
+                    try:
+                        groq = GroqTranscriber(
+                            model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
+                            api_key=new_key,
+                        )
+                        ok, msg = groq.verify_key(timeout=10)
+                    except Exception as e:
+                        log.error("Worker exception: %s", e)
+                        ok, msg, groq = False, f"Error: {e}", None
+                    result_state["ok"] = ok
+                    result_state["msg"] = msg
+                    result_state["groq"] = groq
+                    result_state["done"] = True
+                    log.info("Worker done: ok=%s msg=%s", ok, msg)
+
+                def poll():
+                    """Poll every 200ms on Tk thread; finalize when worker reports done."""
+                    if result_state["done"]:
+                        finish_ui()
+                        return
+                    try:
+                        root.after(200, poll)
+                    except tk.TclError:
+                        pass
+
+                def watchdog():
+                    """If worker hasn't finished after 20s, force-fail."""
+                    if not result_state["done"]:
+                        log.warning("verify watchdog: worker did not finish in 20s")
+                        result_state["ok"] = False
+                        result_state["msg"] = "Timed out after 20s — check internet/firewall"
+                        result_state["groq"] = None
+                        result_state["done"] = True
+
+                threading.Thread(target=worker, daemon=True).start()
+                root.after(200, poll)
+                root.after(20000, watchdog)
+
+            btn_frame = tk.Frame(root, bg="#1e1e2e")
+            btn_frame.pack(pady=(10, 15))
+
+            save_btn = make_btn(btn_frame, "Save & Verify", on_save_verify,
+                                "#a6e3a1", "#94e2d5")
+            save_btn.pack(side="left", padx=5)
+            clear_btn = make_btn(btn_frame, "Clear Key", on_clear,
+                                 "#fab387", "#f9e2af")
+            clear_btn.pack(side="left", padx=5)
+            cancel_btn = make_btn(btn_frame, "Cancel", on_cancel,
+                                  "#f38ba8", "#eba0ac")
+            cancel_btn.pack(side="left", padx=5)
+
+            # Enter = Save & Verify, Esc = Cancel
+            root.bind("<Return>", lambda e: on_save_verify())
+            root.bind("<Escape>", lambda e: on_cancel())
+            root.protocol("WM_DELETE_WINDOW", on_cancel)
+
+            # Focus the entry (on top without -topmost which fights clipboard focus)
+            root.after(100, lambda: (root.lift(), entry.focus_force()))
+
+            root.mainloop()
+
+        threading.Thread(target=open_dialog, daemon=True).start()
+
+    def _show_history(self):
+        """Open a Tkinter window showing transcription history."""
+        def open_window():
+            import tkinter as tk
+            from tkinter import ttk
+            import datetime
+            import pyperclip
+
+            history = load_history()
+            history.reverse()  # newest first
+
+            root = tk.Tk()
+            root.title("WhisperType - History")
+            root.geometry("700x500")
+            root.attributes('-topmost', True)
+            root.configure(bg="#1e1e2e")
+
+            # Header
+            header = tk.Frame(root, bg="#1e1e2e")
+            header.pack(fill="x", padx=10, pady=(10, 5))
+            tk.Label(header, text=f"Transcription History ({len(history)} entries)",
+                     font=("Segoe UI", 14, "bold"), fg="#cdd6f4", bg="#1e1e2e").pack(side="left")
+
+            # Search
+            search_frame = tk.Frame(root, bg="#1e1e2e")
+            search_frame.pack(fill="x", padx=10, pady=(0, 5))
+            tk.Label(search_frame, text="Search:", fg="#a6adc8", bg="#1e1e2e",
+                     font=("Segoe UI", 10)).pack(side="left")
+            search_var = tk.StringVar()
+            search_entry = tk.Entry(search_frame, textvariable=search_var, font=("Segoe UI", 10),
+                                    bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
+                                    relief="flat", bd=5)
+            search_entry.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+            # List frame
+            list_frame = tk.Frame(root, bg="#1e1e2e")
+            list_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+            canvas = tk.Canvas(list_frame, bg="#1e1e2e", highlightthickness=0)
+            scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+            scrollable = tk.Frame(canvas, bg="#1e1e2e")
+
+            scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas_window = canvas.create_window((0, 0), window=scrollable, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+
+            # Make scrollable frame resize with canvas
+            def on_canvas_configure(event):
+                canvas.itemconfig(canvas_window, width=event.width)
+            canvas.bind("<Configure>", on_canvas_configure)
+
+            scrollbar.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+
+            # Mouse wheel scrolling
+            def on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+            def copy_text(text):
+                pyperclip.copy(text)
+
+            def render_entries(filter_text=""):
+                for widget in scrollable.winfo_children():
+                    widget.destroy()
+
+                filtered = history
+                if filter_text:
+                    lower_filter = filter_text.lower()
+                    filtered = [e for e in history if lower_filter in e.get("text", "").lower()]
+
+                if not filtered:
+                    tk.Label(scrollable, text="No entries found", fg="#6c7086", bg="#1e1e2e",
+                             font=("Segoe UI", 11)).pack(pady=20)
+                    return
+
+                for entry in filtered:
+                    card = tk.Frame(scrollable, bg="#313244", bd=0, highlightthickness=1,
+                                    highlightbackground="#45475a")
+                    card.pack(fill="x", pady=2, padx=2)
+
+                    # Top row: timestamp + metadata
+                    top = tk.Frame(card, bg="#313244")
+                    top.pack(fill="x", padx=8, pady=(6, 2))
+
+                    try:
+                        ts = datetime.datetime.fromisoformat(entry["timestamp"])
+                        time_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        time_str = entry.get("timestamp", "")
+
+                    tk.Label(top, text=time_str, fg="#a6adc8", bg="#313244",
+                             font=("Segoe UI", 9)).pack(side="left")
+
+                    meta_parts = []
+                    dur = entry.get("duration", 0)
+                    if dur > 0:
+                        meta_parts.append(f"{dur}s")
+                    src = entry.get("source", "")
+                    if src and src != "microphone":
+                        meta_parts.append(src)
+                    task = entry.get("task", "")
+                    if task == "translate":
+                        meta_parts.append("translated")
+                    if meta_parts:
+                        tk.Label(top, text=" | ".join(meta_parts), fg="#6c7086", bg="#313244",
+                                 font=("Segoe UI", 9)).pack(side="right")
+
+                    # Text content
+                    text = entry.get("text", "")
+                    display = text[:200] + "..." if len(text) > 200 else text
+                    text_label = tk.Label(card, text=display, fg="#cdd6f4", bg="#313244",
+                                          font=("Segoe UI", 10), anchor="w", justify="left",
+                                          wraplength=620, cursor="hand2")
+                    text_label.pack(fill="x", padx=8, pady=(0, 6))
+                    text_label.bind("<Button-1>", lambda e, t=text: copy_text(t))
+                    text_label.bind("<Enter>", lambda e, w=text_label: w.configure(fg="#f5e0dc"))
+                    text_label.bind("<Leave>", lambda e, w=text_label: w.configure(fg="#cdd6f4"))
+
+            render_entries()
+
+            def on_search(*args):
+                render_entries(search_var.get())
+            search_var.trace_add("write", on_search)
+
+            def on_close():
+                canvas.unbind_all("<MouseWheel>")
+                root.destroy()
+            root.protocol("WM_DELETE_WINDOW", on_close)
+            root.mainloop()
+
+        threading.Thread(target=open_window, daemon=True).start()
 
     def _quit(self):
         log.info("Quitting WhisperType...")
