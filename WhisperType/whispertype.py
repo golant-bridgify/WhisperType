@@ -1006,6 +1006,45 @@ STARTUP_DIR = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows"
 STARTUP_SHORTCUT = os.path.join(STARTUP_DIR, "WhisperType.lnk")
 
 
+def _ensure_whispertype_launcher():
+    """Create a copy of pythonw.exe named 'WhisperType.exe' in the project folder.
+
+    Purpose: make the process appear as 'WhisperType.exe' in Task Manager
+    instead of 'pythonw.exe'. Windows identifies processes by their .exe file
+    name, so any valid PE binary with this name will show up that way.
+
+    Returns the path to the renamed launcher, or None if not applicable
+    (e.g. when running from a PyInstaller bundle, or on non-Windows).
+    """
+    if getattr(sys, 'frozen', False):
+        return None  # PyInstaller bundle — already named WhisperType.exe
+    if os.name != 'nt':
+        return None
+
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    target = os.path.join(script_dir, "WhisperType.exe")
+
+    py_dir = os.path.dirname(sys.executable)
+    pythonw = os.path.join(py_dir, "pythonw.exe")
+    if not os.path.exists(pythonw):
+        return None  # pythonw not available (base Python install)
+
+    try:
+        import shutil
+        need_copy = True
+        if os.path.exists(target):
+            # Skip if same size — assume it's our copy
+            if os.path.getsize(target) == os.path.getsize(pythonw):
+                need_copy = False
+        if need_copy:
+            shutil.copy2(pythonw, target)
+            log.info("Created process launcher: %s (copy of %s)", target, pythonw)
+        return target
+    except Exception as e:
+        log.warning("Could not create WhisperType.exe launcher: %s", e)
+        return None
+
+
 def _get_startup_target():
     """Return (target_path, arguments, working_dir, icon_path) for the startup shortcut.
 
@@ -1025,10 +1064,15 @@ def _get_startup_target():
     else:
         # Running from Python source
         script = os.path.abspath(sys.argv[0])
-        # Prefer pythonw.exe (no console window) over python.exe
-        py_dir = os.path.dirname(sys.executable)
-        pythonw = os.path.join(py_dir, "pythonw.exe")
-        target = pythonw if os.path.exists(pythonw) else sys.executable
+        # Prefer our renamed WhisperType.exe so Task Manager shows the right name.
+        # Fall back to pythonw.exe (no console window), then python.exe.
+        launcher = _ensure_whispertype_launcher()
+        if launcher:
+            target = launcher
+        else:
+            py_dir = os.path.dirname(sys.executable)
+            pythonw = os.path.join(py_dir, "pythonw.exe")
+            target = pythonw if os.path.exists(pythonw) else sys.executable
         args = f'"{script}"'
         working = script_dir
 
@@ -1513,6 +1557,7 @@ class WhisperTypeApp:
                 save_config(self.config)
 
         self.is_recording = False
+        self._recording_state_lock = threading.Lock()  # Guards is_recording to prevent double start/stop
         self.model_loaded = False
         self.status_text = "Loading model..."
         self.tray_icon = None
@@ -1611,9 +1656,61 @@ class WhisperTypeApp:
         hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
         hotkey_thread.start()
 
+        # Wait for Windows Explorer / taskbar to be ready before showing the tray
+        # icon. Fixes the case where auto-start launches WhisperType before the
+        # shell is fully loaded and the icon silently fails to register.
+        self._wait_for_shell_ready()
+
         log.info("WhisperType is running! Hotkey: %s", self.config["hotkey"])
         log.info("Right-click the tray icon for options.")
-        self.tray_icon.run()
+
+        # Run the tray icon with a setup callback so we know when it's actually visible
+        def on_tray_ready(icon):
+            icon.visible = True
+            log.info("Tray icon registered and visible")
+
+        try:
+            self.tray_icon.run(setup=on_tray_ready)
+        except Exception as e:
+            log.exception("Tray icon run failed: %s", e)
+
+    def _wait_for_shell_ready(self, timeout_sec=60):
+        """Block until the Windows taskbar notification area is ready.
+
+        On cold boot / auto-start, the taskbar can take 15-30 seconds to
+        initialize its notification area (tray). Registering a tray icon too
+        early causes pystray to silently fail — the process runs, but no icon.
+
+        We wait for:
+        1. Shell_TrayWnd (the main taskbar window)
+        2. TrayNotifyWnd (the notification area inside it)
+        3. An extra 2s buffer so the icon list is actually ready to accept us
+        """
+        import ctypes
+        user32 = ctypes.windll.user32
+        start = time.time()
+        attempts = 0
+        tray_wnd_found = False
+
+        while time.time() - start < timeout_sec:
+            shell_tray = user32.FindWindowW("Shell_TrayWnd", None)
+            if shell_tray:
+                # Look for TrayNotifyWnd inside Shell_TrayWnd
+                tray_notify = user32.FindWindowExW(shell_tray, 0, "TrayNotifyWnd", None)
+                if tray_notify:
+                    tray_wnd_found = True
+                    break
+            attempts += 1
+            time.sleep(0.5)
+
+        if tray_wnd_found:
+            # Give the notification area a moment to be fully ready
+            time.sleep(2)
+            elapsed = time.time() - start
+            if elapsed > 1:
+                log.info("Shell ready after %.1fs (%d attempts)", elapsed, attempts)
+        else:
+            log.warning("Shell not ready after %ss — tray icon may not appear", timeout_sec)
 
     def _create_icon(self, state="idle"):
         """Create a simple icon using PIL."""
@@ -1636,16 +1733,27 @@ class WhisperTypeApp:
             draw.arc([18, 28, 46, 52], start=0, end=180, fill=(255, 255, 255), width=3)
             draw.line([32, 52, 32, 58], fill=(255, 255, 255), width=3)
         elif state == "processing":
-            # Yellow processing circle
-            draw.ellipse([4, 4, size - 4, size - 4], fill=(255, 165, 0), outline=(255, 255, 255), width=2)
-            draw.text((16, 16), "...", fill=(255, 255, 255))
+            # Yellow circle - transcription in progress: three sound-wave bars
+            draw.ellipse([4, 4, size - 4, size - 4], fill=(220, 150, 0), outline=(255, 255, 255), width=2)
+            # Three vertical bars of increasing height (sound-wave / waveform symbol)
+            bar_w = 7
+            bar_color = (255, 255, 255)
+            cx = size // 2
+            for i, (bh, bx) in enumerate([(20, cx - 14), (32, cx - 3), (20, cx + 10)]):
+                top = (size - bh) // 2
+                draw.rounded_rectangle([bx, top, bx + bar_w, top + bh], radius=3, fill=bar_color)
         elif state == "loading":
-            # Blue circle - model is loading
+            # Blue circle - model is loading: hourglass
             draw.ellipse([4, 4, size - 4, size - 4], fill=(30, 100, 200), outline=(255, 255, 255), width=2)
-            # Hourglass shape
-            draw.rounded_rectangle([22, 14, 42, 38], radius=8, fill=(255, 255, 255))
-            draw.arc([18, 28, 46, 52], start=0, end=180, fill=(255, 255, 255), width=3)
-            draw.line([32, 52, 32, 58], fill=(255, 255, 255), width=3)
+            # Hourglass: two triangles pointing at each other
+            w = (255, 255, 255)
+            # Top triangle (wide → narrow, pointing down)
+            draw.polygon([(18, 14), (46, 14), (32, 32)], fill=w)
+            # Bottom triangle (narrow → wide, pointing up)
+            draw.polygon([(18, 50), (46, 50), (32, 32)], fill=w)
+            # Top and bottom horizontal bars
+            draw.rectangle([18, 12, 46, 16], fill=w)
+            draw.rectangle([18, 48, 46, 52], fill=w)
 
         return img
 
@@ -1718,9 +1826,10 @@ class WhisperTypeApp:
                 time.sleep(0.5)
 
     def _start_recording(self):
-        if self.is_recording:
-            return
-        self.is_recording = True
+        with self._recording_state_lock:
+            if self.is_recording:
+                return
+            self.is_recording = True
         source = self.config.get("recording_source", "microphone")
         source_label = {"microphone": "Mic", "stereo_mix": "System Audio", "both": "Mic + System"}.get(source, "Mic")
         log.info("Recording (%s)...", source_label)
@@ -1945,9 +2054,10 @@ class WhisperTypeApp:
                 log.error("Streaming transcription error: %s", e)
 
     def _stop_and_transcribe(self):
-        if not self.is_recording:
-            return
-        self.is_recording = False
+        with self._recording_state_lock:
+            if not self.is_recording:
+                return
+            self.is_recording = False
         streaming_mode = self.config.get("streaming_mode", "preview")
         log.info("Processing...")
         self.overlay.show_processing()
@@ -3133,6 +3243,24 @@ class WhisperTypeApp:
 # Entry Point
 # ============================================================
 if __name__ == "__main__":
+    # ---- Single-instance guard (Windows named mutex) ----
+    # Prevents duplicate processes that cause double-transcription + double-paste.
+    # The mutex auto-releases when this process exits (Windows cleans it up),
+    # so a crashed / force-killed instance won't permanently block future launches.
+    import ctypes
+    import atexit
+    _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, False, "WhisperType_SingleInstance")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        log.warning("Another WhisperType instance is already running — exiting.")
+        ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        sys.exit(0)
+
+    # Release the mutex on normal exit
+    atexit.register(lambda: ctypes.windll.kernel32.CloseHandle(_mutex_handle))
+
     log.info("WhisperType starting...")
+    # Create the renamed launcher on first run so future launches show
+    # as "WhisperType.exe" in Task Manager instead of "pythonw.exe".
+    _ensure_whispertype_launcher()
     app = WhisperTypeApp()
     app.run()
