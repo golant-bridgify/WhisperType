@@ -1713,12 +1713,16 @@ class WhisperTypeApp:
         import pystray
         from PIL import Image
 
-        # Load model in background
-        model_thread = threading.Thread(target=self._load_model, daemon=True)
-        model_thread.start()
-
-        # Create tray icon
-        icon_image = self._create_icon("idle")
+        # Create tray icon in LOADING state — the model takes ~2-5s to load
+        # on warm starts (and up to 30s on cold boot). Starting with the green
+        # "idle" icon would lie to the user that the app is ready before it
+        # actually is. _load_model() flips it to "idle" once the model is
+        # truly usable.
+        #
+        # ORDER MATTERS: create self.tray_icon BEFORE starting the model
+        # thread, otherwise _load_model's `if self.tray_icon:` guard skips
+        # the state changes and the icon never reflects loading progress.
+        icon_image = self._create_icon("loading")
         menu = pystray.Menu(
             pystray.MenuItem("WhisperType", None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -1790,6 +1794,11 @@ class WhisperTypeApp:
         # the tray icon tells the user what WhisperType is doing right now.
         self.tray_icon = pystray.Icon("WhisperType", icon_image,
                                        "WhisperType — Loading model...", menu)
+
+        # Now that self.tray_icon exists, start the model loader. It can
+        # safely switch the icon between "loading" and "idle" based on state.
+        model_thread = threading.Thread(target=self._load_model, daemon=True)
+        model_thread.start()
 
         # Start hotkey listener in background
         hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
