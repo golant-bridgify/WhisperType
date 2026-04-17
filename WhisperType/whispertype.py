@@ -91,6 +91,16 @@ DEFAULT_CONFIG = {
     # Example: 'git, push, pull, commit, React, Kubernetes, Naor, Jabra'
     # stops 'git push' from being transcribed as 'בגד פושע'.
     "custom_vocabulary": "",
+    # Clipboard auto-restore: after pasting transcribed text, put back
+    # whatever was in the clipboard before the paste (~2s delay). Stops
+    # WhisperType from silently clobbering the user's 'copy' whenever they
+    # dictate. Only applies to auto_paste mode — "Clipboard Only" obviously
+    # leaves the text in the clipboard on purpose.
+    "clipboard_auto_restore": True,
+    # Undo hotkey: press to remove the last WhisperType paste (sends Ctrl+Z
+    # to the focused window) AND restore the previous clipboard content
+    # immediately. Only works within 60s of the paste.
+    "undo_hotkey": "ctrl+alt+z",
 }
 
 
@@ -2503,6 +2513,12 @@ class WhisperTypeApp:
         # run two recorders at once on most Windows audio stacks).
         self._active_meeting = None
         self._meeting_lock = threading.Lock()
+        # Last paste state — drives Ctrl+Alt+Z undo. dict with keys:
+        # {text, old_clipboard, timestamp, generation}. None means no
+        # recent paste to undo. generation matches _recording_generation
+        # at time-of-paste so a follow-up recording can't confuse undo.
+        self._last_paste = None
+        self._last_paste_lock = threading.Lock()
 
     def run(self):
         """Main entry point."""
@@ -2568,6 +2584,11 @@ class WhisperTypeApp:
                         "Custom Vocabulary...",
                         lambda: self._open_vocabulary_dialog(),
                     ),
+                    pystray.MenuItem(
+                        "Restore Clipboard After Paste",
+                        lambda: self._toggle_clipboard_auto_restore(),
+                        checked=lambda item: bool(self.config.get("clipboard_auto_restore", True)),
+                    ),
                     pystray.Menu.SEPARATOR,
                     # Dynamic label: swaps between "Start Meeting" and
                     # "Stop Meeting" based on whether a session is active.
@@ -2616,6 +2637,17 @@ class WhisperTypeApp:
         # Start hotkey listener in background
         hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
         hotkey_thread.start()
+
+        # Register the global undo hotkey (Ctrl+Alt+Z by default).
+        # Uses keyboard.add_hotkey — non-blocking callback registration,
+        # different mechanism from the main press-to-talk loop.
+        try:
+            import keyboard as kb
+            undo_hk = self.config.get("undo_hotkey", "ctrl+alt+z")
+            kb.add_hotkey(undo_hk, self._undo_last_paste, suppress=False)
+            log.info("Undo hotkey registered: %s", undo_hk)
+        except Exception as e:
+            log.warning("Could not register undo hotkey: %s", e)
 
         # Wait for Windows Explorer / taskbar to be ready before showing the tray
         # icon. Fixes the case where auto-start launches WhisperType before the
@@ -3343,7 +3375,7 @@ class WhisperTypeApp:
                         text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
-                        ok = output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
+                        ok = self._do_paste(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         if ok:
                             self.overlay.show_done(char_count=len(display_text))
@@ -3374,7 +3406,7 @@ class WhisperTypeApp:
                         text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
-                        ok = output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
+                        ok = self._do_paste(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         if ok:
                             self.overlay.show_done(char_count=len(display_text))
@@ -3514,6 +3546,103 @@ class WhisperTypeApp:
         # Pass custom vocab too so the LLM can fix mis-transcribed user terms
         vocab = self.config.get("custom_vocabulary", "") or ""
         return self._llm_cleaner.clean(text, style=style, vocabulary=vocab)
+
+    # ----- Paste + undo pipeline -----
+    def _do_paste(self, text, mode):
+        """Paste `text` and remember it for undo + clipboard restoration.
+
+        This is a wrapper around module-level output_text(). We grab the
+        current clipboard BEFORE the paste so it can be restored, store
+        the state for undo, and (for auto_paste mode) schedule a
+        background thread to put the previous clipboard back ~2s later.
+
+        Returns True on successful paste, False otherwise.
+        """
+        import pyperclip
+        # Snapshot the clipboard before we clobber it
+        old_clipboard = ""
+        try:
+            old_clipboard = pyperclip.paste() or ""
+        except Exception as e:
+            log.warning("Could not read clipboard before paste: %s", e)
+
+        ok = output_text(text, mode=mode)
+        if not ok:
+            return False
+
+        # Remember this paste for the Ctrl+Alt+Z undo path
+        with self._last_paste_lock:
+            self._last_paste = {
+                "text": text,
+                "old_clipboard": old_clipboard,
+                "timestamp": time.time(),
+            }
+
+        # Auto-restore the clipboard after a short delay so the user's
+        # previous 'copy' isn't silently lost. Only for auto_paste mode —
+        # 'clipboard_only' intentionally keeps the transcript in the
+        # clipboard. Guarded: if the clipboard changed in the meantime
+        # (user manually copied something else), we don't overwrite them.
+        if mode == "auto_paste" and self.config.get("clipboard_auto_restore", True):
+            def _restore_later():
+                time.sleep(2.0)
+                try:
+                    current = pyperclip.paste() or ""
+                    if current == text:
+                        pyperclip.copy(old_clipboard)
+                        log.info("Clipboard auto-restored to pre-paste content (%d chars)",
+                                 len(old_clipboard))
+                    else:
+                        log.info("Clipboard changed since paste — skipping auto-restore")
+                except Exception as e:
+                    log.warning("Clipboard auto-restore failed: %s", e)
+            threading.Thread(target=_restore_later, daemon=True).start()
+        return True
+
+    def _undo_last_paste(self):
+        """Send Ctrl+Z to remove the last WhisperType paste + restore the
+        clipboard to what the user had before the paste. Invoked by the
+        global undo hotkey (Ctrl+Alt+Z by default).
+        """
+        with self._last_paste_lock:
+            last = self._last_paste
+            self._last_paste = None   # consume — can't undo twice
+
+        if not last:
+            log.info("Undo: nothing to undo")
+            self.overlay.show("  ↩  Nothing to undo  ",
+                              bg_color="#6c7086", duration=1200)
+            return
+
+        age = time.time() - last["timestamp"]
+        if age > 60.0:
+            log.info("Undo: last paste was %.0fs ago — too stale to safely undo", age)
+            self.overlay.show("  ↩  Last paste too old to undo  ",
+                              bg_color="#6c7086", duration=1500)
+            return
+
+        # 1. Restore the previous clipboard content immediately (overrides
+        #    the still-pending auto-restore timer if any).
+        import pyperclip
+        try:
+            pyperclip.copy(last["old_clipboard"])
+        except Exception as e:
+            log.warning("Undo: clipboard restore failed: %s", e)
+
+        # 2. Send Ctrl+Z to remove the pasted text from the focused window.
+        #    Apps that accept text input treat a Ctrl+V paste as a single
+        #    undo-able action, so one Ctrl+Z removes the whole pasted block.
+        try:
+            import keyboard as kb
+            time.sleep(0.02)
+            kb.send('ctrl+z')
+        except Exception as e:
+            log.warning("Undo: Ctrl+Z send failed: %s", e)
+
+        chars = len(last["text"])
+        log.info("Undo: removed last paste (%d chars, %.1fs old)", chars, age)
+        self.overlay.show(f"  ↩  Undone ({chars} chars)  ",
+                          bg_color="#4c6085", duration=1500)
 
     def _transcribe_file_with_fallback(self, file_path, **kwargs):
         """Transcribe a file using primary backend, fall back to local on failure."""
@@ -4013,6 +4142,13 @@ class WhisperTypeApp:
         self.config["cleanup_style"] = style
         save_config(self.config)
         log.info("Cleanup style: %s", style)
+
+    def _toggle_clipboard_auto_restore(self):
+        """Flip the 'put the user's previous clipboard back after a paste' setting."""
+        new_val = not bool(self.config.get("clipboard_auto_restore", True))
+        self.config["clipboard_auto_restore"] = new_val
+        save_config(self.config)
+        log.info("Clipboard auto-restore: %s", "ON" if new_val else "OFF")
 
     # ----- Meeting Mode -----
     def _is_meeting_active(self):
