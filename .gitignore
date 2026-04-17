@@ -35,5 +35,10 @@ Desktop.ini
 *.wav
 *.m4a
 
+# Auto-generated launcher (copy of pythonw.exe so Task Manager shows
+# 'WhisperType.exe'). Created on first run, no reason to commit.
+WhisperType/WhisperType.exe
+WhisperType.exe
+
 # Claude
 .claude/
