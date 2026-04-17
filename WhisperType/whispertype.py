@@ -78,6 +78,12 @@ DEFAULT_CONFIG = {
     "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
     "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
     "groq_he_en_bias": True,  # True = bias Groq language detection to Hebrew/English only (prevents false French/etc. detection)
+    # AI cleanup: post-process Whisper output via a Groq LLM to remove filler
+    # words, add punctuation, fix obvious mis-hearings. Costs ~$0.00005 per
+    # transcription and ~500-900ms added latency. Set to "off" or "verbatim"
+    # to disable. Shares the groq_api_key with GroqTranscriber.
+    "cleanup_style": "casual",  # "off" / "casual" / "email" / "code" / "verbatim"
+    "cleanup_llm_model": "llama-3.3-70b-versatile",  # Groq model for cleanup
 }
 
 
@@ -1043,6 +1049,144 @@ class GroqTranscriber(BaseTranscriber):
 
 
 # ============================================================
+# Groq LLM Cleanup — post-process raw Whisper output
+# ============================================================
+class GroqLLMCleaner:
+    """Post-processes raw transcription through a Groq LLM.
+
+    Whisper transcribes verbatim: "so basically I uh think that maybe we should"
+    People read + edit every paste because raw speech is messy. Running the
+    transcript through a small LLM with a cleanup prompt produces polished
+    text at the cost of ~300-800ms added latency. Same Groq API key used by
+    GroqTranscriber, so no extra auth setup.
+
+    Styles:
+      off      — bypass (return as-is)
+      casual   — remove filler words, add punctuation, keep voice (default)
+      email    — polish into email-ready prose
+      code     — preserve technical terms exactly
+      verbatim — same as off
+    """
+    CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+    # Keep prompts terse — LLM will follow them and we pay per output token.
+    STYLE_PROMPTS = {
+        "casual": (
+            "You are a transcription cleanup assistant. The user dictated "
+            "text via speech-to-text. Clean it up:\n"
+            "- Remove filler words (um, uh, like, אה, יעני, בעצם, כאילו).\n"
+            "- Add proper punctuation and sentence casing.\n"
+            "- Fix obvious mis-hearings when context makes them unambiguous.\n"
+            "- Preserve the exact meaning and the speaker's voice.\n"
+            "- Keep the SAME LANGUAGE as the input (Hebrew stays Hebrew, "
+            "English stays English, mixed stays mixed).\n"
+            "- Do NOT rephrase, summarise, translate, or add content.\n"
+            "- Respond with ONLY the cleaned text — no preface, no quotes, "
+            "no explanations."
+        ),
+        "email": (
+            "You are a transcription cleanup assistant. Polish the user's "
+            "spoken dictation into email-ready prose:\n"
+            "- Proper capitalisation, punctuation, paragraph breaks.\n"
+            "- Remove filler words and redundancy.\n"
+            "- Improve flow while preserving meaning.\n"
+            "- Maintain the speaker's voice and language.\n"
+            "- Do NOT add greetings or signatures.\n"
+            "- Respond with ONLY the polished text."
+        ),
+        "code": (
+            "You are a transcription cleanup assistant for technical "
+            "dictation:\n"
+            "- Preserve code terms, variable names, product names, and "
+            "technical vocabulary EXACTLY (React, API, async, OAuth, "
+            "Kubernetes, etc.).\n"
+            "- Fix grammar and punctuation around technical terms.\n"
+            "- Remove filler words.\n"
+            "- Keep the same language.\n"
+            "- Respond with ONLY the cleaned text."
+        ),
+    }
+
+    def __init__(self, api_key, model="llama-3.3-70b-versatile"):
+        self.api_key = api_key
+        self.model = model
+
+    def clean(self, text, style="casual", timeout=10):
+        """Return the cleaned text. On any failure, return the original text.
+
+        Cleanup is best-effort — a Groq hiccup must never block the paste.
+        """
+        if not text or not text.strip():
+            return text
+        if style in ("off", "verbatim") or not self.api_key:
+            return text
+        prompt = self.STYLE_PROMPTS.get(style)
+        if not prompt:
+            return text
+        # Skip cleanup for trivially short output — not worth the round-trip
+        # and LLM might over-clean a single word ("הי" → "Hello there").
+        stripped = text.replace('\u200F', '').replace('\u200E', '').strip()
+        if len(stripped) < 4:
+            return text
+
+        try:
+            import requests
+        except ImportError:
+            log.warning("LLM cleanup: 'requests' not installed — skipping")
+            return text
+
+        # RTL marker handling: strip before sending, re-add if input had it
+        had_rtl = text.startswith('\u200F')
+        payload_text = text.lstrip('\u200F\u200E')
+
+        try:
+            log.info("LLM cleanup (%s): sending %d chars", style, len(payload_text))
+            resp = requests.post(
+                self.CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": payload_text},
+                    ],
+                    "temperature": 0.2,   # low — we want faithful cleanup, not creativity
+                    "max_tokens": max(128, len(payload_text) * 2),
+                    "stream": False,
+                },
+                timeout=(5, timeout),
+            )
+            if resp.status_code != 200:
+                log.warning("LLM cleanup: HTTP %d, body=%s — using raw text",
+                            resp.status_code, resp.text[:200])
+                return text
+            data = resp.json()
+            cleaned = data["choices"][0]["message"]["content"].strip()
+
+            # Occasional LLMs wrap output in quotes — strip them
+            if len(cleaned) >= 2 and cleaned[0] in ('"', "'", '«', '\u201C') and cleaned[-1] in ('"', "'", '»', '\u201D'):
+                cleaned = cleaned[1:-1].strip()
+
+            # Safety: if the LLM returned something drastically shorter (e.g.
+            # it hallucinated a single-word summary), fall back to raw.
+            if len(cleaned) < max(3, len(payload_text) // 4):
+                log.warning("LLM cleanup: result too short (%d << %d) — using raw text",
+                            len(cleaned), len(payload_text))
+                return text
+
+            if had_rtl and not cleaned.startswith('\u200F'):
+                cleaned = '\u200F' + cleaned
+            log.info("LLM cleanup (%s): %d → %d chars", style, len(payload_text), len(cleaned))
+            return cleaned
+        except Exception as e:
+            log.warning("LLM cleanup failed (%s: %s) — using raw text", type(e).__name__, e)
+            return text
+
+
+# ============================================================
 # Text Paster - types text into active window
 # ============================================================
 def _copy_with_retry(text, retries=3, delay=0.08):
@@ -1797,6 +1941,16 @@ class WhisperTypeApp:
             )
             self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
 
+        # LLM cleanup uses the same Groq API key. Initialised whenever a
+        # key is present, regardless of which transcription backend is
+        # active — so a user on local Whisper can still get cloud cleanup.
+        self._llm_cleaner = None
+        if self.config.get("groq_api_key"):
+            self._llm_cleaner = GroqLLMCleaner(
+                api_key=self.config["groq_api_key"],
+                model=self.config.get("cleanup_llm_model", "llama-3.3-70b-versatile"),
+            )
+
         # Pick primary transcriber based on backend setting
         if self._groq_transcriber is not None:
             self.transcriber = self._groq_transcriber
@@ -1889,6 +2043,10 @@ class WhisperTypeApp:
                         "Bias Groq to Hebrew/English",
                         lambda: self._toggle_he_en_bias(),
                         checked=lambda item: bool(self.config.get("groq_he_en_bias", True)),
+                    ),
+                    pystray.MenuItem(
+                        "AI Cleanup (Groq)",
+                        pystray.Menu(self._build_cleanup_menu),
                     ),
                     pystray.MenuItem(
                         "Beep Output",
@@ -2626,6 +2784,9 @@ class WhisperTypeApp:
 
                     # Single paste of complete text
                     if text:
+                        # LLM cleanup (removes filler words, fixes punctuation)
+                        # before we log/paste. Best-effort — never blocks paste.
+                        text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
                         ok = output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
@@ -2655,6 +2816,8 @@ class WhisperTypeApp:
                         )
 
                     if text:
+                        # LLM cleanup (see comment in partial-path above)
+                        text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
                         ok = output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
@@ -2773,6 +2936,28 @@ class WhisperTypeApp:
             log.warning("Groq transcription failed (%s) — falling back to local", e)
             self.overlay.show("  ⚠  Cloud failed, using local  ", bg_color="#d08770")
             return self._local_transcriber.transcribe(audio_np, **kwargs)
+
+    def _cleanup_if_enabled(self, text, is_translation=False):
+        """Run the raw transcription through the LLM cleaner if configured.
+
+        Safe to call with any text. Returns original on any failure so a
+        cleanup problem never blocks the paste. Skips for:
+          - Empty / missing text
+          - cleanup_style = off / verbatim
+          - Translation mode (Whisper already produced clean English)
+          - Very short text (<4 chars) — LLM would over-fix it
+          - No Groq API key configured
+        """
+        style = self.config.get("cleanup_style", "casual")
+        if style in ("off", "verbatim"):
+            return text
+        if is_translation:
+            # Whisper's /translations endpoint already produces polished
+            # English; running a second LLM pass risks rephrasing.
+            return text
+        if not self._llm_cleaner:
+            return text
+        return self._llm_cleaner.clean(text, style=style)
 
     def _transcribe_file_with_fallback(self, file_path, **kwargs):
         """Transcribe a file using primary backend, fall back to local on failure."""
@@ -3236,6 +3421,42 @@ class WhisperTypeApp:
             self._groq_transcriber.he_en_bias = new_value
         log.info("Groq he/en bias: %s", "ON" if new_value else "OFF")
 
+    # ----- AI Cleanup menu -----
+    CLEANUP_MENU_STYLES = [
+        ("Off — raw transcription", "off"),
+        ("Casual ⭐ — remove fillers, add punctuation", "casual"),
+        ("Email polish — email-ready prose", "email"),
+        ("Technical/Code — preserve tech terms", "code"),
+    ]
+
+    def _build_cleanup_menu(self):
+        """Radio-button submenu under Options → AI Cleanup."""
+        import pystray
+        items = []
+        # Disable entirely if no Groq API key is set — cleanup requires it
+        if not self.config.get("groq_api_key"):
+            items.append(pystray.MenuItem(
+                "(Set Groq API key first)", None, enabled=False
+            ))
+            return items
+        for label, style in self.CLEANUP_MENU_STYLES:
+            items.append(pystray.MenuItem(
+                label,
+                (lambda s: lambda: self._set_cleanup_style(s))(style),
+                checked=(lambda s: lambda item:
+                         self.config.get("cleanup_style", "casual") == s)(style),
+                radio=True,
+            ))
+        return items
+
+    def _set_cleanup_style(self, style):
+        """Change cleanup style + persist."""
+        if style == self.config.get("cleanup_style"):
+            return
+        self.config["cleanup_style"] = style
+        save_config(self.config)
+        log.info("Cleanup style: %s", style)
+
     def _toggle_silent_mode(self):
         """Toggle silent mode: when ON, the overlay (waveform + status) is hidden.
         Tray icon color still changes to indicate state."""
@@ -3460,11 +3681,12 @@ class WhisperTypeApp:
                 # Clear the saved key and switch to local
                 self.config["groq_api_key"] = ""
                 self._groq_transcriber = None
+                self._llm_cleaner = None  # cleanup shared the same key
                 if self.config.get("transcription_backend") == "groq":
                     self.transcriber = self._local_transcriber
                     self.config["transcription_backend"] = "local"
                 save_config(self.config)
-                log.info("Groq API key cleared")
+                log.info("Groq API key cleared (transcribe + cleanup disabled)")
                 status_label.config(text="Key cleared. Backend: Local.", fg="#a6adc8")
                 root.after(800, root.destroy)
 
@@ -3532,7 +3754,14 @@ class WhisperTypeApp:
                     self.transcriber = groq
                     self.config["transcription_backend"] = "groq"
                     save_config(self.config)
-                    log.info("Groq API key saved & activated")
+                    # AI cleanup uses the same key — create it here too so
+                    # the user doesn't have to restart to get cleanup working
+                    # after setting up Groq for the first time.
+                    self._llm_cleaner = GroqLLMCleaner(
+                        api_key=new_key,
+                        model=self.config.get("cleanup_llm_model", "llama-3.3-70b-versatile"),
+                    )
+                    log.info("Groq API key saved & activated (transcribe + cleanup)")
                     status_label.config(text="Key valid. Switched to Groq Cloud.", fg="#a6e3a1")
                     try:
                         self.overlay.show_done()
