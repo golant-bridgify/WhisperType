@@ -1074,20 +1074,45 @@ class GroqLLMCleaner:
         "casual": (
             "You are a transcription cleanup assistant. The user dictated "
             "text via speech-to-text. Clean it up:\n"
-            "- Remove filler words (um, uh, like, אה, יעני, בעצם, כאילו).\n"
+            "- Remove filler words (um, uh, like, אה, יעני, בעצם, כאילו, "
+            "אממ, נו).\n"
             "- Add proper punctuation and sentence casing.\n"
-            "- Fix obvious mis-hearings when context makes them unambiguous.\n"
-            "- Preserve the exact meaning and the speaker's voice.\n"
+            "- Fix spelling errors, typos, and obvious mis-hearings (wrong "
+            "homophone, wrong letter at end of word, missing letter). Use "
+            "the surrounding context to pick the most likely intended word. "
+            "Example Hebrew: 'הולק' → 'הולך', 'שלומק' → 'שלומך'. "
+            "Example English: 'there going' → 'they're going', 'to now' → "
+            "'to know'.\n"
+            "- Fix basic grammar errors (verb agreement, prepositions).\n"
+            "- Preserve the speaker's voice, style, and intentional slang.\n"
             "- Keep the SAME LANGUAGE as the input (Hebrew stays Hebrew, "
             "English stays English, mixed stays mixed).\n"
-            "- Do NOT rephrase, summarise, translate, or add content.\n"
+            "- Do NOT rephrase sentences, summarise, translate, or add new "
+            "content. Do NOT change word choice beyond fixing clear errors.\n"
             "- Respond with ONLY the cleaned text — no preface, no quotes, "
+            "no explanations."
+        ),
+        "proofread": (
+            "You are a professional proofreader. The user dictated text "
+            "via speech-to-text. Fully polish it:\n"
+            "- Fix ALL spelling, grammar, punctuation, and capitalisation "
+            "errors.\n"
+            "- Fix misheard words, homophones, and typos using context "
+            "(Hebrew and English alike).\n"
+            "- Fix awkward phrasing and unclear sentences. Improve sentence "
+            "structure and flow where clearly beneficial.\n"
+            "- Remove filler words, verbal tics, and redundancy.\n"
+            "- Preserve the EXACT meaning — never add or remove ideas, "
+            "never translate.\n"
+            "- Keep the same language as the input.\n"
+            "- Respond with ONLY the polished text — no preface, no quotes, "
             "no explanations."
         ),
         "email": (
             "You are a transcription cleanup assistant. Polish the user's "
             "spoken dictation into email-ready prose:\n"
             "- Proper capitalisation, punctuation, paragraph breaks.\n"
+            "- Fix ALL spelling errors, typos, and grammar issues.\n"
             "- Remove filler words and redundancy.\n"
             "- Improve flow while preserving meaning.\n"
             "- Maintain the speaker's voice and language.\n"
@@ -1099,8 +1124,11 @@ class GroqLLMCleaner:
             "dictation:\n"
             "- Preserve code terms, variable names, product names, and "
             "technical vocabulary EXACTLY (React, API, async, OAuth, "
-            "Kubernetes, etc.).\n"
-            "- Fix grammar and punctuation around technical terms.\n"
+            "Kubernetes, etc.). If a technical term was misheard (e.g. "
+            "'קוברנטיס' → 'Kubernetes', 'אסינק' → 'async'), fix it to the "
+            "correct canonical spelling.\n"
+            "- Fix spelling, grammar, and punctuation around technical "
+            "terms.\n"
             "- Remove filler words.\n"
             "- Keep the same language.\n"
             "- Respond with ONLY the cleaned text."
@@ -3424,7 +3452,8 @@ class WhisperTypeApp:
     # ----- AI Cleanup menu -----
     CLEANUP_MENU_STYLES = [
         ("Off — raw transcription", "off"),
-        ("Casual ⭐ — remove fillers, add punctuation", "casual"),
+        ("Casual ⭐ — fillers, typos, basic grammar", "casual"),
+        ("Proofread — full spelling + grammar polish", "proofread"),
         ("Email polish — email-ready prose", "email"),
         ("Technical/Code — preserve tech terms", "code"),
     ]
