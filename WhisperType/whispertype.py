@@ -1318,6 +1318,382 @@ class GroqLLMCleaner:
 
 
 # ============================================================
+# Meeting Mode — long-form chunked recording
+# ============================================================
+MEETINGS_DIR = os.path.join(CONFIG_DIR, "meetings")
+
+
+class MeetingSession:
+    """A running meeting recording.
+
+    A meeting is a long-form capture (minutes to hours) where the user
+    does NOT hold down a hotkey. Instead we record continuously and
+    rotate the underlying recorder every N seconds, sending each chunk
+    to Groq for transcription. On stop we assemble the full transcript,
+    ask an LLM to produce a summary + action items, and save everything
+    as a markdown file.
+
+    Design notes:
+      - Rotating recorder (stop + start fresh) vs. snapshotting a live
+        buffer: rotating keeps memory bounded to one chunk-worth of
+        audio regardless of meeting length. Cost: a ~50-100ms gap
+        between chunks where audio is lost. Acceptable for meetings.
+      - Each chunk is transcribed in a fire-and-forget thread as soon
+        as it's produced. Chunks are written to self.chunks in order
+        (indexed by chunk number) so out-of-order Groq responses can
+        still be re-assembled correctly.
+      - On stop: wait for any in-flight transcription jobs, then
+        assemble + summarise + save.
+      - On app quit mid-meeting: best-effort save of whatever chunks
+        have completed, skip summary.
+    """
+    # Chunk length — long enough to minimise Groq round-trip overhead,
+    # short enough to bound memory and give responsive transcript updates.
+    CHUNK_SECONDS = 45
+
+    def __init__(self, app, source=None, input_device_index=None,
+                 loopback_device_index=None):
+        self.app = app
+        self.source = source or app.config.get("recording_source", "both")
+        self._input_device_index = (
+            input_device_index if input_device_index is not None
+            else app.config.get("input_device_index")
+        )
+        self._loopback_device_index = (
+            loopback_device_index if loopback_device_index is not None
+            else app.config.get("loopback_device_index")
+        )
+        self.start_time = None          # float (time.time()) when start() was called
+        self.stop_time = None
+        # chunks: list of dicts {index, timestamp_rel, text, status}
+        # status is 'pending' | 'ok' | 'failed'
+        self.chunks = []
+        self._chunks_lock = threading.Lock()
+        self._next_chunk_index = 0
+        self._active = False
+        self._stop_event = threading.Event()
+        self._rotation_thread = None
+        self._mic_recorder = None
+        self._loopback_recorder = None
+        # Track in-flight transcription threads so stop() can wait for them
+        self._pending_jobs = []
+        self._pending_lock = threading.Lock()
+
+    # ---- lifecycle ----
+    def start(self):
+        if self._active:
+            return
+        os.makedirs(MEETINGS_DIR, exist_ok=True)
+        self._active = True
+        self.start_time = time.time()
+        self._stop_event.clear()
+        self._open_recorders()
+        self._rotation_thread = threading.Thread(
+            target=self._rotation_loop, daemon=True
+        )
+        self._rotation_thread.start()
+        log.info("Meeting started (source=%s, chunk=%ds)",
+                 self.source, self.CHUNK_SECONDS)
+
+    def stop(self, save=True):
+        """Stop the meeting. If save=True, writes the markdown file and
+        returns its path. Otherwise returns None."""
+        if not self._active:
+            return None
+        self._active = False
+        self._stop_event.set()
+        self.stop_time = time.time()
+
+        # Let the rotation loop finalise the last chunk
+        if self._rotation_thread and self._rotation_thread.is_alive():
+            self._rotation_thread.join(timeout=10.0)
+
+        # Transcribe whatever audio was in the current recorder
+        self._finalise_current_chunk()
+
+        # Wait (bounded) for any in-flight chunk transcriptions
+        self._wait_for_pending_jobs(timeout=60.0)
+
+        duration_sec = self.stop_time - self.start_time
+        log.info("Meeting stopped (duration=%.1fs, chunks=%d)",
+                 duration_sec, len(self.chunks))
+
+        if save:
+            return self._write_output_file(duration_sec)
+        return None
+
+    # ---- recorder management ----
+    def _open_recorders(self):
+        """Create + start the recorders based on the meeting's source mode."""
+        self._mic_recorder = None
+        self._loopback_recorder = None
+        if self.source in ("microphone", "both"):
+            self._mic_recorder = AudioRecorder(
+                input_device_index=self._input_device_index
+            )
+            self._mic_recorder.start()
+        if self.source in ("stereo_mix", "both") and LoopbackRecorder.is_available():
+            try:
+                self._loopback_recorder = LoopbackRecorder(
+                    loopback_device_index=self._loopback_device_index
+                )
+                self._loopback_recorder.start()
+            except Exception as e:
+                log.warning("Meeting: loopback start failed (%s) — mic only", e)
+                self._loopback_recorder = None
+
+    def _close_and_grab(self):
+        """Stop the current recorders and return the combined audio array.
+
+        Returns None if nothing usable was captured.
+        """
+        mic_audio = None
+        loop_audio = None
+        if self._mic_recorder is not None:
+            try:
+                mic_audio = self._mic_recorder.stop()
+            except Exception as e:
+                log.warning("Meeting: mic stop failed: %s", e)
+            self._mic_recorder = None
+        if self._loopback_recorder is not None:
+            try:
+                loop_audio = self._loopback_recorder.stop()
+            except Exception as e:
+                log.warning("Meeting: loopback stop failed: %s", e)
+            self._loopback_recorder = None
+
+        if mic_audio is not None and loop_audio is not None and len(loop_audio) > 0:
+            return mix_audio(mic_audio, loop_audio)
+        if mic_audio is not None and len(mic_audio) > 0:
+            return mic_audio
+        if loop_audio is not None and len(loop_audio) > 0:
+            return loop_audio
+        return None
+
+    # ---- main rotation loop ----
+    def _rotation_loop(self):
+        """Every CHUNK_SECONDS: snapshot current audio → spawn transcribe job
+        → start a fresh recorder. Exits when stop_event is set."""
+        while not self._stop_event.wait(timeout=self.CHUNK_SECONDS):
+            if not self._active:
+                break
+            try:
+                audio = self._close_and_grab()
+                # Start the next chunk's recording BEFORE we kick off
+                # the transcription — minimises the audio gap.
+                if self._active:
+                    self._open_recorders()
+                if audio is not None and len(audio) >= 8000:  # at least 0.5s
+                    self._submit_chunk(audio)
+            except Exception as e:
+                log.error("Meeting rotation loop error: %s", e)
+
+    def _finalise_current_chunk(self):
+        """Called once on stop — transcribes whatever is in the active recorder."""
+        try:
+            audio = self._close_and_grab()
+            if audio is not None and len(audio) >= 8000:
+                self._submit_chunk(audio, blocking=True)
+        except Exception as e:
+            log.error("Meeting final chunk failed: %s", e)
+
+    # ---- chunk transcription ----
+    def _submit_chunk(self, audio_np, blocking=False):
+        """Reserve an index (preserves ordering even if Groq responds
+        out-of-order), then transcribe in a background thread."""
+        with self._chunks_lock:
+            idx = self._next_chunk_index
+            self._next_chunk_index += 1
+            rel_ts = (time.time() - self.start_time) if self.start_time else 0
+            self.chunks.append({
+                "index": idx,
+                "timestamp_rel": rel_ts,
+                "text": "",
+                "status": "pending",
+            })
+
+        def worker():
+            try:
+                text = self.app._transcribe_with_fallback(
+                    audio_np,
+                    language=self.app._get_language(),
+                    beam_size=1,
+                    task="transcribe",
+                )
+                text = text or ""
+            except Exception as e:
+                log.warning("Meeting chunk #%d transcription failed: %s", idx, e)
+                text = ""
+
+            with self._chunks_lock:
+                for c in self.chunks:
+                    if c["index"] == idx:
+                        c["text"] = text
+                        c["status"] = "ok" if text else "failed"
+                        break
+            log.info("Meeting chunk #%d: %d chars", idx, len(text))
+
+        t = threading.Thread(target=worker, daemon=True)
+        with self._pending_lock:
+            self._pending_jobs.append(t)
+        t.start()
+        if blocking:
+            t.join(timeout=60.0)
+
+    def _wait_for_pending_jobs(self, timeout=60.0):
+        """Block until all chunk transcriptions have finished (or timeout)."""
+        deadline = time.time() + timeout
+        with self._pending_lock:
+            jobs = list(self._pending_jobs)
+        for t in jobs:
+            remain = max(0.5, deadline - time.time())
+            if t.is_alive():
+                t.join(timeout=remain)
+
+    # ---- output ----
+    def _assemble_transcript_markdown(self):
+        """Return the chunk-by-chunk transcript as markdown with timestamps."""
+        with self._chunks_lock:
+            sorted_chunks = sorted(self.chunks, key=lambda c: c["index"])
+        lines = []
+        for c in sorted_chunks:
+            if c["status"] == "failed":
+                lines.append(f"### {_fmt_relative_ts(c['timestamp_rel'])}")
+                lines.append("_[transcription failed]_")
+                lines.append("")
+                continue
+            if not c["text"]:
+                continue
+            lines.append(f"### {_fmt_relative_ts(c['timestamp_rel'])}")
+            lines.append(c["text"].replace('\u200F', '').replace('\u200E', '').strip())
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _assemble_transcript_plain(self):
+        """Flat transcript text (for the LLM summarisation prompt)."""
+        with self._chunks_lock:
+            sorted_chunks = sorted(self.chunks, key=lambda c: c["index"])
+        texts = []
+        for c in sorted_chunks:
+            if c["status"] == "ok" and c["text"]:
+                texts.append(c["text"].replace('\u200F', '').replace('\u200E', '').strip())
+        return "\n".join(texts).strip()
+
+    def _summarise(self, plain_transcript):
+        """Ask the Groq LLM for summary + action items. Returns (summary, action_items)
+        as (str, str). On failure returns ("", "")."""
+        cleaner = self.app._llm_cleaner
+        if not cleaner or not cleaner.api_key or not plain_transcript.strip():
+            return "", ""
+        try:
+            import requests
+            system = (
+                "You are a meeting-notes assistant. You will receive a raw "
+                "meeting transcript. Produce TWO sections, in the PRIMARY "
+                "LANGUAGE OF THE TRANSCRIPT, separated by an empty line:\n\n"
+                "1) A 'Summary' section: 3-6 concise bullet points of the "
+                "main topics and decisions.\n"
+                "2) An 'Action Items' section: a checklist of follow-up "
+                "tasks, decisions, or next steps, each on its own line "
+                "prefixed with '- [ ]'. If no action items, write '- (none)'.\n\n"
+                "Format with markdown headers (## Summary, ## Action Items). "
+                "Be faithful to what was said — do NOT invent tasks or "
+                "information that was not in the transcript. Respond with "
+                "ONLY these two sections, no preface."
+            )
+            resp = requests.post(
+                cleaner.CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {cleaner.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": cleaner.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": plain_transcript},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 1500,
+                    "stream": False,
+                },
+                timeout=(10, 60),
+            )
+            if resp.status_code != 200:
+                log.warning("Meeting summary: HTTP %d — skipping", resp.status_code)
+                return "", ""
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            # Split on "## Action Items" for basic separation
+            summary = content
+            action_items = ""
+            if "## Action Items" in content:
+                summary, _, action_items = content.partition("## Action Items")
+                summary = summary.strip()
+                action_items = "## Action Items" + action_items
+            return summary, action_items
+        except Exception as e:
+            log.warning("Meeting summary failed: %s", e)
+            return "", ""
+
+    def _write_output_file(self, duration_sec):
+        """Assemble and save the meeting markdown file. Returns the path."""
+        import datetime
+        os.makedirs(MEETINGS_DIR, exist_ok=True)
+        start_dt = datetime.datetime.fromtimestamp(self.start_time)
+        mins = int(duration_sec // 60)
+        secs = int(duration_sec - mins * 60)
+        fname = start_dt.strftime("%Y-%m-%d_%H-%M") + "_meeting.md"
+        path = os.path.join(MEETINGS_DIR, fname)
+
+        transcript_md = self._assemble_transcript_markdown()
+        plain = self._assemble_transcript_plain()
+
+        # Summarisation (LLM) — best effort, non-fatal
+        summary_md, action_items_md = "", ""
+        if plain:
+            summary_md, action_items_md = self._summarise(plain)
+
+        # ---- Compose the final markdown ----
+        sections = []
+        sections.append(f"# Meeting — {start_dt.strftime('%Y-%m-%d %H:%M')}")
+        sections.append(f"*Duration: {mins}m {secs}s · {len(self.chunks)} chunks · "
+                        f"source: {self.source}*")
+        sections.append("")
+        if summary_md:
+            # summary_md already starts with "## Summary" from the LLM
+            if not summary_md.startswith("##"):
+                summary_md = "## Summary\n\n" + summary_md
+            sections.append(summary_md)
+            sections.append("")
+        if action_items_md:
+            sections.append(action_items_md)
+            sections.append("")
+        if not summary_md and not action_items_md:
+            sections.append("## Summary\n\n_(LLM summary unavailable — transcript below)_\n")
+        sections.append("---")
+        sections.append("")
+        sections.append("## Full Transcript")
+        sections.append("")
+        sections.append(transcript_md or "_(no transcript)_")
+        content = "\n".join(sections)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info("Meeting saved: %s (%d chars)", path, len(content))
+        return path
+
+
+def _fmt_relative_ts(seconds):
+    """Format a seconds-offset as mm:ss or hh:mm:ss."""
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+# ============================================================
 # Text Paster - types text into active window
 # ============================================================
 def _copy_with_retry(text, retries=3, delay=0.08):
@@ -2122,6 +2498,11 @@ class WhisperTypeApp:
         # up the audio stack if the machine was idle for a long time
         # (Windows sleep/suspend leaves WASAPI needing a fresh init).
         self._last_recording_time = 0.0
+        # Meeting Mode state — an in-progress long-form capture. When not
+        # None, the main press-to-dictate hotkey is blocked (you can't
+        # run two recorders at once on most Windows audio stacks).
+        self._active_meeting = None
+        self._meeting_lock = threading.Lock()
 
     def run(self):
         """Main entry point."""
@@ -2187,6 +2568,15 @@ class WhisperTypeApp:
                         "Custom Vocabulary...",
                         lambda: self._open_vocabulary_dialog(),
                     ),
+                    pystray.Menu.SEPARATOR,
+                    # Dynamic label: swaps between "Start Meeting" and
+                    # "Stop Meeting" based on whether a session is active.
+                    pystray.MenuItem(
+                        lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
+                                       else "🎙  Start Meeting (long recording)"),
+                        lambda: self._toggle_meeting(),
+                    ),
+                    pystray.Menu.SEPARATOR,
                     pystray.MenuItem(
                         "Beep Output",
                         pystray.Menu(self._build_beep_output_menu),
@@ -2338,6 +2728,16 @@ class WhisperTypeApp:
             # X shape (diagonal lines through the center)
             draw.line([(20, 20), (44, 44)], fill=(255, 255, 255), width=5)
             draw.line([(44, 20), (20, 44)], fill=(255, 255, 255), width=5)
+        elif state == "meeting":
+            # Deep purple circle with a white "dot" — meeting recording.
+            # Purple distinguishes it from the bright red 'recording' state
+            # (single press-to-talk) while still reading as "capturing now".
+            draw.ellipse([4, 4, size - 4, size - 4], fill=(88, 28, 135), outline=(255, 255, 255), width=2)
+            # Red inner dot — the classic 'REC' indicator
+            draw.ellipse([25, 25, 39, 39], fill=(239, 68, 68))
+            # Two horizontal "recording" bars above and below
+            draw.rounded_rectangle([18, 14, 46, 18], radius=2, fill=(255, 255, 255))
+            draw.rounded_rectangle([18, 46, 46, 50], radius=2, fill=(255, 255, 255))
 
         return img
 
@@ -2402,6 +2802,21 @@ class WhisperTypeApp:
                     # Wait for key RELEASE before listening again — otherwise
                     # keyboard.wait() returns instantly while the key is held,
                     # producing a tight busy-loop.
+                    while any(keyboard.is_pressed(p) for p in parts):
+                        time.sleep(0.1)
+                    time.sleep(0.1)
+                    continue
+
+                # Block press-to-talk while a meeting is recording. Two
+                # PyAudio streams on the same mic device is unreliable on
+                # Windows, and semantically it doesn't make sense — the
+                # meeting already captures everything you're saying.
+                if self._is_meeting_active():
+                    log.info("Hotkey ignored — meeting is recording")
+                    try:
+                        self.overlay.show_error("Meeting active — click tray to stop")
+                    except Exception:
+                        pass
                     while any(keyboard.is_pressed(p) for p in parts):
                         time.sleep(0.1)
                     time.sleep(0.1)
@@ -3598,6 +4013,92 @@ class WhisperTypeApp:
         self.config["cleanup_style"] = style
         save_config(self.config)
         log.info("Cleanup style: %s", style)
+
+    # ----- Meeting Mode -----
+    def _is_meeting_active(self):
+        """Thread-safe check — used by the tray menu predicates."""
+        return self._active_meeting is not None
+
+    def _toggle_meeting(self):
+        """Start a meeting if none active, else stop the current one.
+        Invoked from the 'Start/Stop Meeting' tray menu item."""
+        with self._meeting_lock:
+            already_active = self._active_meeting is not None
+        if already_active:
+            self._stop_meeting()
+        else:
+            self._start_meeting()
+
+    def _start_meeting(self):
+        """Start a long-form meeting capture.
+
+        Blocks the main press-to-talk hotkey until the meeting is stopped,
+        because running two PyAudio streams on the same device
+        simultaneously is unreliable on Windows.
+        """
+        with self._meeting_lock:
+            if self._active_meeting is not None:
+                return
+            if self.is_recording:
+                log.warning("Meeting blocked: a press-to-talk recording is active")
+                self.overlay.show_error("Finish current recording first")
+                return
+            if not self.model_loaded:
+                log.warning("Meeting blocked: model still loading")
+                self.overlay.show_error("Model still loading")
+                return
+            try:
+                session = MeetingSession(self)
+                session.start()
+                self._active_meeting = session
+            except Exception as e:
+                log.error("Failed to start meeting: %s", e)
+                self.overlay.show_error(f"Meeting start failed: {e}")
+                return
+
+        if self.tray_icon:
+            self.tray_icon.icon = self._create_icon("meeting")
+            self.tray_icon.title = "WhisperType — Meeting recording..."
+        self.overlay.show("  🎙  Meeting recording — click tray to stop  ",
+                          bg_color="#581C87", duration=2500)
+        log.info("Meeting active")
+
+    def _stop_meeting(self):
+        """Stop the in-progress meeting, produce a markdown file with
+        summary + action items + full transcript, and open it."""
+        with self._meeting_lock:
+            session = self._active_meeting
+            if session is None:
+                return
+            self._active_meeting = None
+
+        if self.tray_icon:
+            self.tray_icon.icon = self._create_icon("processing")
+            self.tray_icon.title = "WhisperType — Finalising meeting..."
+        self.overlay.show("  ⏳  Finalising meeting...  ", bg_color="#f77f00")
+
+        # Heavy lifting (last chunk transcription + LLM summary) in a thread
+        # so the tray stays responsive.
+        def finalise():
+            path = None
+            try:
+                path = session.stop(save=True)
+            except Exception as e:
+                log.exception("Meeting finalisation failed: %s", e)
+                self.overlay.show_error("Meeting save failed")
+            finally:
+                if self.tray_icon:
+                    self.tray_icon.icon = self._create_icon("idle")
+                    self.tray_icon.title = "WhisperType — Ready"
+            if path and os.path.exists(path):
+                try:
+                    os.startfile(path)
+                except Exception as e:
+                    log.warning("Could not open meeting file: %s", e)
+                self.overlay.show_done()
+                self._play_done_beep()
+
+        threading.Thread(target=finalise, daemon=True).start()
 
     def _open_vocabulary_dialog(self):
         """Simple multi-line dialog for editing custom_vocabulary.
