@@ -1,8 +1,13 @@
 """
 Generate whispertype.ico - a multi-size Windows icon for WhisperType.
 
-Produces a modern microphone icon with a purple/blue gradient background,
-exported as a multi-resolution .ico file (16, 32, 48, 64, 128, 256).
+Design: dark premium / tech-forward.
+- Near-black slate background with a soft purple glow from centre-out
+- Cyan/icy microphone that appears to glow (neon halo)
+- Minimal, confident — distinct from the purple-gradient Apple-esque icon
+  we started with
+
+Exported as a multi-resolution .ico (16, 24, 32, 48, 64, 128, 256).
 """
 
 import os
@@ -15,75 +20,41 @@ def lerp_color(c1, c2, t):
 
 def draw_icon(size):
     """Draw a WhisperType icon at the given size."""
-    # Work at 4x for supersampling, then downscale
+    # Work at 4x for supersampling, then downscale with Lanczos.
     scale = 4
     s = size * scale
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
 
-    # --- Rounded-square background with vertical gradient ---
-    # Top color (lighter purple) -> bottom color (deeper purple)
-    top_color = (124, 92, 255)      # #7C5CFF
-    bot_color = (45, 27, 105)       # #2D1B69
+    # --- Rounded-square base: near-black slate ---
+    base = Image.new("RGBA", (s, s), (15, 23, 42, 255))  # slate-900
 
-    # Create gradient on a separate layer
-    gradient = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(gradient)
-    for y in range(s):
-        t = y / (s - 1)
-        color = lerp_color(top_color, bot_color, t) + (255,)
-        gd.line([(0, y), (s, y)], fill=color)
+    # --- Purple radial glow bleeding out from centre ---
+    glow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    gld = ImageDraw.Draw(glow)
+    gld.ellipse(
+        [int(s * 0.15), int(s * 0.15), int(s * 0.85), int(s * 0.85)],
+        fill=(139, 92, 246, 180),  # violet-500 with opacity
+    )
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=s // 8))
+    base = Image.alpha_composite(base, glow)
 
-    # Mask: rounded square
+    # --- Rounded-square mask (22% corner radius) ---
     mask = Image.new("L", (s, s), 0)
     md = ImageDraw.Draw(mask)
     radius = int(s * 0.22)
     md.rounded_rectangle([0, 0, s - 1, s - 1], radius=radius, fill=255)
 
-    # Apply mask to gradient
     bg = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    bg.paste(gradient, (0, 0), mask)
-
-    # Subtle inner glow on top edge
-    glow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    gdl = ImageDraw.Draw(glow)
-    gdl.rounded_rectangle(
-        [int(s * 0.05), int(s * 0.05), int(s * 0.95), int(s * 0.5)],
-        radius=radius,
-        fill=(255, 255, 255, 28),
-    )
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=s // 40))
-    bg = Image.alpha_composite(bg, glow)
-
+    bg.paste(base, (0, 0), mask)
     img = Image.alpha_composite(img, bg)
     draw = ImageDraw.Draw(img)
 
-    # --- Sound waves (arcs on each side of the microphone) ---
-    cx, cy = s // 2, int(s * 0.48)
-    wave_color = (255, 255, 255, 170)
+    # --- Microphone dimensions ---
+    cx = s // 2
+    neon = (165, 243, 252)  # cyan-100 (icy white-cyan)
+    halo_color = (34, 211, 238, 255)  # cyan-400 for the glow around it
 
-    # Two arcs on each side
-    arc_stroke = max(2, s // 48)
-    for i, r in enumerate([int(s * 0.30), int(s * 0.38)]):
-        # Left side
-        draw.arc(
-            [cx - r, cy - r, cx + r, cy + r],
-            start=135,
-            end=225,
-            fill=wave_color,
-            width=arc_stroke,
-        )
-        # Right side
-        draw.arc(
-            [cx - r, cy - r, cx + r, cy + r],
-            start=-45,
-            end=45,
-            fill=wave_color,
-            width=arc_stroke,
-        )
-
-    # --- Microphone body ---
-    mic_w = int(s * 0.22)
+    mic_w = int(s * 0.24)
     mic_h = int(s * 0.36)
     mic_x0 = cx - mic_w // 2
     mic_y0 = int(s * 0.22)
@@ -91,57 +62,79 @@ def draw_icon(size):
     mic_y1 = mic_y0 + mic_h
     mic_radius = mic_w // 2
 
-    # Soft shadow behind the mic
-    shadow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    offset = max(2, s // 80)
-    sd.rounded_rectangle(
-        [mic_x0 + offset, mic_y0 + offset, mic_x1 + offset, mic_y1 + offset],
-        radius=mic_radius,
-        fill=(0, 0, 0, 90),
+    # --- Neon halo / glow around the mic body ---
+    halo = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(halo)
+    # Slightly larger-than-mic coloured shape that we then heavily blur
+    pad = max(2, s // 80)
+    hd.rounded_rectangle(
+        [mic_x0 - pad, mic_y0 - pad, mic_x1 + pad, mic_y1 + pad],
+        radius=mic_radius + pad,
+        fill=halo_color,
     )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=s // 60))
-    img = Image.alpha_composite(img, shadow)
+    halo = halo.filter(ImageFilter.GaussianBlur(radius=s // 40))
+    img = Image.alpha_composite(img, halo)
     draw = ImageDraw.Draw(img)
 
-    # Mic body (white)
+    # --- Mic body (solid cyan-white) ---
     draw.rounded_rectangle(
         [mic_x0, mic_y0, mic_x1, mic_y1],
         radius=mic_radius,
-        fill=(255, 255, 255, 255),
+        fill=neon + (255,),
     )
 
-    # --- Mic stand (U-shape + vertical line + base) ---
+    # --- Mic stand: U-shape arc + vertical line + horizontal base ---
     stand_stroke = max(3, s // 28)
     stand_r_outer = int(s * 0.20)
-    stand_cy = int(s * 0.58)
+    stand_cy = int(s * 0.60)
+
+    # Halo glow for the stand too (keeps the neon consistency)
+    stand_halo = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    shd = ImageDraw.Draw(stand_halo)
+    shd.arc(
+        [cx - stand_r_outer, stand_cy - stand_r_outer,
+         cx + stand_r_outer, stand_cy + stand_r_outer],
+        start=0, end=180,
+        fill=halo_color,
+        width=stand_stroke + 2,
+    )
+    line_top = stand_cy + stand_r_outer - stand_stroke // 3
+    line_bottom = int(s * 0.82)
+    shd.line(
+        [cx, line_top, cx, line_bottom],
+        fill=halo_color,
+        width=stand_stroke + 2,
+    )
+    base_half = int(s * 0.11)
+    shd.line(
+        [cx - base_half, line_bottom, cx + base_half, line_bottom],
+        fill=halo_color,
+        width=stand_stroke + 2,
+    )
+    stand_halo = stand_halo.filter(ImageFilter.GaussianBlur(radius=s // 55))
+    img = Image.alpha_composite(img, stand_halo)
+    draw = ImageDraw.Draw(img)
+
+    # Solid stand in neon colour
     draw.arc(
         [cx - stand_r_outer, stand_cy - stand_r_outer,
          cx + stand_r_outer, stand_cy + stand_r_outer],
-        start=0,
-        end=180,
-        fill=(255, 255, 255, 255),
+        start=0, end=180,
+        fill=neon + (255,),
         width=stand_stroke,
     )
-
-    # Vertical line from U down to base
-    line_top = stand_cy + stand_r_outer - stand_stroke // 2
-    line_bottom = int(s * 0.84)
     draw.line(
         [cx, line_top, cx, line_bottom],
-        fill=(255, 255, 255, 255),
+        fill=neon + (255,),
         width=stand_stroke,
     )
-
-    # Base (horizontal line)
-    base_half = int(s * 0.11)
     draw.line(
         [cx - base_half, line_bottom, cx + base_half, line_bottom],
-        fill=(255, 255, 255, 255),
+        fill=neon + (255,),
         width=stand_stroke,
     )
 
-    # Downscale with high-quality Lanczos
+    # --- Downscale for final output ---
     return img.resize((size, size), Image.LANCZOS)
 
 
@@ -152,12 +145,12 @@ def main():
     sizes = [16, 24, 32, 48, 64, 128, 256]
     images = [draw_icon(s) for s in sizes]
 
-    # Save as multi-size .ico (largest is the base, PIL embeds the rest)
+    # Save as multi-size .ico — largest as base, PIL embeds the rest
     base = images[-1]
     base.save(
         out_path,
         format="ICO",
-        sizes=[(s, s) for s in sizes],
+        sizes=[(sz, sz) for sz in sizes],
         append_images=images[:-1],
     )
 
