@@ -20,16 +20,27 @@ import logging
 import numpy as np
 
 # --- Logging (replaces print, no console window needed) ---
+# Uses RotatingFileHandler so the log never grows unbounded — on a PC
+# running auto-start daily, a plain FileHandler would reach hundreds of MB
+# within a few weeks (especially if any loop errors — e.g. waveform_updater
+# throwing at 20Hz can write 10MB/hour).
+# Caps at ~2MB × 3 rotated backups = ~8MB max total on disk.
+from logging.handlers import RotatingFileHandler
+
 LOG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WhisperType")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "whispertype.log")
 
+_log_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=2 * 1024 * 1024,  # 2 MB per file
+    backupCount=3,             # keep .1/.2/.3 rotations
+    encoding="utf-8",
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
+    handlers=[_log_handler],
 )
 log = logging.getLogger("WhisperType")
 
@@ -313,17 +324,44 @@ MODEL_LANGUAGE = {
 def load_config():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-            # Merge with defaults for any new keys
-            for k, v in DEFAULT_CONFIG.items():
-                if k not in cfg:
-                    cfg[k] = v
-            # Migrate old auto_paste boolean to new paste_mode
-            if "auto_paste" in cfg and "paste_mode" not in cfg:
-                cfg["paste_mode"] = "auto_paste" if cfg["auto_paste"] else "clipboard_only"
-            return cfg
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            log.warning("Config file corrupt or unreadable (%s) — using defaults", e)
+            return DEFAULT_CONFIG.copy()
+        # Merge with defaults for any new keys
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in cfg:
+                cfg[k] = v
+        # Migrate old auto_paste boolean to new paste_mode
+        if "auto_paste" in cfg and "paste_mode" not in cfg:
+            cfg["paste_mode"] = "auto_paste" if cfg["auto_paste"] else "clipboard_only"
+        # Migrate legacy direct_type paste mode — removed from UI but still
+        # reachable if config has the old value. Hebrew pastes as garbage
+        # via keyboard.write() so force-migrate to auto_paste.
+        if cfg.get("paste_mode") == "direct_type":
+            log.info("Migrating legacy paste_mode 'direct_type' → 'auto_paste'")
+            cfg["paste_mode"] = "auto_paste"
+        return cfg
     return DEFAULT_CONFIG.copy()
+
+
+def is_user_admin():
+    """Return True if this process is running with admin (elevated) rights.
+
+    Global hotkeys + paste-into-admin-apps require admin rights on Windows.
+    Without them, the user may see 'app sometimes doesn't produce output'
+    when they're focused on Task Manager, regedit, or anything else started
+    via 'Run as administrator'.
+    """
+    if os.name != 'nt':
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 # Serialize config writes across threads. Config is written from the tray
@@ -392,11 +430,24 @@ class AudioRecorder:
 
     def stop(self) -> np.ndarray:
         self.is_recording = False
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
-        if self._pa:
-            self._pa.terminate()
+        try:
+            if self._stream:
+                try:
+                    self._stream.stop_stream()
+                except Exception as e:
+                    log.warning("AudioRecorder.stop_stream failed: %s", e)
+                try:
+                    self._stream.close()
+                except Exception as e:
+                    log.warning("AudioRecorder.close failed: %s", e)
+        finally:
+            # ALWAYS terminate PyAudio — if we skipped this, the native
+            # context would leak and eventually exhaust system audio handles.
+            if self._pa:
+                try:
+                    self._pa.terminate()
+                except Exception as e:
+                    log.warning("AudioRecorder.pa.terminate failed: %s", e)
 
         if not self.audio_data:
             return np.array([], dtype=np.float32)
@@ -513,11 +564,25 @@ class LoopbackRecorder:
 
     def stop(self) -> np.ndarray:
         self.is_recording = False
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
-        if self._pa:
-            self._pa.terminate()
+        try:
+            if self._stream:
+                try:
+                    self._stream.stop_stream()
+                except Exception as e:
+                    log.warning("LoopbackRecorder.stop_stream failed: %s", e)
+                try:
+                    self._stream.close()
+                except Exception as e:
+                    log.warning("LoopbackRecorder.close failed: %s", e)
+        finally:
+            # ALWAYS terminate — common WASAPI edge case: device was unplugged
+            # mid-recording, stream.close() raises OSError, and without this
+            # finally the PyAudio context would leak a native handle.
+            if self._pa:
+                try:
+                    self._pa.terminate()
+                except Exception as e:
+                    log.warning("LoopbackRecorder.pa.terminate failed: %s", e)
 
         if not self.audio_data:
             return np.array([], dtype=np.float32)
@@ -988,40 +1053,98 @@ class GroqTranscriber(BaseTranscriber):
 # ============================================================
 # Text Paster - types text into active window
 # ============================================================
-def clipboard_paste(text):
-    """Paste text via clipboard using keyboard library (avoids conflicts with pyautogui)."""
+def _copy_with_retry(text, retries=3, delay=0.08):
+    """Copy text to clipboard with retries + verification.
+
+    pyperclip.copy() can silently fail when another app holds the clipboard
+    (Excel cell in edit mode, RDP reconnect, some antivirus). On failure,
+    a subsequent Ctrl+V would paste the STALE clipboard content — the user
+    would see the wrong text appear with no error.
+
+    We retry up to 3 times and verify the readback matches what we tried
+    to write. Returns (ok, message). On total failure, caller should log
+    and skip the paste rather than pasting stale content.
+    """
     import pyperclip
+    last_err = None
+    for attempt in range(retries):
+        try:
+            pyperclip.copy(text)
+            time.sleep(0.03)
+            # Verify — pyperclip.paste() reads back whatever is on the clipboard
+            got = pyperclip.paste()
+            if got == text:
+                return True, "OK"
+            last_err = f"readback mismatch (attempt {attempt + 1}/{retries})"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e} (attempt {attempt + 1}/{retries})"
+        time.sleep(delay)
+    return False, last_err or "unknown failure"
+
+
+def clipboard_paste(text):
+    """Paste text via clipboard using keyboard library (avoids conflicts with pyautogui).
+
+    Returns True on success, False on clipboard failure (caller may want to
+    show an error since no paste will have happened).
+    """
     import keyboard as kb
-    pyperclip.copy(text)
+    ok, msg = _copy_with_retry(text)
+    if not ok:
+        log.warning("clipboard_paste: clipboard copy failed (%s) — skipping Ctrl+V to avoid pasting stale content", msg)
+        return False
     time.sleep(0.05)
-    kb.send('ctrl+v')
+    try:
+        kb.send('ctrl+v')
+    except Exception as e:
+        log.warning("keyboard.send ctrl+v failed: %s", e)
+        return False
     time.sleep(0.05)
+    return True
 
 
 def output_text(text, mode="auto_paste"):
-    """Output transcribed text based on the selected mode."""
-    import pyperclip
+    """Output transcribed text based on the selected mode.
 
+    Returns True on success, False if the output couldn't be delivered
+    (clipboard failure, etc.). Caller can surface an error overlay.
+    """
     if mode == "clipboard_only":
-        # Just copy to clipboard, don't paste
-        pyperclip.copy(text)
-        log.info("Copied to clipboard")
+        ok, msg = _copy_with_retry(text)
+        if ok:
+            log.info("Copied to clipboard")
+        else:
+            log.warning("output_text: clipboard_only failed — %s", msg)
+        return ok
 
-    elif mode == "direct_type":
-        # Also copy to clipboard as backup, then type directly
-        pyperclip.copy(text)
+    if mode == "direct_type":
+        # Legacy path — kept for backward compat with old configs.
+        # Also copy to clipboard as backup, then type directly.
+        _copy_with_retry(text)  # best-effort, ignore failure
         import keyboard
         time.sleep(0.05)
-        keyboard.write(text, delay=0.01)
+        try:
+            keyboard.write(text, delay=0.01)
+        except Exception as e:
+            log.warning("keyboard.write failed: %s", e)
+            return False
         log.info("Typed directly")
+        return True
 
-    else:  # "auto_paste" (default)
-        # Copy to clipboard and simulate Ctrl+V
-        import keyboard as kb
-        pyperclip.copy(text)
-        time.sleep(0.05)
+    # Default: auto_paste (Ctrl+V)
+    import keyboard as kb
+    ok, msg = _copy_with_retry(text)
+    if not ok:
+        log.warning("output_text: clipboard copy failed (%s) — skipping Ctrl+V (would paste stale content)", msg)
+        return False
+    time.sleep(0.05)
+    try:
         kb.send('ctrl+v')
-        log.info("Pasted via Ctrl+V")
+    except Exception as e:
+        log.warning("keyboard.send ctrl+v failed: %s", e)
+        return False
+    log.info("Pasted via Ctrl+V")
+    return True
 
 
 # ============================================================
@@ -1707,6 +1830,13 @@ class WhisperTypeApp:
         self._transcribe_lock = threading.Lock()
         self._last_partial_text = ""
         self._last_snapshot_sample_count = 0
+        # Monotonically increasing session/transcription ID. Incremented on
+        # every _start_recording call so concurrent/stale do_transcribe threads
+        # can tell if they're still the "current" one before updating the tray
+        # icon — prevents a stale thread from clobbering the tray to "idle"
+        # while a newer recording is actively in progress.
+        self._recording_generation = 0
+        self._generation_lock = threading.Lock()
 
     def run(self):
         """Main entry point."""
@@ -1907,6 +2037,14 @@ class WhisperTypeApp:
             # Top and bottom horizontal bars
             draw.rectangle([18, 12, 46, 16], fill=w)
             draw.rectangle([18, 48, 46, 52], fill=w)
+        elif state == "error":
+            # Dark red circle with white X — critical failure state.
+            # Distinct from "recording" (bright red + mic) so the user
+            # can tell at a glance that the app is NOT working.
+            draw.ellipse([4, 4, size - 4, size - 4], fill=(120, 20, 20), outline=(255, 255, 255), width=2)
+            # X shape (diagonal lines through the center)
+            draw.line([(20, 20), (44, 44)], fill=(255, 255, 255), width=5)
+            draw.line([(44, 20), (20, 44)], fill=(255, 255, 255), width=5)
 
         return img
 
@@ -1937,8 +2075,11 @@ class WhisperTypeApp:
             self.status_text = f"Error: {e}"
             log.error("Failed to load model: %s", e)
             if self.tray_icon:
-                self.tray_icon.icon = self._create_icon("idle")
-                self.tray_icon.title = f"WhisperType — Error: {e}"
+                # Red X icon — NEVER green on error. Green lies that
+                # the app is ready; user would press hotkey and nothing
+                # would happen with no visible indication of why.
+                self.tray_icon.icon = self._create_icon("error")
+                self.tray_icon.title = f"WhisperType — Model load failed: {e}"
             self.overlay.show_error("Model load failed")
 
     def _hotkey_listener(self):
@@ -1999,6 +2140,10 @@ class WhisperTypeApp:
             if self.is_recording:
                 return
             self.is_recording = True
+        # Bump generation so any still-running do_transcribe thread from a
+        # previous press knows it's stale and won't update tray/overlay state.
+        with self._generation_lock:
+            self._recording_generation += 1
         source = self.config.get("recording_source", "microphone")
         source_label = {"microphone": "Mic", "stereo_mix": "System Audio", "both": "Mic + System"}.get(source, "Mic")
         log.info("Recording (%s)...", source_label)
@@ -2064,11 +2209,53 @@ class WhisperTypeApp:
         )
         self._waveform_thread.start()
 
+        # Safety watchdog: auto-stop runaway recordings.
+        # Scenarios this catches:
+        #   • User toggled recording and walked away
+        #   • Stuck hold-key (key up event missed)
+        #   • User fell asleep talking :)
+        # Mic+loopback at 48kHz stereo is ~690KB/s = 2.5GB in 1 hour.
+        # Cap at 10 minutes: warn at 5, forcibly stop at 10.
+        watchdog_gen = self._recording_generation
+        threading.Thread(
+            target=self._recording_watchdog, args=(watchdog_gen,), daemon=True
+        ).start()
+
+    def _recording_watchdog(self, generation):
+        """Stop runaway recordings. Runs once per recording session.
+
+        The `generation` argument pins this watchdog to a specific recording.
+        If a new recording starts (generation bumped), this watchdog silently
+        exits without touching the new one.
+        """
+        WARN_SEC = 5 * 60      # 5 minutes: log warning
+        MAX_SEC = 10 * 60      # 10 minutes: force-stop
+        start = time.time()
+        warned = False
+        while self.is_recording and generation == self._recording_generation:
+            elapsed = time.time() - start
+            if not warned and elapsed >= WARN_SEC:
+                log.warning("Recording running %.0fs — will auto-stop at %d min", elapsed, MAX_SEC // 60)
+                warned = True
+            if elapsed >= MAX_SEC:
+                log.warning("Recording exceeded %d min limit — force-stopping", MAX_SEC // 60)
+                try:
+                    self._stop_and_transcribe()
+                except Exception as e:
+                    log.error("Watchdog force-stop failed: %s", e)
+                return
+            time.sleep(2.0)
+
     def _waveform_updater(self):
         """Update the waveform visualization with real-time audio levels."""
         NUM_BARS = OverlayNotification.NUM_BARS
         # Give overlay a moment to initialize on first recording
         time.sleep(0.3)
+
+        # Error rate-limiting — if the same error happens every iteration
+        # (20x/sec), we'd spam the log. Count consecutive errors; sleep
+        # more aggressively and stop logging after N repeats.
+        consecutive_errors = 0
 
         while self.is_recording:
             try:
@@ -2127,8 +2314,19 @@ class WhisperTypeApp:
                     levels.append(level)
 
                 self.overlay.update_waveform(levels)
+                consecutive_errors = 0  # reset on success
             except Exception as e:
-                log.error("Waveform updater error: %s", e)
+                consecutive_errors += 1
+                # Log first 3 only; then back off so we don't flood the log
+                # at 20/sec if something is persistently failing.
+                if consecutive_errors <= 3:
+                    log.error("Waveform updater error: %s", e)
+                elif consecutive_errors == 4:
+                    log.warning("Waveform updater: suppressing further errors (recurring failure)")
+                if consecutive_errors > 3:
+                    # Back off to 500ms so we don't burn CPU in a tight error loop
+                    time.sleep(0.5)
+                    continue
 
             time.sleep(0.05)  # ~20 FPS
 
@@ -2299,6 +2497,12 @@ class WhisperTypeApp:
             last_snapshot_samples = 0
             log.info("Short recording (%.1fs), direct transcription with beam_size=1", duration_sec)
 
+        # Capture the current generation so we can tell if a newer recording
+        # started while we were transcribing. If so, skip tray/overlay updates
+        # in the finally — otherwise a slow transcription could clobber the
+        # fresh "recording" state with a stale "idle" label.
+        my_generation = self._recording_generation
+
         # Transcribe in background to not block
         def do_transcribe():
             try:
@@ -2376,10 +2580,13 @@ class WhisperTypeApp:
                     if text:
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
-                        output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
+                        ok = output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
-                        self.overlay.show_done(char_count=len(display_text))
-                        self._play_done_beep()
+                        if ok:
+                            self.overlay.show_done(char_count=len(display_text))
+                            self._play_done_beep()
+                        else:
+                            self.overlay.show_error("Clipboard busy — text saved to history")
                     else:
                         self.overlay.show_error("No speech detected")
                 else:
@@ -2397,10 +2604,13 @@ class WhisperTypeApp:
                     if text:
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
-                        output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
+                        ok = output_text(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
-                        self.overlay.show_done(char_count=len(display_text))
-                        self._play_done_beep()
+                        if ok:
+                            self.overlay.show_done(char_count=len(display_text))
+                            self._play_done_beep()
+                        else:
+                            self.overlay.show_error("Clipboard busy — text saved to history")
                     else:
                         log.info("No speech detected")
                         self.overlay.show_error("No speech detected")
@@ -2408,7 +2618,10 @@ class WhisperTypeApp:
                 log.error("Transcription error: %s", e)
                 self.overlay.show_error("Transcription failed")
             finally:
-                if self.tray_icon:
+                # Only restore idle state if we're still the current recording.
+                # A newer press may have bumped the generation; in that case the
+                # newer _start_recording already set tray to "recording".
+                if self.tray_icon and my_generation == self._recording_generation:
                     self.tray_icon.icon = self._create_icon("idle")
                     self.tray_icon.title = "WhisperType — Ready"
 
@@ -3455,6 +3668,15 @@ if __name__ == "__main__":
     atexit.register(lambda: ctypes.windll.kernel32.CloseHandle(_mutex_handle))
 
     log.info("WhisperType starting...")
+    # Admin check — hotkey registration + paste-into-admin-apps (Task Manager,
+    # regedit, UAC-elevated windows) require admin rights. If we're not
+    # elevated, warn in the log so the user knows why paste may silently fail
+    # into those specific apps. run.bat already elevates, but PyInstaller
+    # launches or direct pythonw launches won't.
+    if not is_user_admin():
+        log.warning("Not running as administrator — paste into elevated apps "
+                    "(Task Manager, regedit, UAC prompts) will silently fail. "
+                    "Launch via run.bat or right-click → Run as administrator.")
     # Create the renamed launcher on first run so future launches show
     # as "WhisperType.exe" in Task Manager instead of "pythonw.exe".
     _ensure_whispertype_launcher()
