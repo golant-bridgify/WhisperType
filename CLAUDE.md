@@ -1,193 +1,316 @@
-# WhisperType - Development Context
+# WhisperType — Development Context
 
 ## Project Overview
-**WhisperType** is a local Windows speech-to-text application (SuperWhisper alternative). Single-file Python app running as a system tray icon with global hotkey recording, Whisper transcription, and auto-paste.
+**WhisperType** is a Windows speech-to-text app — a SuperWhisper alternative that runs as a system-tray icon with global-hotkey recording, local/cloud Whisper transcription, AI-powered cleanup, and auto-paste. Single-file Python app (~5,100 lines, monolithic by design).
 
-**User:** Naor, running Windows with Intel Core Ultra 7 265K (20 cores, Intel Arc iGPU, NPU). No NVIDIA GPU.
+**User:** Naor. Windows, Intel Core Ultra 7 265K (20 cores, Intel Arc iGPU, NPU). No NVIDIA GPU. Hebrew-speaking developer; dictates mixed Hebrew + English including programming/product terms. Prefers minimal UI — runs with `silent_mode: true`, `beep_device_index: "off"`.
+
+**GitHub:** https://github.com/Danaor/WhisperType
 
 ## File Structure
 ```
-C:\Users\Naor\Downloads\WhisperType\WhisperType\
-  whispertype.py          # Main app (~1800 lines, monolithic)
-  requirements.txt        # Dependencies
-  build.py                # PyInstaller build script → dist/WhisperType.exe
-  run.bat                 # Launcher (admin elevation)
-  install.bat             # Full installer
-  add_to_startup.bat      # Creates startup shortcut with icon
-  create_desktop_shortcut.bat  # Desktop shortcut with icon
-  generate_icon.py        # Generates whispertype.ico
-  whispertype.ico         # App icon (multi-resolution)
-  download_models.py      # Pre-downloads models
-  README.md               # Original docs (not updated with new features)
-  dist/WhisperType.exe    # Standalone executable (358MB, built with PyInstaller)
+C:\Users\Naor\Downloads\WhisperType\
+  CLAUDE.md              # This file
+  LICENSE
+  README.md              # User-facing docs
+  .gitignore             # Ignores WhisperType.exe (auto-generated launcher)
+  WhisperType\
+    whispertype.py       # Main app (~5,100 lines)
+    run_tests.py         # Test suite (29 tests, all pass)
+    requirements.txt     # Dependencies
+    build.py             # PyInstaller → dist/WhisperType.exe
+    run.bat              # Launcher (admin elevation)
+    install.bat          # Full installer
+    add_to_startup.bat   # Creates startup .lnk
+    create_desktop_shortcut.bat
+    generate_icon.py     # Regenerates whispertype.ico
+    whispertype.ico      # Multi-size app icon (dark slate + cyan neon mic)
+    download_models.py   # Pre-downloads Whisper models
+    dist/WhisperType.exe # Standalone executable (~358MB if built)
 
-Config: C:\Users\Naor\AppData\Roaming\WhisperType\config.json
-Logs:   C:\Users\Naor\AppData\Roaming\WhisperType\whispertype.log
+Config:   %APPDATA%\WhisperType\config.json
+Logs:     %APPDATA%\WhisperType\whispertype.log  (RotatingFileHandler, 2MB × 3)
+History:  %APPDATA%\WhisperType\history.json     (max 1000 entries)
+Meetings: %APPDATA%\WhisperType\meetings\        (one .md file per meeting)
+Beep:     %APPDATA%\WhisperType\beep.wav         (48kHz stereo, regenerated on startup)
 ```
 
 ## Architecture (whispertype.py)
 
 ### Class Hierarchy
-- `BaseTranscriber` - Abstract interface: `load_model()`, `transcribe()`, `transcribe_file()`
-- `FasterWhisperTranscriber(BaseTranscriber)` - Default CPU backend using faster-whisper/CTranslate2
-- `OpenVINOTranscriber(BaseTranscriber)` - Optional Intel GPU/NPU backend (code exists but removed from UI)
-- `WhisperTranscriber = FasterWhisperTranscriber` - Backward compat alias
-- `AudioRecorder` - Microphone recording via PyAudio (16kHz mono int16)
-- `LoopbackRecorder` - System audio capture via PyAudioWPatch WASAPI loopback (supports device selection)
-- `OverlayNotification` - Tkinter floating overlay with waveform visualization
-- `WhisperTypeApp` - Main app (tray icon, hotkey listener, recording/transcription orchestration)
+- `BaseTranscriber` — Abstract: `load_model`, `transcribe`, `transcribe_file`
+- `FasterWhisperTranscriber(BaseTranscriber)` — CPU backend (faster-whisper / CT2). Has `custom_vocabulary` passed as `initial_prompt`.
+- `OpenVINOTranscriber(BaseTranscriber)` — Intel GPU/NPU code path, hidden from UI, still present for future use.
+- `WhisperTranscriber = FasterWhisperTranscriber` — Backward-compat alias
+- `GroqTranscriber(BaseTranscriber)` — Cloud backend via api.groq.com. Supports `task=transcribe/translate`, `he_en_bias`, `custom_vocabulary`.
+- `GroqLLMCleaner` — Post-transcription polish via llama-3.3-70b-versatile. 4 styles + 3-layer injection guard.
+- `AudioRecorder` — Mic capture via PyAudio (16kHz mono int16)
+- `LoopbackRecorder` — System audio via PyAudioWPatch WASAPI loopback
+- `MeetingSession` — Long-form chunked capture (45s rotating recorder) + LLM summary
+- `OverlayNotification` — Tkinter floating overlay + waveform
+- `WhisperTypeApp` — Main orchestrator (tray, hotkey, recording, transcription, meeting, undo)
 
 ### Key Helpers
-- `clipboard_paste(text)` - Paste via clipboard using `keyboard.send('ctrl+v')`
-- `output_text(text, mode)` - Output modes: auto_paste, clipboard_only (direct_type removed from UI)
-- `list_input_devices()` - Lists input devices filtered by default host API, deduped
-- `list_loopback_devices()` - Lists WASAPI loopback output devices for device selection
-- `resample_audio()` - Linear interpolation resampler for loopback audio
-- `mix_audio()` - Mixes two audio arrays with normalization
-- `MODEL_LANGUAGE` - Maps model → language automatically (no manual language selection)
+- `clipboard_paste(text)` → bool — Paste via clipboard with retry + readback verification
+- `output_text(text, mode)` → bool — Top-level paste; modes: `auto_paste`, `clipboard_only`, (legacy `direct_type` migrated out)
+- `_copy_with_retry(text, retries=3)` → (ok, msg) — Handles clipboard contention silently
+- `strip_hallucinated_tail(text)` — Removes "Thank you"/"תודה רבה" etc. Whole-text matches → empty (the caller flashes tray-icon error).
+- `trim_trailing_silence(audio)` — Pre-transcribe hallucination prevention
+- `_validate_hotkey(str)` → bool — Rejects bare keys without modifier (or F-keys alone OK)
+- `_fmt_relative_ts(sec)` → "mm:ss" / "h:mm:ss" — Meeting transcript timestamps
+- `list_input_devices()`, `list_output_devices()`, `list_loopback_devices()` — Device enumeration, deduped by name
+- `resample_audio()`, `mix_audio()` — Audio utilities
+- `is_user_admin()` — Windows admin check (warns at startup if not)
+
+### Module-level State
+- `_config_lock`, `_history_lock` — threading.Lock serializing JSON writes (atomic via `.tmp` + `os.replace`)
+- `MODELS` dict — display names for Whisper models
+- `MODEL_LANGUAGE` — auto language from model
+- `_HALLUCINATION_PATTERNS` — regex list for strip
+- `MEETINGS_DIR` — `%APPDATA%/WhisperType/meetings`
 
 ### Threading Model
-- **Main thread:** pystray tray icon event loop
+- **Main thread:** pystray event loop
 - **Daemon threads:**
+  - `_hotkey_listener` — event-driven, waits on `threading.Event` set by `keyboard.add_hotkey` callback (swappable live)
   - Model loader
-  - Hotkey listener (keyboard library polling)
-  - Overlay notification (tkinter mainloop)
-  - Streaming transcription worker (background transcription during recording)
-  - Waveform updater (~20 FPS audio level visualization, shows both mic + loopback)
+  - Overlay Tk mainloop
+  - Streaming transcription worker (preview mode, local backend)
+  - Waveform updater (~20 FPS, rate-limited on persistent errors)
+  - Recording watchdog (auto-stops at 10 min)
+  - Meeting rotation loop (`_rotation_loop`, every 45s)
+  - Per-chunk transcription workers (meeting)
+  - Clipboard auto-restore timer (fire-and-forget 2s)
+  - Undo hotkey callback (`keyboard.add_hotkey`, non-blocking)
 
-### Recording Flow
+### Recording Flow (press-to-talk)
 ```
-Hotkey press → _start_recording()
-  ├── Start recorder(s) based on recording_source (mic / loopback / both)
-  ├── Show waveform overlay
-  ├── Start _waveform_updater thread (real-time audio visualization)
-  └── Start _streaming_worker thread (starts transcribing after 5s of audio)
-
-Hotkey release → _stop_and_transcribe()
-  ├── Stop streaming worker (wait for completion)
-  ├── Stop recorder(s), get audio numpy array
-  ├── Short recording (<5s): single fast transcription, beam_size=1
-  ├── Long recording with streaming partial: use partial (+ optional tail)
-  ├── source="both": always full re-transcription on mixed audio
-  └── Show Done overlay + beep
+Hotkey pressed → _hotkey_event.set()
+_hotkey_listener wakes:
+  ├─ if !model_loaded: wait for release, log rate-limited, continue
+  ├─ if meeting active: show "Meeting active" error, wait for release
+  ├─ if audio warmup needed (idle >5min): open+close PyAudio once
+  ├─ _start_recording() bumps generation, starts recorders
+  │   ├─ show_recording overlay + tray='recording' (red)
+  │   ├─ recorder.start() [+ loopback.start() if both/stereo_mix]
+  │   ├─ spawn _streaming_worker thread (local backend only)
+  │   ├─ spawn _waveform_updater thread
+  │   └─ spawn _recording_watchdog thread (warn 5min, stop 10min)
+  └─ poll is_pressed() → on release → _stop_and_transcribe()
+       ├─ tray='processing' (amber)
+       ├─ join streaming thread (capture partial)
+       ├─ stop recorders, mix if source=both
+       ├─ if too short (<1.5s): bail
+       ├─ if RMS < 0.003 over 1.5s: "Mic silent — try again" + flash red X
+       ├─ pick path: partial+tail OR full transcription
+       ├─ transcribe via self.transcriber (_transcribe_with_fallback)
+       ├─ _cleanup_if_enabled() → Groq LLM pass
+       ├─ _do_paste() → clipboard copy + Ctrl+V + save undo state
+       ├─ spawn clipboard auto-restore (2s delay)
+       ├─ add_history_entry + show_done + _play_done_beep
+       └─ tray='idle' (green) [unless flash_error still active]
 ```
 
-### Transcribe File Flow
-- Tray menu: "Transcribe File" → Hebrew/English
-- Uses `BatchedInferencePipeline` for speed (batch_size=16)
-- Accuracy-optimized: beam_size=5, condition_on_previous_text=True, VAD 500ms
-- Saves .txt file next to source, opens in default editor
+### Meeting Flow
+```
+Tray menu → Start Meeting
+  ├─ blocks if recording active or model not loaded
+  ├─ MeetingSession.start():
+  │   ├─ creates AudioRecorder + LoopbackRecorder based on 'both' source
+  │   ├─ spawns _rotation_loop thread (every 45s)
+  │   └─ tray='meeting' (purple with red dot)
+  └─ Main hotkey is BLOCKED via _is_meeting_active() check
 
-### Config Keys (config.json)
+Rotation loop (every 45s):
+  ├─ stop current recorders → grab audio
+  ├─ open fresh recorders (~50ms gap)
+  └─ spawn worker to transcribe grabbed chunk → append to self.chunks
+
+Tray menu → Stop Meeting
+  ├─ MeetingSession.stop():
+  │   ├─ finalise current chunk
+  │   ├─ wait for all pending Groq transcription jobs (timeout 60s)
+  │   ├─ _summarise() via llama-3.3-70b for summary + action items
+  │   └─ _write_output_file() → markdown with timestamps
+  └─ os.startfile(path) opens in default editor
+```
+
+### Undo Flow
+```
+Any paste:
+  ├─ _do_paste(text, mode) grabs clipboard-before
+  ├─ output_text() copies + Ctrl+V
+  ├─ stores self._last_paste = {text, old_clipboard, timestamp}
+  └─ if auto_paste + auto_restore: schedule thread to restore clipboard after 2s
+         (only if clipboard is still the pasted text — respects user copy)
+
+Ctrl+Alt+Z pressed (via keyboard.add_hotkey):
+  _undo_last_paste():
+    ├─ reads self._last_paste (locked, consumes)
+    ├─ if stale (>60s): "Last paste too old to undo"
+    ├─ pyperclip.copy(old_clipboard)   [restore clipboard immediately]
+    ├─ kb.send('ctrl+z')                [remove the paste from focused window]
+    └─ show "↩  Undone (N chars)" overlay
+```
+
+## Config Keys (config.json)
 ```json
 {
-  "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
-  "language": "he",              // legacy - now auto-detected from model via MODEL_LANGUAGE
+  "model_size": "large-v3-turbo",
+  "language": "he",
   "hotkey": "ctrl+space",
-  "beam_size": 3,                // used for long recordings, short uses 1
-  "paste_mode": "auto_paste",    // "auto_paste" or "clipboard_only"
+  "beam_size": 3,
+  "paste_mode": "auto_paste",
   "play_sound": true,
   "cpu_threads": 16,
-  "input_device_index": 1,       // null=default, or PyAudio device index
-  "loopback_device_index": null,  // null=default output, or specific WASAPI loopback index
-  "recording_mode": "hold",      // "hold" or "toggle"
-  "recording_source": "both",    // "microphone", "stereo_mix", "both"
-  "engine": "faster_whisper",    // only faster_whisper in UI now
-  "streaming_mode": "preview",   // always "preview" (no UI toggle)
-  "translate_mode": false,       // true = translate to English (Whisper task="translate")
-  "auto_start": false            // true = start with Windows (startup shortcut)
+  "input_device_index": 1,
+  "loopback_device_index": null,
+  "recording_mode": "hold",
+  "recording_source": "both",
+  "engine": "faster_whisper",
+  "streaming_mode": "preview",
+  "translate_mode": false,
+  "auto_start": false,
+  "transcription_backend": "groq",
+  "groq_api_key": "gsk_...",
+  "groq_model": "whisper-large-v3-turbo",
+  "silent_mode": true,
+  "beep_device_index": "off",
+  "groq_he_en_bias": true,
+  "cleanup_style": "casual",
+  "cleanup_llm_model": "llama-3.3-70b-versatile",
+  "custom_vocabulary": "git, push, React, Kubernetes, ...",
+  "clipboard_auto_restore": true,
+  "undo_hotkey": "ctrl+alt+z"
 }
 ```
 
-### Tray Menu Structure (current)
-- Microphone (dynamic list)
-- Model (Hebrew Turbo ⭐ / Hebrew Large / English Distil ⭐ / General Turbo)
-- After Recording (Auto-Paste / Clipboard Only)
-- Recording Mode (Hold / Toggle)
-- Recording Source (Mic / System Audio / Both + System Audio Device submenu)
-- Translate to English (toggle)
-- Transcribe File (Hebrew / English)
-- History (opens viewer window)
-- Start with Windows (toggle)
-- Quit
-
-### Models Available
-```python
-MODELS = {
-    "ivrit-ai/whisper-large-v3-turbo-ct2": "Hebrew Turbo ⭐",    # → language: "he"
-    "ivrit-ai/whisper-large-v3-ct2": "Hebrew Large",              # → language: "he"
-    "distil-large-v3": "English Distil ⭐",                       # → language: "en"
-    "large-v3-turbo": "General Turbo",                            # → language: "auto"
-}
+## Tray Menu Structure
+```
+WhisperType (disabled header)
+Status: Loading... (dynamic)
+— Audio Input — (submenu: mics, then loopback devices)
+— Model — (5 radio items: Hebrew Turbo/English Distil/General Turbo Local/Groq Turbo/Groq Hebrew→English)
+— Options —
+  ├─ Hold to Record / Toggle (radio)
+  ├─ Auto-Paste / Clipboard Only (radio)
+  ├─ Invisible Mode (checkbox)
+  ├─ Bias Groq to Hebrew/English (checkbox)
+  ├─ AI Cleanup (Groq) → Off / Casual ⭐ / Proofread / Email / Code (radio)
+  ├─ Custom Vocabulary... (dialog)
+  ├─ Hotkey: ctrl+space... (dialog — dynamic label)
+  ├─ Restore Clipboard After Paste (checkbox)
+  ├─ ─────
+  ├─ 🎙  Start Meeting (long recording)   ←→   ⏹  Stop Meeting  (dynamic)
+  ├─ ─────
+  ├─ Beep Output → None/System Default/<devices> (radio)
+  ├─ Transcribe File → Hebrew / English
+  ├─ History (dialog)
+  ├─ Set Groq API Key... (dialog)
+  └─ Start with Windows (checkbox)
+Quit
 ```
 
-## Changes Made in Session 2 (2026-04-13)
+## Tray Icon States
+- 🟢 **idle** — Green circle + white mic. Ready to record.
+- 🔴 **recording** — Bright red circle + white mic. Active recording.
+- 🟡 **processing** — Amber circle + 3 sound bars. Transcribing.
+- 🔵 **loading** — Blue circle + hourglass. Model loading.
+- ❌ **error** — Dark red circle + white X. Model failed / silent mic / clipboard busy (3s flash).
+- 🟣 **meeting** — Deep purple + red dot + horizontal bars. Meeting in progress.
 
-1. **Git initialized** - repo with .gitignore, initial commit
-2. **Loopback device selection** - tray menu to pick which output device to capture (fixes Teams on Jabra)
-3. **Fixed "תודה רבה" hallucination** - source="both" now does full re-transcription on mixed audio
-4. **Waveform shows both sources** - mic + loopback combined (max of both)
-5. **Removed Engine menu** - only faster-whisper, OpenVINO code kept but hidden
-6. **Simplified models** - 4 models: Hebrew Turbo/Large, English Distil, General Turbo
-7. **Auto language from model** - MODEL_LANGUAGE dict, removed Language menu
-8. **Fixed auto_paste** - switched from pyautogui to keyboard.send (was broken)
-9. **Removed direct_type** - from paste mode menu
-10. **Removed Background Processing menu** - always on (preview mode)
-11. **PyInstaller build** - build.py → dist/WhisperType.exe (358MB standalone)
-12. **Waveform log-scale** - RMS + dB scale for better low-volume visibility
-13. **Fixed waveform disappearing** - fade_out now respects waveform_mode
-14. **Faster streaming** - INTERVAL=0.5s, min 5s audio before streaming starts
-15. **Short recording optimization** - <5s recordings skip streaming, beam_size=1
-16. **File transcription accuracy** - beam_size=5, condition_on_previous_text=True
-17. **Streaming join fix** - waits for streaming to finish, captures partial after completion
+## Dependencies (requirements.txt)
+- `faster-whisper>=1.1.0` — Local CPU transcription
+- `pyaudio>=0.2.14` — Mic recording
+- `PyAudioWPatch>=0.2.12.7` — WASAPI loopback for system audio
+- `keyboard>=0.13.5` — Global hotkey + Ctrl+V send
+- `pyperclip>=1.8.2` — Clipboard access
+- `pystray>=0.19.5` — System tray
+- `Pillow>=10.0.0` — Icon gen + overlay
+- `numpy>=1.24.0` — Audio math
+- `requests>=2.31.0` — Groq HTTP
+- Optional: `openvino-genai`, `huggingface-hub` (OpenVINO backend, hidden from UI)
 
-## Known Issues
+## Test Suite (run_tests.py)
+29 tests, `python run_tests.py` runs them all. Covers:
+1. Syntax + imports
+2. Config roundtrip, migrations, corruption, atomic writes (4)
+3. History thread safety with 20 concurrent writes
+4. Hallucination stripping (3)
+5. Transcriber construction + vocab wire-up
+6. **LIVE Groq calls** (requires API key in config): 4 cleanup styles + expansion guard + RTL + vocab fix
+7. Meeting end-to-end markdown generation
+8. Paste/undo state machine (3)
+9. Hotkey validation
+10. All 6 icon states render
 
-1. **Live Dictation mode** - Code exists but unreliable, removed from UI
-2. **Config migration** - old configs may have stale keys (direct_type, engine, etc.)
-3. **README.md** - Not updated with new features
-4. **Loopback still shows Focusrite in log** - user set device 26, needs verification
-5. **~3.5s for short sentences** - hardware limit for local Whisper on CPU
+## Known Issues / Non-Goals
+1. **Live Dictation mode** — Code present, removed from UI (unreliable).
+2. **No official native-Windows sleep/wake hook** — we mitigate with `_last_recording_time` warmup and silent-audio detection instead.
+3. **Multi-instance** — single-instance mutex blocks duplicates (good).
+4. **File transcription** — Does NOT go through `_cleanup_if_enabled` (long text, token-limit concerns).
+5. **OpenVINO backend** — Still in source, hidden from UI. Keep for potential Intel GPU/NPU use.
+6. **Admin rights** — Required on Windows for global keyboard hook; detected at startup, warned if not elevated.
 
-## Changes Made in Session 3 (2026-04-13)
+## Session History (chronological)
 
-1. **Translation Mode** - "Translate to English" tray toggle, passes `task="translate"` to Whisper
-2. **Auto-Start with Windows** - "Start with Windows" tray toggle, creates/removes .lnk in Startup folder via PowerShell
-3. **Transcription History** - Saves to `history.json` (max 1000 entries), dark-themed Tkinter viewer with search + click-to-copy
+### Session 1: Initial build
+- Tray icon + hotkey + faster-whisper + paste
 
-### History Implementation
-- `add_history_entry()` called after every successful transcription (recording + file)
-- Fields: timestamp, text, duration, model, source, task
-- Storage: `C:\Users\Naor\AppData\Roaming\WhisperType\history.json`
-- Viewer: Catppuccin-dark styled Tkinter window, newest-first, search bar, click text to copy
+### Session 2 (2026-04-13): Audio expansion + stability
+- WASAPI loopback (mic + system audio mix)
+- Multi-model, auto language from model
+- Streaming transcription worker
+- PyInstaller build
+- Admin launcher
 
-### Auto-Start Implementation
-- `set_auto_start()` / `is_auto_start_enabled()` — manages .lnk in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`
-- Uses PowerShell `WScript.Shell` COM to create shortcut (same approach as add_to_startup.bat)
-- Works for both .exe and .py execution modes
+### Session 3 (2026-04-13): Features layer 1
+- Translation mode
+- Auto-start (Windows startup shortcut)
+- History viewer (Tkinter)
 
-### Translation Mode Implementation
-- `task` parameter added to `BaseTranscriber.transcribe()` and `transcribe_file()`
-- `_get_task()` helper returns "translate" or "transcribe" based on config
-- All 6 transcribe call sites updated
-- Translation output skips RTL mark (output is always English)
+### Session 4 (2026-04-15): Cloud + reliability
+- Groq Cloud backend + Tkinter API key dialog
+- Hebrew/English bias for Whisper
+- Fallback to local on cloud failure
 
-## Dependencies
-- faster-whisper>=1.1.0 (core transcription)
-- pyaudio>=0.2.14 (microphone recording)
-- PyAudioWPatch>=0.2.12.7 (WASAPI loopback for system audio)
-- keyboard>=0.13.5 (global hotkey, clipboard_paste)
-- pyperclip>=1.8.2 (clipboard access)
-- pyautogui>=0.9.54 (legacy, can be removed - auto_paste now uses keyboard)
-- pystray>=0.19.5 (system tray)
-- Pillow>=10.0.0 (icon generation)
-- numpy>=1.24.0
-- Optional: openvino-genai, huggingface-hub (code exists, not in UI)
+### Session 5 (2026-04-17): Big intelligence + safety sweep — **this session**
+- **Bug hunting (15+ fixes):** hallucination-strip erase fix, hotkey busy-loop, is_recording state bleed, log rotation (RotatingFileHandler), clipboard retry + readback verification, transcription generation counter (race fix), recording watchdog, PyAudio try/finally, error icon state, admin check, silent-audio detection, WASAPI warmup, legacy config migration
+- **Feature — AI Cleanup:** `GroqLLMCleaner` class, 4 styles (Casual/Proofread/Email/Code), with 3-layer anti-injection guard (system prompt + `<transcription>` delimiters + 1.5× length cap) after discovering the cleanup LLM was expanding "I want to review the code" into a 2,020-char AWS implementation plan
+- **Feature — Custom Vocabulary:** per-user term list fed to Whisper's `prompt`/`initial_prompt` + LLM cleanup system prompt. Fixes "git push" → "בגד פושע" permanently. Dialog in tray menu.
+- **Feature — Meeting Mode:** `MeetingSession` class, 45s rotating recorder, per-chunk background Groq transcription, final LLM summary + action-items pass, saves as markdown to `%APPDATA%/WhisperType/meetings/`.
+- **Feature — Undo Last Paste:** Ctrl+Alt+Z hotkey via `keyboard.add_hotkey`. Sends Ctrl+Z + restores the clipboard content that was there before the paste.
+- **Feature — Clipboard auto-restore:** after every auto-paste, clipboard returns to its pre-paste content (~2s delay). Guarded: won't override a manual copy.
+- **Feature — Hotkey UI:** Tkinter dialog to change the press-to-talk hotkey at runtime. Refactored `_hotkey_listener` to event-driven (`keyboard.add_hotkey` + `threading.Event`) so the hotkey can be swapped without restarting the thread.
+- **Icon redesign:** dark slate + cyan neon mic (Design D); 6-state icon set for tray.
+- **Test suite:** 29 tests in `run_tests.py`, all passing.
 
-## Hardware
-- Intel Core Ultra 7 265K (8P + 12E cores, 20 threads)
-- Intel Arc iGPU (4 Xe cores - too small for Whisper)
-- Intel NPU (Whisper support not mature)
-- Audio: Focusrite USB Audio (default output), Jabra EVOLVE LINK headset, DJI MIC MINI
-- No NVIDIA GPU
-- Performance: ~3.5s for 2s speech (1.5x real-time, hardware limit)
+## User Preferences (inferred from usage)
+- Minimal UI: `silent_mode: true`, `beep: off` — **tray icon colour + tooltip is the primary feedback channel**
+- Hebrew-first workflow, code terms in English
+- Uses "Both" audio source (mic + loopback) → likely records meetings
+- Dictates for 3-30 second clips typically; meetings are longer
+- Cares about tool reliability over fancy features — spent a full session fixing bugs before adding new stuff
+
+## How to Run / Dev Quickstart
+
+```bash
+# From repo root
+cd WhisperType
+pip install -r requirements.txt
+
+# Run in dev mode
+python whispertype.py
+
+# Run with admin (proper hotkey support)
+run.bat
+
+# Run tests (requires Groq API key configured)
+python run_tests.py
+
+# Rebuild icon (after generate_icon.py changes)
+python generate_icon.py
+
+# Rebuild standalone exe
+python build.py  # outputs dist/WhisperType.exe
+```
