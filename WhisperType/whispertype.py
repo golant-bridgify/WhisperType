@@ -248,10 +248,17 @@ def strip_hallucinated_tail(text):
     Aggressively strips phrases like 'thank you', 'תודה רבה', 'bye' when they
     appear at the very end of the text (with or without preceding punctuation).
     Applies up to 3 rounds to catch stacked hallucinations like 'thank you. bye.'.
+
+    IMPORTANT: If stripping would erase the ENTIRE text (Whisper returned only
+    a known hallucination), we preserve the original so the user gets SOME
+    visible output instead of a silent failure. Better to paste a possibly-
+    hallucinated "Thank you" than to give zero feedback — the user can
+    immediately tell that their mic was muted or too quiet.
     """
     if not text:
         return text
     import re
+    original = text
     cleaned = text.rstrip()
     regexes = _get_hallucination_regexes()
 
@@ -261,9 +268,17 @@ def strip_hallucinated_tail(text):
             m = rx.search(cleaned)
             if m:
                 removed = m.group(0).strip()
-                # Cut the match and trim trailing punctuation/whitespace
-                cleaned = cleaned[:m.start()]
-                cleaned = re.sub(r'[\s.!?,;:،۔؟]+$', '', cleaned)
+                # Check: would stripping leave anything substantive?
+                remaining = cleaned[:m.start()]
+                remaining_trimmed = re.sub(r'[\s.!?,;:،۔؟]+$', '', remaining).strip()
+                if not remaining_trimmed:
+                    # Match IS the whole text — preserve original so user sees
+                    # something. This is our "mic was muted" escape hatch.
+                    log.info("Hallucination %r IS the entire transcription — "
+                             "keeping original (likely silent/muted input)", removed)
+                    return original.strip()
+                # Normal case: strip the tail
+                cleaned = remaining_trimmed
                 log.info("Stripped hallucinated tail: %r", removed)
                 found = True
                 break
@@ -311,10 +326,20 @@ def load_config():
     return DEFAULT_CONFIG.copy()
 
 
+# Serialize config writes across threads. Config is written from the tray
+# menu callbacks (main thread), hotkey handler, and transcription threads —
+# concurrent writes can corrupt the file.
+_config_lock = threading.Lock()
+
+
 def save_config(cfg):
+    """Atomically save config — write to .tmp then rename, under a lock."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    with _config_lock:
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, CONFIG_FILE)
 
 
 # ============================================================
@@ -1122,6 +1147,10 @@ def set_auto_start(enabled):
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
 MAX_HISTORY = 1000
 
+# Serialize read-modify-write of history — add_history_entry can be called
+# from multiple transcription threads (live dictation, streaming, final).
+_history_lock = threading.Lock()
+
 
 def load_history():
     """Load transcription history from JSON file."""
@@ -1135,15 +1164,17 @@ def load_history():
 
 
 def save_history(history):
-    """Save transcription history, keeping only the last MAX_HISTORY entries."""
+    """Atomically save transcription history (last MAX_HISTORY entries only)."""
     history = history[-MAX_HISTORY:]
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+    tmp = HISTORY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, HISTORY_FILE)
 
 
 def add_history_entry(text, duration_sec=0, model="", source="microphone", task="transcribe"):
-    """Add a transcription entry to history."""
+    """Add a transcription entry to history (thread-safe)."""
     import datetime
     clean_text = text.replace('\u200F', '').replace('\u200E', '').strip()
     if not clean_text:
@@ -1156,9 +1187,10 @@ def add_history_entry(text, duration_sec=0, model="", source="microphone", task=
         "source": source,
         "task": task,
     }
-    history = load_history()
-    history.append(entry)
-    save_history(history)
+    with _history_lock:
+        history = load_history()
+        history.append(entry)
+        save_history(history)
 
 
 # ============================================================
@@ -1650,7 +1682,10 @@ class WhisperTypeApp:
             pystray.MenuItem("Quit", self._quit),
         )
 
-        self.tray_icon = pystray.Icon("WhisperType", icon_image, "WhisperType", menu)
+        # Tooltip changes dynamically with state — even in silent_mode, hovering
+        # the tray icon tells the user what WhisperType is doing right now.
+        self.tray_icon = pystray.Icon("WhisperType", icon_image,
+                                       "WhisperType — Loading model...", menu)
 
         # Start hotkey listener in background
         hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
@@ -1704,11 +1739,16 @@ class WhisperTypeApp:
             time.sleep(0.5)
 
         if tray_wnd_found:
-            # Give the notification area a moment to be fully ready
-            time.sleep(2)
+            # Buffer scales with how long detection took: if shell was ready on
+            # the first try (attempts==0), 0.3s is plenty. If we waited through
+            # several retries, the taskbar may still be stabilizing — give it
+            # longer. Previously this was a flat 2.0s on every startup.
+            buffer = 0.3 if attempts == 0 else min(2.0, 0.5 + attempts * 0.3)
+            time.sleep(buffer)
             elapsed = time.time() - start
             if elapsed > 1:
-                log.info("Shell ready after %.1fs (%d attempts)", elapsed, attempts)
+                log.info("Shell ready after %.1fs (%d attempts, +%.1fs buffer)",
+                         elapsed, attempts, buffer)
         else:
             log.warning("Shell not ready after %ss — tray icon may not appear", timeout_sec)
 
@@ -1762,6 +1802,7 @@ class WhisperTypeApp:
             # Show blue icon while loading
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("loading")
+                self.tray_icon.title = "WhisperType — Loading model..."
             model_label = MODELS.get(self.config["model_size"], self.config["model_size"])
             self.overlay.show(f"  🔄  Loading: {model_label}  ", bg_color="#1e64c8")
 
@@ -1777,12 +1818,14 @@ class WhisperTypeApp:
             log.info("Model loaded. Ready to transcribe!")
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("idle")
+                self.tray_icon.title = "WhisperType — Ready"
             self.overlay.show_done()
         except Exception as e:
             self.status_text = f"Error: {e}"
             log.error("Failed to load model: %s", e)
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("idle")
+                self.tray_icon.title = f"WhisperType — Error: {e}"
             self.overlay.show_error("Model load failed")
 
     def _hotkey_listener(self):
@@ -1791,9 +1834,11 @@ class WhisperTypeApp:
 
         hotkey = self.config["hotkey"]
         # Parse hotkey parts
-        parts = hotkey.lower().split("+")
+        parts = [p.strip() for p in hotkey.lower().split("+")]
 
         log.info("Hotkey registered: %s", hotkey)
+
+        last_loading_log = 0.0  # rate-limit "still loading" messages
 
         while True:
             try:
@@ -1801,7 +1846,18 @@ class WhisperTypeApp:
                 keyboard.wait(hotkey)
 
                 if not self.model_loaded:
-                    log.info("Model still loading, please wait...")
+                    # Rate-limit log to 1 msg / 3s (avoid the 700-entry storm
+                    # when user holds the key during startup).
+                    now = time.time()
+                    if now - last_loading_log > 3.0:
+                        log.info("Model still loading, please wait...")
+                        last_loading_log = now
+                    # Wait for key RELEASE before listening again — otherwise
+                    # keyboard.wait() returns instantly while the key is held,
+                    # producing a tight busy-loop.
+                    while any(keyboard.is_pressed(p) for p in parts):
+                        time.sleep(0.1)
+                    time.sleep(0.1)
                     continue
 
                 if self.config.get("recording_mode") == "toggle":
@@ -1811,13 +1867,13 @@ class WhisperTypeApp:
                     else:
                         self._start_recording()
                     # Wait for key release (debounce) before listening again
-                    while any(keyboard.is_pressed(p.strip()) for p in parts):
+                    while any(keyboard.is_pressed(p) for p in parts):
                         time.sleep(0.05)
                     time.sleep(0.2)  # extra debounce
                 else:
                     # Hold mode (default): hold to record, release to stop
                     self._start_recording()
-                    while all(keyboard.is_pressed(p.strip()) for p in parts):
+                    while all(keyboard.is_pressed(p) for p in parts):
                         time.sleep(0.05)
                     self._stop_and_transcribe()
 
@@ -1836,14 +1892,37 @@ class WhisperTypeApp:
         self.overlay.show_recording()
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("recording")
+            self.tray_icon.title = "WhisperType — Recording..."
 
-        if source == "stereo_mix" and self._loopback_recorder:
-            self._loopback_recorder.start()
-        elif source == "both" and self._loopback_recorder:
-            self.recorder.start()
-            self._loopback_recorder.start()
-        else:
-            self.recorder.start()
+        # Wrap recorder starts so a failure doesn't leave is_recording=True stuck.
+        # Loopback failure is non-fatal (we can still record mic); mic failure IS fatal.
+        try:
+            if source == "stereo_mix" and self._loopback_recorder:
+                self._loopback_recorder.start()
+            elif source == "both" and self._loopback_recorder:
+                self.recorder.start()
+                try:
+                    self._loopback_recorder.start()
+                except Exception as e:
+                    log.warning("Loopback start failed (%s) — continuing with mic only", e)
+            else:
+                self.recorder.start()
+        except Exception as e:
+            log.error("Failed to start recording: %s", e)
+            # Reset state and try to clean up whatever did start
+            with self._recording_state_lock:
+                self.is_recording = False
+            for r in (self.recorder, self._loopback_recorder):
+                if r is not None:
+                    try:
+                        r.stop()
+                    except Exception:
+                        pass
+            if self.tray_icon:
+                self.tray_icon.icon = self._create_icon("idle")
+                self.tray_icon.title = "WhisperType — Ready"
+            self.overlay.show_error("Recording failed to start")
+            return
 
         # Start streaming transcription worker (if streaming is enabled)
         # Skip streaming when on Groq backend — cloud round-trips during recording
@@ -2063,6 +2142,7 @@ class WhisperTypeApp:
         self.overlay.show_processing()
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("processing")
+            self.tray_icon.title = "WhisperType — Transcribing..."
 
         # Stop streaming worker - wait for it to finish so we can use its result
         self._streaming_stop_event.set()
@@ -2096,6 +2176,7 @@ class WhisperTypeApp:
             self.overlay.hide()
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("idle")
+                self.tray_icon.title = "WhisperType — Ready"
             return
 
         duration_sec = len(audio) / 16000
@@ -2216,6 +2297,7 @@ class WhisperTypeApp:
             finally:
                 if self.tray_icon:
                     self.tray_icon.icon = self._create_icon("idle")
+                    self.tray_icon.title = "WhisperType — Ready"
 
         threading.Thread(target=do_transcribe, daemon=True).start()
 
@@ -2281,6 +2363,7 @@ class WhisperTypeApp:
             finally:
                 if self.tray_icon:
                     self.tray_icon.icon = self._create_icon("idle")
+                    self.tray_icon.title = "WhisperType — Ready"
 
         threading.Thread(target=do_pick_and_transcribe, daemon=True).start()
 
