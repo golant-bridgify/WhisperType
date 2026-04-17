@@ -1703,6 +1703,27 @@ def _fmt_relative_ts(seconds):
     return f"{m:d}:{s:02d}"
 
 
+def _validate_hotkey(hotkey_str):
+    """Sanity-check a hotkey string before we register it.
+
+    Returns True if it has at least one modifier (ctrl/alt/shift/win)
+    or a function key (f1-f24). Without a modifier, the hotkey would
+    fire on every single keypress matching that key — useless and
+    noisy. Function keys are OK alone because they're not used in
+    normal typing.
+    """
+    if not hotkey_str:
+        return False
+    parts = [p.strip() for p in hotkey_str.lower().split("+")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return False
+    modifiers = {"ctrl", "control", "alt", "shift", "win", "cmd", "windows"}
+    has_modifier = any(p in modifiers for p in parts)
+    has_fkey = any(p.startswith("f") and p[1:].isdigit() and 1 <= int(p[1:]) <= 24 for p in parts)
+    return has_modifier or has_fkey
+
+
 # ============================================================
 # Text Paster - types text into active window
 # ============================================================
@@ -2585,6 +2606,12 @@ class WhisperTypeApp:
                         lambda: self._open_vocabulary_dialog(),
                     ),
                     pystray.MenuItem(
+                        # Dynamic label shows current hotkey so the user
+                        # can see at a glance what's currently bound
+                        lambda item: f"Hotkey: {self.config.get('hotkey', 'ctrl+space')}...",
+                        lambda: self._open_hotkey_dialog(),
+                    ),
+                    pystray.MenuItem(
                         "Restore Clipboard After Paste",
                         lambda: self._toggle_clipboard_auto_restore(),
                         checked=lambda item: bool(self.config.get("clipboard_auto_restore", True)),
@@ -2807,33 +2834,71 @@ class WhisperTypeApp:
                 self.tray_icon.title = f"WhisperType — Model load failed: {e}"
             self.overlay.show_error("Model load failed")
 
+    def _register_hotkey(self, hotkey_str):
+        """(Re-)register the main press-to-talk hotkey at runtime.
+
+        Uses keyboard.add_hotkey to install a callback that sets
+        self._hotkey_event. This way we can swap the hotkey at any time
+        (e.g. from the 'Change Hotkey...' dialog) without killing the
+        listener thread — we just remove the old hotkey handle and
+        install a new one. The listener thread itself keeps waiting on
+        the same Event regardless.
+        """
+        import keyboard as kb
+        # Remove previous registration, if any
+        if getattr(self, "_hotkey_handle", None) is not None:
+            try:
+                kb.remove_hotkey(self._hotkey_handle)
+            except Exception:
+                # Handle may already be gone; not worth crashing over.
+                pass
+            self._hotkey_handle = None
+
+        self._hotkey_parts = [p.strip() for p in hotkey_str.lower().split("+")]
+        try:
+            self._hotkey_handle = kb.add_hotkey(
+                hotkey_str,
+                lambda: self._hotkey_event.set(),
+                suppress=False,  # let the key still reach other apps
+            )
+            log.info("Hotkey registered: %s", hotkey_str)
+            return True
+        except Exception as e:
+            log.error("Failed to register hotkey %r: %s", hotkey_str, e)
+            return False
+
     def _hotkey_listener(self):
-        """Listen for the hotkey using keyboard library."""
+        """Listen for the press-to-talk hotkey.
+
+        Architecture:
+          - Hotkey presses signal self._hotkey_event (via add_hotkey callback)
+          - This thread wakes on each event and handles the press
+          - Hold detection still uses keyboard.is_pressed() — stateless,
+            works regardless of how the hotkey was registered
+          - Hotkey can be re-registered live via _register_hotkey()
+        """
         import keyboard
 
-        hotkey = self.config["hotkey"]
-        # Parse hotkey parts
-        parts = [p.strip() for p in hotkey.lower().split("+")]
-
-        log.info("Hotkey registered: %s", hotkey)
+        self._hotkey_event = threading.Event()
+        self._hotkey_handle = None
+        self._hotkey_parts = []
+        self._register_hotkey(self.config["hotkey"])
 
         last_loading_log = 0.0  # rate-limit "still loading" messages
 
         while True:
             try:
-                # Wait for hotkey press
-                keyboard.wait(hotkey)
+                # Wait for the hotkey to be pressed (set by add_hotkey callback)
+                self._hotkey_event.wait()
+                self._hotkey_event.clear()
+                parts = list(self._hotkey_parts)  # snapshot (might be mutated by change)
 
                 if not self.model_loaded:
-                    # Rate-limit log to 1 msg / 3s (avoid the 700-entry storm
-                    # when user holds the key during startup).
                     now = time.time()
                     if now - last_loading_log > 3.0:
                         log.info("Model still loading, please wait...")
                         last_loading_log = now
-                    # Wait for key RELEASE before listening again — otherwise
-                    # keyboard.wait() returns instantly while the key is held,
-                    # producing a tight busy-loop.
+                    # Wait for key RELEASE before listening again
                     while any(keyboard.is_pressed(p) for p in parts):
                         time.sleep(0.1)
                     time.sleep(0.1)
@@ -2874,6 +2939,25 @@ class WhisperTypeApp:
             except Exception as e:
                 log.error("Hotkey error: %s", e)
                 time.sleep(0.5)
+
+    def _change_hotkey(self, new_hotkey):
+        """Persist a new hotkey and re-register without restart."""
+        new_hotkey = (new_hotkey or "").strip().lower()
+        if not new_hotkey:
+            return False
+        if new_hotkey == (self.config.get("hotkey") or "").lower():
+            return False
+        self.config["hotkey"] = new_hotkey
+        save_config(self.config)
+        ok = self._register_hotkey(new_hotkey)
+        if ok:
+            log.info("Hotkey changed to: %s", new_hotkey)
+            try:
+                self.overlay.show(f"  ⌨  Hotkey: {new_hotkey}  ",
+                                  bg_color="#1e6091", duration=1800)
+            except Exception:
+                pass
+        return ok
 
     def _start_recording(self):
         with self._recording_state_lock:
@@ -4235,6 +4319,157 @@ class WhisperTypeApp:
                 self._play_done_beep()
 
         threading.Thread(target=finalise, daemon=True).start()
+
+    def _open_hotkey_dialog(self):
+        """Dialog to change the main press-to-talk hotkey.
+
+        Uses keyboard.read_hotkey() in a worker thread to capture the
+        next combination the user presses. No need to parse Tkinter key
+        events — keyboard gives us the canonical string directly
+        ('ctrl+shift+space', 'alt+grave', etc.).
+        """
+        def open_dialog():
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.title("Change Hotkey")
+            root.configure(bg="#1e1e2e")
+            root.resizable(False, False)
+
+            W, H = 520, 330
+            x = (root.winfo_screenwidth() - W) // 2
+            y = (root.winfo_screenheight() - H) // 2
+            root.geometry(f"{W}x{H}+{x}+{y}")
+
+            tk.Label(root, text="Change Press-to-Talk Hotkey",
+                     font=("Segoe UI", 14, "bold"),
+                     fg="#cdd6f4", bg="#1e1e2e").pack(pady=(14, 8))
+
+            current = self.config.get("hotkey", "ctrl+space")
+            tk.Label(root, text=f"Current: {current}",
+                     font=("Segoe UI", 10),
+                     fg="#a6adc8", bg="#1e1e2e").pack(pady=(0, 12))
+
+            # Entry showing the new hotkey (editable in case user wants to type)
+            new_var = tk.StringVar(value=current)
+            entry = tk.Entry(root, textvariable=new_var,
+                             font=("Consolas", 12),
+                             bg="#313244", fg="#cdd6f4",
+                             insertbackground="#cdd6f4",
+                             relief="flat", bd=5, justify="center")
+            entry.pack(padx=40, pady=6, fill="x", ipady=6)
+
+            status = tk.Label(root,
+                              text="Click 'Capture' and press your new hotkey.",
+                              font=("Segoe UI", 9),
+                              fg="#a6adc8", bg="#1e1e2e",
+                              wraplength=W - 40, justify="center")
+            status.pack(pady=(8, 4))
+
+            capture_state = {"busy": False}
+
+            def do_capture():
+                if capture_state["busy"]:
+                    return
+                capture_state["busy"] = True
+                status.config(text="▶  Press the key combination NOW...",
+                              fg="#f9e2af")
+                capture_btn.config(state="disabled", text="Listening...")
+                root.update_idletasks()
+
+                def worker():
+                    try:
+                        import keyboard as kb
+                        hk = kb.read_hotkey(suppress=False)
+                    except Exception as e:
+                        hk = None
+                        err = str(e)
+                    else:
+                        err = None
+
+                    def on_done():
+                        capture_state["busy"] = False
+                        capture_btn.config(state="normal", text="Capture New...")
+                        if err:
+                            status.config(text=f"Capture failed: {err}", fg="#f38ba8")
+                            return
+                        if not hk:
+                            status.config(text="No hotkey detected — try again.",
+                                          fg="#f38ba8")
+                            return
+                        new_var.set(hk)
+                        if _validate_hotkey(hk):
+                            status.config(text=f"✓ Captured: {hk}", fg="#a6e3a1")
+                        else:
+                            status.config(
+                                text=f"⚠  '{hk}' has no modifier — it'll fire on "
+                                     "every keypress. Pick something with Ctrl/Alt/Shift.",
+                                fg="#f9e2af"
+                            )
+                    root.after(0, on_done)
+
+                threading.Thread(target=worker, daemon=True).start()
+
+            def make_btn(parent, text, cmd, bg, hover_bg, fg="#1e1e2e"):
+                b = tk.Button(parent, text=text, command=cmd,
+                              font=("Segoe UI", 10, "bold"),
+                              bg=bg, fg=fg,
+                              activebackground=hover_bg, activeforeground=fg,
+                              relief="flat", bd=0, padx=15, pady=6,
+                              cursor="hand2")
+                b.bind("<Enter>", lambda e: b.config(bg=hover_bg))
+                b.bind("<Leave>", lambda e: b.config(bg=bg))
+                return b
+
+            capture_frame = tk.Frame(root, bg="#1e1e2e")
+            capture_frame.pack(pady=(4, 8))
+            capture_btn = make_btn(capture_frame, "Capture New...",
+                                   do_capture, "#89b4fa", "#74c7ec")
+            capture_btn.pack()
+
+            def on_save():
+                candidate = new_var.get().strip().lower()
+                if not candidate:
+                    status.config(text="Enter or capture a hotkey first.", fg="#f38ba8")
+                    return
+                if not _validate_hotkey(candidate):
+                    status.config(
+                        text=f"'{candidate}' is too generic (no modifier). "
+                             "Add Ctrl/Alt/Shift or Win.", fg="#f38ba8")
+                    return
+                if candidate == current:
+                    status.config(text="Same as current — nothing to change.",
+                                  fg="#a6adc8")
+                    root.after(600, root.destroy)
+                    return
+                ok = self._change_hotkey(candidate)
+                if ok:
+                    status.config(text=f"✓ Saved: {candidate}", fg="#a6e3a1")
+                    root.after(900, root.destroy)
+                else:
+                    status.config(text="Failed to register that hotkey.",
+                                  fg="#f38ba8")
+
+            def on_reset():
+                new_var.set(DEFAULT_CONFIG["hotkey"])
+                status.config(text=f"Reset to default: {DEFAULT_CONFIG['hotkey']}",
+                              fg="#a6adc8")
+
+            def on_cancel():
+                root.destroy()
+
+            btn_frame = tk.Frame(root, bg="#1e1e2e")
+            btn_frame.pack(pady=(10, 16))
+            make_btn(btn_frame, "Save", on_save, "#a6e3a1", "#94e2d5").pack(side="left", padx=5)
+            make_btn(btn_frame, "Reset", on_reset, "#fab387", "#f9e2af").pack(side="left", padx=5)
+            make_btn(btn_frame, "Cancel", on_cancel, "#f38ba8", "#eba0ac").pack(side="left", padx=5)
+
+            root.bind("<Escape>", lambda e: on_cancel())
+            root.protocol("WM_DELETE_WINDOW", on_cancel)
+            root.after(100, lambda: (root.lift(), entry.focus_force()))
+            root.mainloop()
+
+        threading.Thread(target=open_dialog, daemon=True).start()
 
     def _open_vocabulary_dialog(self):
         """Simple multi-line dialog for editing custom_vocabulary.
