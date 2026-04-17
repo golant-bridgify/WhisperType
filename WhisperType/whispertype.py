@@ -256,20 +256,20 @@ def _get_hallucination_regexes():
 def strip_hallucinated_tail(text):
     """Remove known trailing hallucinations from a transcription.
 
-    Aggressively strips phrases like 'thank you', 'תודה רבה', 'bye' when they
-    appear at the very end of the text (with or without preceding punctuation).
-    Applies up to 3 rounds to catch stacked hallucinations like 'thank you. bye.'.
+    Whisper frequently produces "Thank you" / "תודה רבה" / "bye" when the
+    input audio is silent or too quiet to contain real speech. These
+    phrases almost never match what the user actually said, so we strip
+    them. If the matched phrase is the entire output, we return empty —
+    pasting a random "תודה רבה" into the user's document (from silent
+    audio) is MORE disruptive than no paste at all.
 
-    IMPORTANT: If stripping would erase the ENTIRE text (Whisper returned only
-    a known hallucination), we preserve the original so the user gets SOME
-    visible output instead of a silent failure. Better to paste a possibly-
-    hallucinated "Thank you" than to give zero feedback — the user can
-    immediately tell that their mic was muted or too quiet.
+    The caller is expected to surface a visible error indicator when
+    the transcription comes back empty (we flash the tray icon red for
+    3s in do_transcribe, so silent_mode users still see feedback).
     """
     if not text:
         return text
     import re
-    original = text
     cleaned = text.rstrip()
     regexes = _get_hallucination_regexes()
 
@@ -279,17 +279,9 @@ def strip_hallucinated_tail(text):
             m = rx.search(cleaned)
             if m:
                 removed = m.group(0).strip()
-                # Check: would stripping leave anything substantive?
-                remaining = cleaned[:m.start()]
-                remaining_trimmed = re.sub(r'[\s.!?,;:،۔؟]+$', '', remaining).strip()
-                if not remaining_trimmed:
-                    # Match IS the whole text — preserve original so user sees
-                    # something. This is our "mic was muted" escape hatch.
-                    log.info("Hallucination %r IS the entire transcription — "
-                             "keeping original (likely silent/muted input)", removed)
-                    return original.strip()
-                # Normal case: strip the tail
-                cleaned = remaining_trimmed
+                # Cut the match and trim trailing punctuation/whitespace
+                cleaned = cleaned[:m.start()]
+                cleaned = re.sub(r'[\s.!?,;:،۔؟]+$', '', cleaned)
                 log.info("Stripped hallucinated tail: %r", removed)
                 found = True
                 break
@@ -2505,6 +2497,10 @@ class WhisperTypeApp:
 
         # Transcribe in background to not block
         def do_transcribe():
+            # Tracks whether we already signalled an error state via
+            # _flash_error_tray; if so, the `finally` must NOT reset to idle
+            # or it'll instantly clobber our red X before the user sees it.
+            error_shown = False
             try:
                 if streaming_mode == "live_dictation":
                     # Live dictation: text was appended incrementally during recording.
@@ -2587,8 +2583,13 @@ class WhisperTypeApp:
                             self._play_done_beep()
                         else:
                             self.overlay.show_error("Clipboard busy — text saved to history")
+                            self._flash_error_tray("Clipboard busy — text saved to history")
+                            error_shown = True
                     else:
+                        log.info("No speech detected (likely silent audio or hallucination)")
                         self.overlay.show_error("No speech detected")
+                        self._flash_error_tray("No speech detected — check mic")
+                        error_shown = True
                 else:
                     # --- NO PARTIAL: full transcription (short recording or streaming=off) ---
                     # Use beam_size=1 for short audio (<5s) for speed
@@ -2611,17 +2612,23 @@ class WhisperTypeApp:
                             self._play_done_beep()
                         else:
                             self.overlay.show_error("Clipboard busy — text saved to history")
+                            self._flash_error_tray("Clipboard busy — text saved to history")
+                            error_shown = True
                     else:
-                        log.info("No speech detected")
+                        log.info("No speech detected (likely silent audio or hallucination)")
                         self.overlay.show_error("No speech detected")
+                        self._flash_error_tray("No speech detected — check mic")
+                        error_shown = True
             except Exception as e:
                 log.error("Transcription error: %s", e)
                 self.overlay.show_error("Transcription failed")
+                self._flash_error_tray(f"Transcription failed: {e}")
+                error_shown = True
             finally:
-                # Only restore idle state if we're still the current recording.
-                # A newer press may have bumped the generation; in that case the
-                # newer _start_recording already set tray to "recording".
-                if self.tray_icon and my_generation == self._recording_generation:
+                # Only restore idle state if we're still the current recording
+                # AND we didn't already flash an error (the flash has its own
+                # scheduled restore-to-idle after ~3s).
+                if not error_shown and self.tray_icon and my_generation == self._recording_generation:
                     self.tray_icon.icon = self._create_icon("idle")
                     self.tray_icon.title = "WhisperType — Ready"
 
@@ -3127,6 +3134,44 @@ class WhisperTypeApp:
         if device == "off":
             return
         play_beep(1000, 100, device_index=device)
+
+    def _flash_error_tray(self, msg, duration_sec=3.0):
+        """Briefly set the tray icon to the 'error' state, then restore to idle.
+
+        This is the user feedback channel that works even when silent_mode is
+        ON and beep is OFF — both of which the user has configured. Without
+        this, a failed transcription produces ZERO visible signal: no overlay
+        (silent_mode suppresses it), no beep (disabled), no paste (text was
+        empty after hallucination-strip). The user would have no way to know
+        the recording didn't produce usable output.
+
+        The icon flashes red-X for `duration_sec`, then goes back to green-
+        idle — but only if no new recording has started in the meantime
+        (generation counter check prevents clobbering fresh state).
+        """
+        if not self.tray_icon:
+            return
+        my_gen = self._recording_generation
+        try:
+            self.tray_icon.icon = self._create_icon("error")
+            self.tray_icon.title = f"WhisperType — {msg}"
+        except Exception as e:
+            log.warning("_flash_error_tray: setting error icon failed: %s", e)
+            return
+
+        def restore():
+            time.sleep(duration_sec)
+            # Only restore if this flash is still 'current' — a new recording
+            # may have bumped generation, in which case the newer flow owns
+            # the icon state and we must not clobber it.
+            if self.tray_icon and my_gen == self._recording_generation:
+                try:
+                    self.tray_icon.icon = self._create_icon("idle")
+                    self.tray_icon.title = "WhisperType — Ready"
+                except Exception:
+                    pass
+
+        threading.Thread(target=restore, daemon=True).start()
 
     def _toggle_he_en_bias(self):
         """Toggle the Hebrew/English bias prompt sent to Groq.
