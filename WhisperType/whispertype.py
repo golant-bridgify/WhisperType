@@ -1829,6 +1829,10 @@ class WhisperTypeApp:
         # while a newer recording is actively in progress.
         self._recording_generation = 0
         self._generation_lock = threading.Lock()
+        # Track when the last recording actually happened so we can warm
+        # up the audio stack if the machine was idle for a long time
+        # (Windows sleep/suspend leaves WASAPI needing a fresh init).
+        self._last_recording_time = 0.0
 
     def run(self):
         """Main entry point."""
@@ -2136,6 +2140,27 @@ class WhisperTypeApp:
         # previous press knows it's stale and won't update tray/overlay state.
         with self._generation_lock:
             self._recording_generation += 1
+
+        # Warm up the audio stack if we haven't recorded in a long time.
+        # After Windows sleep/long idle, the first WASAPI stream open can
+        # return silent frames for ~1-2s while the driver re-initialises.
+        # By briefly opening/closing PyAudio first, we force re-enumeration
+        # so the REAL recording below starts on a warm stack.
+        now = time.time()
+        if self._last_recording_time and (now - self._last_recording_time) > 300:
+            idle_min = (now - self._last_recording_time) / 60
+            log.info("Warming up audio stack (idle %.0f min since last recording)", idle_min)
+            try:
+                import pyaudio
+                pa = pyaudio.PyAudio()
+                try:
+                    pa.get_default_host_api_info()  # triggers device scan
+                finally:
+                    pa.terminate()
+            except Exception as e:
+                log.warning("Audio warmup failed (non-fatal): %s", e)
+        self._last_recording_time = now
+
         source = self.config.get("recording_source", "microphone")
         source_label = {"microphone": "Mic", "stereo_mix": "System Audio", "both": "Mic + System"}.get(source, "Mic")
         log.info("Recording (%s)...", source_label)
@@ -2483,6 +2508,33 @@ class WhisperTypeApp:
             return
 
         duration_sec = len(audio) / 16000
+
+        # Silent-audio detection.
+        # Scenario: user presses hotkey after Windows sleep/wake or long idle.
+        # PyAudio opens the WASAPI stream before the audio driver is fully
+        # re-initialised, so the stream returns silent frames for several
+        # seconds even though recording looks normal. User then gets a
+        # Whisper hallucination like "Thank you" and wonders why their
+        # speech wasn't transcribed.
+        # Heuristic: if the clip is longer than 1.5s but RMS is near zero,
+        # the mic almost certainly didn't capture real audio. Skip
+        # transcription (it'll just hallucinate) and tell the user clearly.
+        if duration_sec >= 1.5:
+            audio_rms = float(np.sqrt(np.mean(audio ** 2) + 1e-12))
+            if audio_rms < 0.003:  # ~-50dB — effectively silent
+                log.warning(
+                    "Silent audio detected: duration=%.1fs but RMS=%.5f. "
+                    "Mic likely didn't capture (common after Windows sleep). "
+                    "Skipping transcription.",
+                    duration_sec, audio_rms,
+                )
+                self.overlay.show_error("Mic silent — try again or check mic")
+                self._flash_error_tray("Mic captured silence — try again")
+                if self.tray_icon and self._recording_generation == self._recording_generation:
+                    # Tray will be restored by _flash_error_tray's timer
+                    pass
+                return
+
         # Short recordings: skip streaming partial, do single fast transcription
         if duration_sec < 5:
             last_partial = ""
