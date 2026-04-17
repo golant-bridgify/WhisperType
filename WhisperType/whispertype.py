@@ -1406,13 +1406,21 @@ _beep_wav_path = None
 
 
 def _ensure_beep_wav():
-    """Generate a short beep WAV file once, reuse it."""
+    """Generate a short beep WAV file once, reuse it.
+
+    Generated at 48kHz stereo 16-bit — this is the near-universal format
+    for modern Windows audio devices (Focusrite, Realtek, USB headsets).
+    Previously we used 22050Hz mono which some pro audio interfaces (like
+    Focusrite) reject at the driver level, causing PortAudio to crash the
+    entire process at the C level (un-catchable by Python).
+    """
     global _beep_wav_path
     if _beep_wav_path and os.path.exists(_beep_wav_path):
         return _beep_wav_path
     import struct
     freq, duration_ms, volume = 500, 100, 0.3
-    sample_rate = 22050
+    sample_rate = 48000  # near-universal compatibility
+    channels = 2         # stereo — most devices refuse mono
     n = int(sample_rate * duration_ms / 1000)
     fade = min(n // 4, int(sample_rate * 0.015))
     samples = []
@@ -1423,15 +1431,18 @@ def _ensure_beep_wav():
             val *= i / fade
         elif i > n - fade:
             val *= (n - i) / fade
-        samples.append(int(val * 32767))
+        s = int(val * 32767)
+        # Write both channels (L=R) for each sample to produce stereo
+        for _ch in range(channels):
+            samples.append(s)
     path = os.path.join(CONFIG_DIR, "beep.wav")
     with wave.open(path, 'wb') as wf:
-        wf.setnchannels(1)
+        wf.setnchannels(channels)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(struct.pack(f'<{len(samples)}h', *samples))
     _beep_wav_path = path
-    log.info("Beep WAV generated: %s", path)
+    log.info("Beep WAV generated: %s (%dHz %dch)", path, sample_rate, channels)
     return path
 
 
@@ -1465,9 +1476,15 @@ def list_output_devices():
 def play_beep(freq=800, duration_ms=150, device_index=None):
     """Play beep WAV — on a specific output device if given, else default.
 
-    device_index=None uses winsound (fast, goes to Windows default output).
-    device_index=N uses PyAudio to force a specific output device (so the user
-    can hear the beep on, say, their Jabra headset even if they record from DJI).
+    device_index=None uses winsound (fast, safe, goes to Windows default).
+    device_index=N runs a subprocess that uses PyAudio to target that specific
+    device. The subprocess is mandatory because PortAudio can hard-crash at
+    the C level on incompatible device formats (e.g. Focusrite interfaces
+    refusing our beep settings). A crashed subprocess is safe — the main
+    WhisperType process stays running.
+
+    The beep is fire-and-forget: we don't wait for the subprocess to finish
+    so the done-beep doesn't add latency to the paste.
     """
     wav = _ensure_beep_wav()
     if device_index is None:
@@ -1478,7 +1495,81 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
             log.warning("winsound beep failed: %s", e)
         return
 
-    # Play on a specific output device via PyAudio
+    # Specific device → try to run PyAudio in a subprocess (crash-safe).
+    # When frozen (PyInstaller), we can't spawn `-c python -c "..."`, so fall
+    # back to in-process PyAudio with a format-supported guard — it's less
+    # safe but the format check prevents the worst crashes.
+    import subprocess
+
+    # Find a real python interpreter to run -c with. None if we're frozen.
+    def _find_python_interpreter():
+        if getattr(sys, 'frozen', False):
+            return None  # PyInstaller: no standalone python.exe available
+        py_dir = os.path.dirname(sys.executable)
+        for name in ("pythonw.exe", "python.exe"):
+            cand = os.path.join(py_dir, name)
+            if os.path.exists(cand):
+                return cand
+        return sys.executable
+
+    interp = _find_python_interpreter()
+
+    if interp:
+        try:
+            # Inline script: reads the WAV at 48kHz stereo, then tries the
+            # native format first. If unsupported (e.g. Jabra that only
+            # accepts mono), falls back to mono by taking just the left
+            # channel (byte slicing — audioop was removed in Python 3.13).
+            # We deliberately avoid resampling (keeps stdlib-only), relying
+            # on the device to accept 48kHz (virtually universal). Any
+            # unhandled crash here dies in the subprocess — main app stays up.
+            script = (
+                "import sys, wave, pyaudio\n"
+                "wav_path, device_index = sys.argv[1], int(sys.argv[2])\n"
+                "with wave.open(wav_path, 'rb') as wf:\n"
+                "    data = wf.readframes(wf.getnframes())\n"
+                "    sr, ch, sw = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()\n"
+                "pa = pyaudio.PyAudio()\n"
+                "def supported(c):\n"
+                "    try:\n"
+                "        pa.is_format_supported(rate=sr, output_device=device_index,\n"
+                "                               output_channels=c, output_format=pyaudio.paInt16)\n"
+                "        return True\n"
+                "    except Exception:\n"
+                "        return False\n"
+                "def to_mono_16bit(stereo_bytes):\n"
+                "    # Take left channel: bytes 0..1 of each 4-byte stereo frame\n"
+                "    return b''.join(stereo_bytes[i:i+2] for i in range(0, len(stereo_bytes), 4))\n"
+                "try:\n"
+                "    target_ch = None\n"
+                "    play_data = data\n"
+                "    if supported(ch):\n"
+                "        target_ch = ch\n"
+                "    elif ch == 2 and supported(1):\n"
+                "        target_ch = 1\n"
+                "        play_data = to_mono_16bit(data)\n"
+                "    else:\n"
+                "        print('FAIL: device %d rejects both stereo and mono at %dHz' % (device_index, sr))\n"
+                "        sys.exit(2)\n"
+                "    s = pa.open(format=pa.get_format_from_width(sw), channels=target_ch,\n"
+                "                rate=sr, output=True, output_device_index=device_index)\n"
+                "    try: s.write(play_data); s.stop_stream()\n"
+                "    finally: s.close()\n"
+                "finally:\n"
+                "    pa.terminate()\n"
+            )
+            subprocess.Popen(
+                [interp, "-c", script, wav, str(device_index)],
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except Exception as e:
+            log.warning("Beep subprocess spawn failed: %s — falling back to in-process", e)
+
+    # Frozen build (or subprocess spawn failed): best-effort in-process with
+    # format check as the main defense against C-level crashes.
     try:
         import wave as wavemod
         import pyaudio
@@ -1489,6 +1580,18 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
             sampwidth = wf.getsampwidth()
         pa = pyaudio.PyAudio()
         try:
+            try:
+                pa.is_format_supported(
+                    rate=sample_rate,
+                    output_device=device_index,
+                    output_channels=channels,
+                    output_format=pyaudio.paInt16,
+                )
+            except ValueError as ve:
+                log.warning("Beep format not supported on device %d (%s) — "
+                            "falling back to system default output",
+                            device_index, ve)
+                raise
             stream = pa.open(
                 format=pa.get_format_from_width(sampwidth),
                 channels=channels,
@@ -1504,7 +1607,8 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
         finally:
             pa.terminate()
     except Exception as e:
-        log.warning("PyAudio beep on device %s failed: %s — falling back to default", device_index, e)
+        log.warning("PyAudio beep on device %s failed: %s — using default output",
+                    device_index, e)
         try:
             import winsound
             winsound.PlaySound(wav, winsound.SND_FILENAME)
