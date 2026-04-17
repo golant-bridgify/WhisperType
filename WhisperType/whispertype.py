@@ -82,8 +82,15 @@ DEFAULT_CONFIG = {
     # words, add punctuation, fix obvious mis-hearings. Costs ~$0.00005 per
     # transcription and ~500-900ms added latency. Set to "off" or "verbatim"
     # to disable. Shares the groq_api_key with GroqTranscriber.
-    "cleanup_style": "casual",  # "off" / "casual" / "email" / "code" / "verbatim"
+    "cleanup_style": "casual",  # "off" / "casual" / "proofread" / "email" / "code"
     "cleanup_llm_model": "llama-3.3-70b-versatile",  # Groq model for cleanup
+    # Custom vocabulary — user-specific terms (programming, names, product
+    # names) that Whisper otherwise mis-transcribes. Sent as Whisper's
+    # `prompt`/`initial_prompt` to bias detection, AND included in the LLM
+    # cleanup system prompt so mis-heard terms get corrected after the fact.
+    # Example: 'git, push, pull, commit, React, Kubernetes, Naor, Jabra'
+    # stops 'git push' from being transcribed as 'בגד פושע'.
+    "custom_vocabulary": "",
 }
 
 
@@ -628,6 +635,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
     def __init__(self, model_size="medium", cpu_threads=8):
         super().__init__(model_size, cpu_threads)
         self._batched_model = None  # Lazy-initialized for fast file transcription
+        self.custom_vocabulary = ""  # User-supplied terms → initial_prompt
 
     def load_model(self, callback=None):
         """Load the model (can take a while on first run as it downloads)."""
@@ -658,11 +666,17 @@ class FasterWhisperTranscriber(BaseTranscriber):
             return ""
 
         lang = language if language and language != "auto" else None
+        # initial_prompt biases Whisper toward user's terms (prevents
+        # 'git push' → 'בגד פושע' style errors). None if no vocab set.
+        init_prompt = None
+        if self.custom_vocabulary and self.custom_vocabulary.strip():
+            init_prompt = f"Common terms: {self.custom_vocabulary.strip()}"
         segments, info = self.model.transcribe(
             audio_np,
             beam_size=beam_size,
             language=lang,
             task=task,
+            initial_prompt=init_prompt,
             vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=500,
@@ -724,10 +738,14 @@ class FasterWhisperTranscriber(BaseTranscriber):
                 log.warning("BatchedInferencePipeline unavailable (%s), falling back to standard model", e)
                 self._batched_model = False  # sentinel: tried and failed
 
+        init_prompt = None
+        if self.custom_vocabulary and self.custom_vocabulary.strip():
+            init_prompt = f"Common terms: {self.custom_vocabulary.strip()}"
         common_kwargs = dict(
             beam_size=5,
             language=lang,
             task=task,
+            initial_prompt=init_prompt,
             condition_on_previous_text=True,
             vad_filter=True,
             vad_parameters=dict(
@@ -893,6 +911,24 @@ class GroqTranscriber(BaseTranscriber):
         super().__init__(model_size=model_size, cpu_threads=0)
         self.api_key = api_key
         self.he_en_bias = True  # Toggleable: send Hebrew/English bias prompt on auto-detect calls
+        self.custom_vocabulary = ""  # User-supplied terms to bias detection
+
+    def _build_bias_prompt(self, include_he_en=True):
+        """Build the `prompt` string sent to Whisper.
+
+        Combines the user's custom vocabulary (highest priority — that's
+        why they set it) with the Hebrew/English language bias. Whisper
+        reads the prompt as pseudo-context: words appearing here are much
+        more likely to be recognised. Example:
+          custom_vocabulary = 'git, push, pull, commit, Naor, React'
+          → prevents 'git push' from being transcribed as 'בגד פושע'.
+        """
+        parts = []
+        if self.custom_vocabulary and self.custom_vocabulary.strip():
+            parts.append(f"Common terms: {self.custom_vocabulary.strip()}.")
+        if include_he_en and self.he_en_bias:
+            parts.append(self.HE_EN_BIAS_PROMPT)
+        return " ".join(parts) if parts else None
 
     def load_model(self, callback=None):
         """No local model to load - just verify API key is set."""
@@ -984,17 +1020,25 @@ class GroqTranscriber(BaseTranscriber):
             # Groq's /translations endpoint only supports whisper-large-v3
             # (turbo/distil don't translate). Force the right model.
             data = {"model": "whisper-large-v3", "response_format": "text"}
-            if self.he_en_bias:
-                data["prompt"] = self.HE_EN_BIAS_PROMPT
-            log.info("Groq translate: model=whisper-large-v3 bias=%s", self.he_en_bias)
+            bias = self._build_bias_prompt()
+            if bias:
+                data["prompt"] = bias
+            log.info("Groq translate: model=whisper-large-v3 bias=%s vocab=%s",
+                     self.he_en_bias, bool(self.custom_vocabulary))
         else:
             url = self.TRANSCRIBE_URL
             data = {"model": self.model_size, "response_format": "text"}
             if language and language != "auto":
                 data["language"] = language
-            elif self.he_en_bias:
-                # Auto-detect: bias toward Hebrew/English so it doesn't drift to French etc.
-                data["prompt"] = self.HE_EN_BIAS_PROMPT
+                # Even with a forced language, include custom vocab so
+                # 'git push' doesn't get mistranscribed as Hebrew.
+                if self.custom_vocabulary and self.custom_vocabulary.strip():
+                    data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
+            else:
+                # Auto-detect: bias toward Hebrew/English + user vocab
+                bias = self._build_bias_prompt()
+                if bias:
+                    data["prompt"] = bias
 
         # Scale timeout with audio duration so long clips have room to process
         duration = len(audio_np) / 16000.0
@@ -1034,17 +1078,21 @@ class GroqTranscriber(BaseTranscriber):
             files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
             if task == "translate":
                 url = self.TRANSLATE_URL
-                # Groq's /translations endpoint only supports whisper-large-v3
                 data = {"model": "whisper-large-v3", "response_format": "text"}
-                if self.he_en_bias:
-                    data["prompt"] = self.HE_EN_BIAS_PROMPT
+                bias = self._build_bias_prompt()
+                if bias:
+                    data["prompt"] = bias
             else:
                 url = self.TRANSCRIBE_URL
                 data = {"model": self.model_size, "response_format": "text"}
                 if language and language != "auto":
                     data["language"] = language
-                elif self.he_en_bias:
-                    data["prompt"] = self.HE_EN_BIAS_PROMPT
+                    if self.custom_vocabulary and self.custom_vocabulary.strip():
+                        data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
+                else:
+                    bias = self._build_bias_prompt()
+                    if bias:
+                        data["prompt"] = bias
             return self._post(url, files, data, timeout=120)
 
 
@@ -1139,10 +1187,14 @@ class GroqLLMCleaner:
         self.api_key = api_key
         self.model = model
 
-    def clean(self, text, style="casual", timeout=10):
+    def clean(self, text, style="casual", timeout=10, vocabulary=""):
         """Return the cleaned text. On any failure, return the original text.
 
         Cleanup is best-effort — a Groq hiccup must never block the paste.
+
+        If `vocabulary` is provided, it's appended to the system prompt so
+        the LLM treats any mis-transcribed Hebrew-sounding-like-English
+        terms in that list as candidates for correction.
         """
         if not text or not text.strip():
             return text
@@ -1151,6 +1203,18 @@ class GroqLLMCleaner:
         prompt = self.STYLE_PROMPTS.get(style)
         if not prompt:
             return text
+        if vocabulary and vocabulary.strip():
+            prompt = prompt + (
+                "\n\nThe user's vocabulary (replace any phonetic or misheard "
+                "approximation with the CANONICAL spelling exactly as written "
+                "below, even if this means inserting English into Hebrew text "
+                "or vice-versa). Whisper often mis-transcribes English "
+                "technical terms as Hebrew-sounding gibberish — replace "
+                "those with the English original. Examples of what to "
+                "correct: 'בגד פושע' → 'git push', 'קומיט' → 'commit', "
+                "'ריאקט' → 'React'. Preserve the user's preferred casing:\n"
+                + vocabulary.strip()
+            )
         # Skip cleanup for trivially short output — not worth the round-trip
         # and LLM might over-clean a single word ("הי" → "Hello there").
         stripped = text.replace('\u200F', '').replace('\u200E', '').strip()
@@ -1959,6 +2023,9 @@ class WhisperTypeApp:
                 model_size=self.config["model_size"],
                 cpu_threads=self.config["cpu_threads"],
             )
+        # Push custom vocab into the local transcriber so initial_prompt
+        # biases Whisper toward the user's terms.
+        self._local_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
 
         # Initialize Groq transcriber if backend is groq and API key is set
         self._groq_transcriber = None
@@ -1968,6 +2035,7 @@ class WhisperTypeApp:
                 api_key=self.config["groq_api_key"],
             )
             self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            self._groq_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
 
         # LLM cleanup uses the same Groq API key. Initialised whenever a
         # key is present, regardless of which transcription backend is
@@ -2075,6 +2143,10 @@ class WhisperTypeApp:
                     pystray.MenuItem(
                         "AI Cleanup (Groq)",
                         pystray.Menu(self._build_cleanup_menu),
+                    ),
+                    pystray.MenuItem(
+                        "Custom Vocabulary...",
+                        lambda: self._open_vocabulary_dialog(),
                     ),
                     pystray.MenuItem(
                         "Beep Output",
@@ -2985,7 +3057,9 @@ class WhisperTypeApp:
             return text
         if not self._llm_cleaner:
             return text
-        return self._llm_cleaner.clean(text, style=style)
+        # Pass custom vocab too so the LLM can fix mis-transcribed user terms
+        vocab = self.config.get("custom_vocabulary", "") or ""
+        return self._llm_cleaner.clean(text, style=style, vocabulary=vocab)
 
     def _transcribe_file_with_fallback(self, file_path, **kwargs):
         """Transcribe a file using primary backend, fall back to local on failure."""
@@ -3485,6 +3559,126 @@ class WhisperTypeApp:
         self.config["cleanup_style"] = style
         save_config(self.config)
         log.info("Cleanup style: %s", style)
+
+    def _open_vocabulary_dialog(self):
+        """Simple multi-line dialog for editing custom_vocabulary.
+
+        This is the user's personal term list — programming terms, product
+        names, names of coworkers. It's sent to Whisper as `prompt` /
+        `initial_prompt` so speech detection is biased toward these words,
+        and to the cleanup LLM so mis-transcribed versions get fixed.
+        """
+        def open_dialog():
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.title("Custom Vocabulary")
+            root.configure(bg="#1e1e2e")
+            root.resizable(False, False)
+
+            W, H = 640, 420
+            x = (root.winfo_screenwidth() - W) // 2
+            y = (root.winfo_screenheight() - H) // 2
+            root.geometry(f"{W}x{H}+{x}+{y}")
+
+            tk.Label(root, text="Custom Vocabulary",
+                     font=("Segoe UI", 14, "bold"),
+                     fg="#cdd6f4", bg="#1e1e2e").pack(pady=(14, 4))
+            tk.Label(root,
+                     text=("Terms Whisper should recognise (programming, "
+                           "product names, people).\n"
+                           "Separate with commas or newlines. Example:\n"
+                           "git, push, pull, commit, React, Kubernetes, OAuth, Naor, Jabra"),
+                     font=("Segoe UI", 9),
+                     fg="#a6adc8", bg="#1e1e2e", justify="left").pack(padx=20, pady=(0, 10))
+
+            # Text area
+            text_frame = tk.Frame(root, bg="#1e1e2e")
+            text_frame.pack(padx=20, pady=5, fill="both", expand=True)
+            textbox = tk.Text(text_frame,
+                              font=("Consolas", 11),
+                              bg="#313244", fg="#cdd6f4",
+                              insertbackground="#cdd6f4",
+                              relief="flat", bd=5, wrap="word",
+                              height=10)
+            textbox.pack(side="left", fill="both", expand=True)
+            scroll = tk.Scrollbar(text_frame, command=textbox.yview)
+            scroll.pack(side="right", fill="y")
+            textbox.config(yscrollcommand=scroll.set)
+
+            # Pre-fill with current value
+            current = self.config.get("custom_vocabulary", "") or ""
+            textbox.insert("1.0", current)
+
+            # Ctrl+V paste binding (in case of focus quirks)
+            def do_paste(event=None):
+                try:
+                    import pyperclip
+                    clip = pyperclip.paste()
+                    if clip:
+                        textbox.insert("insert", clip)
+                except Exception:
+                    pass
+                return "break"
+            textbox.bind("<Control-v>", do_paste)
+            textbox.bind("<Control-V>", do_paste)
+
+            status = tk.Label(root, text="",
+                              font=("Segoe UI", 9),
+                              fg="#a6adc8", bg="#1e1e2e")
+            status.pack(pady=(0, 4))
+
+            def make_btn(parent, text, cmd, bg, hover_bg, fg="#1e1e2e"):
+                b = tk.Button(parent, text=text, command=cmd,
+                              font=("Segoe UI", 10, "bold"),
+                              bg=bg, fg=fg,
+                              activebackground=hover_bg, activeforeground=fg,
+                              relief="flat", bd=0, padx=15, pady=6,
+                              cursor="hand2")
+                b.bind("<Enter>", lambda e: b.config(bg=hover_bg))
+                b.bind("<Leave>", lambda e: b.config(bg=bg))
+                return b
+
+            def on_save():
+                new_vocab = textbox.get("1.0", "end").strip()
+                self.config["custom_vocabulary"] = new_vocab
+                save_config(self.config)
+                # Live-update the running transcriber + cleaner so the next
+                # recording picks up the new vocab without restart.
+                try:
+                    self._local_transcriber.custom_vocabulary = new_vocab
+                except Exception:
+                    pass
+                if self._groq_transcriber:
+                    try:
+                        self._groq_transcriber.custom_vocabulary = new_vocab
+                    except Exception:
+                        pass
+                log.info("Custom vocabulary saved (%d chars)", len(new_vocab))
+                status.config(text=f"Saved ({len(new_vocab)} chars). "
+                                   "Active on next recording.", fg="#a6e3a1")
+                root.after(1000, root.destroy)
+
+            def on_clear():
+                textbox.delete("1.0", "end")
+
+            def on_cancel():
+                root.destroy()
+
+            btn_frame = tk.Frame(root, bg="#1e1e2e")
+            btn_frame.pack(pady=(6, 14))
+            make_btn(btn_frame, "Save", on_save, "#a6e3a1", "#94e2d5").pack(side="left", padx=5)
+            make_btn(btn_frame, "Clear", on_clear, "#fab387", "#f9e2af").pack(side="left", padx=5)
+            make_btn(btn_frame, "Cancel", on_cancel, "#f38ba8", "#eba0ac").pack(side="left", padx=5)
+
+            root.bind("<Escape>", lambda e: on_cancel())
+            # Ctrl+Enter = save (Enter alone should just insert newline)
+            root.bind("<Control-Return>", lambda e: on_save())
+            root.protocol("WM_DELETE_WINDOW", on_cancel)
+            root.after(100, lambda: (root.lift(), textbox.focus_force()))
+            root.mainloop()
+
+        threading.Thread(target=open_dialog, daemon=True).start()
 
     def _toggle_silent_mode(self):
         """Toggle silent mode: when ON, the overlay (waveform + status) is hidden.
