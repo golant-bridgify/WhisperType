@@ -2756,6 +2756,10 @@ class WhisperTypeApp:
         self.is_recording = False
         self._recording_state_lock = threading.Lock()  # Guards is_recording to prevent double start/stop
         self.model_loaded = False
+        # Set once the local transcriber is ready. When Groq is primary we
+        # load local lazily in the background, so the fallback path waits on
+        # this event instead of blocking startup on a ~1.5GB model read.
+        self._local_load_event = threading.Event()
         self.status_text = "Loading model..."
         self.tray_icon = None
         self._hotkey_registered = False
@@ -3095,12 +3099,48 @@ class WhisperTypeApp:
             model_label = MODELS.get(self.config["model_size"], self.config["model_size"])
             self.overlay.show(f"  🔄  Loading: {model_label}  ", bg_color="#1e64c8")
 
-            # Always load local transcriber (used as primary or as fallback for Groq)
-            self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
-
-            # Validate Groq if it's the primary
-            if self._groq_transcriber is not None:
+            groq_is_primary = (
+                self.config.get("transcription_backend") == "groq"
+                and self._groq_transcriber is not None
+            )
+            if groq_is_primary:
+                # Groq is primary: validate it (fast HTTP call), mark ready,
+                # and load local in the background as a fallback. Previously
+                # we blocked startup on a ~1.5GB local-model read even when
+                # the user only uses Groq, which kept the tray blue for many
+                # seconds on every restart.
                 self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
+                self.model_loaded = True
+                self.status_text = "Ready"
+                log.info("Groq ready. Loading local fallback in background...")
+                if self.tray_icon:
+                    self.tray_icon.icon = self._create_icon("idle")
+                    self.tray_icon.title = "WhisperType — Ready"
+                self.overlay.show_done()
+
+                def _load_local_bg():
+                    try:
+                        self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
+                        log.info("Local fallback loaded.")
+                    except Exception as bg_e:
+                        log.warning("Local fallback load failed (Groq-only mode): %s", bg_e)
+                    finally:
+                        # Set the event either way — waiters in the fallback
+                        # path re-check `_local_transcriber.model` themselves.
+                        self._local_load_event.set()
+
+                threading.Thread(target=_load_local_bg, daemon=True).start()
+                return
+
+            # Local is primary: load it synchronously. Also validate Groq
+            # (if present) so the cleanup LLM path is ready — cheap HTTP call.
+            self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
+            self._local_load_event.set()
+            if self._groq_transcriber is not None:
+                try:
+                    self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
+                except Exception as groq_e:
+                    log.warning("Groq validation failed (local-primary mode): %s", groq_e)
 
             self.model_loaded = True
             self.status_text = "Ready"
@@ -3221,6 +3261,16 @@ class WhisperTypeApp:
                     while all(keyboard.is_pressed(p) for p in parts):
                         time.sleep(0.05)
                     self._stop_and_transcribe()
+                    # Wait for FULL release and eat any spurious hotkey re-trigger
+                    # the keyboard library queued from key-repeat events during the
+                    # hold. Without this, the tray icon flickers yellow→red→yellow
+                    # at release: the queued event wakes the listener after stop,
+                    # a ghost _start_recording fires on 0-length audio, and the
+                    # tray bounces through recording/processing/idle.
+                    while any(keyboard.is_pressed(p) for p in parts):
+                        time.sleep(0.05)
+                    time.sleep(0.2)
+                    self._hotkey_event.clear()
 
             except Exception as e:
                 log.error("Hotkey error: %s", e)
@@ -4000,7 +4050,27 @@ class WhisperTypeApp:
                 raise
             log.warning("Groq transcription failed (%s) — falling back to local", e)
             self.overlay.show("  ⚠  Cloud failed, using local  ", bg_color="#d08770")
+            self._wait_for_local_ready()
             return self._local_transcriber.transcribe(audio_np, **kwargs)
+
+    def _wait_for_local_ready(self, timeout=30.0):
+        """Block until the background local-model load finishes.
+
+        Only relevant when Groq is primary: we kick off local loading in a
+        background thread at startup, so the first Groq-failure fallback can
+        race with loading. Users see an amber overlay while they wait.
+        """
+        if self._local_transcriber.model is not None:
+            return
+        log.info("Waiting for local fallback to finish loading...")
+        try:
+            self.overlay.show("  ⏳  Loading local fallback...  ", bg_color="#f77f00")
+        except Exception:
+            pass
+        if not self._local_load_event.wait(timeout=timeout):
+            raise RuntimeError("Local fallback is still loading — please retry in a few seconds")
+        if self._local_transcriber.model is None:
+            raise RuntimeError("Local fallback failed to load (see log)")
 
     def _cleanup_if_enabled(self, text, is_translation=False):
         """Run the raw transcription through the LLM cleaner if configured.
@@ -4131,6 +4201,7 @@ class WhisperTypeApp:
             if self.transcriber is self._local_transcriber:
                 raise
             log.warning("Groq file transcription failed (%s) — falling back to local", e)
+            self._wait_for_local_ready()
             return self._local_transcriber.transcribe_file(file_path, **kwargs)
 
     def _toggle_translate_mode(self):
@@ -4411,6 +4482,9 @@ class WhisperTypeApp:
             self.config["model_size"] = model
             save_config(self.config)
             self.model_loaded = False
+            # New transcriber instance below — the event promises the OLD
+            # instance is ready. Clear so fallback waits on the fresh load.
+            self._local_load_event.clear()
 
             engine = self.config.get("engine", "faster_whisper")
             if engine == "openvino" and OpenVINOTranscriber.is_available():
@@ -5100,6 +5174,13 @@ class WhisperTypeApp:
         else:
             self.transcriber = self._local_transcriber
             log.info("Transcription backend: Local")
+            # Groq-primary startup loads local lazily, so on switch-to-local
+            # the model may still be None. Kick off a load now so the next
+            # press doesn't raise "Model not loaded".
+            if self._local_transcriber.model is None and not self._local_transcriber._loading:
+                log.info("Local not loaded yet — scheduling load on backend switch")
+                self._local_load_event.clear()
+                threading.Thread(target=self._load_model, daemon=True).start()
 
         self.config["transcription_backend"] = backend
         save_config(self.config)
