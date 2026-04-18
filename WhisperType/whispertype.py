@@ -688,6 +688,12 @@ _MIC_SUBPROCESS_SCRIPT = (
     "    finally:\n"
     "        pa.terminate()\n"
     "def main():\n"
+    "    # Handle exactly ONE recording then exit. The parent pre-spawns a\n"
+    "    # replacement worker immediately after each recording, so the next\n"
+    "    # START is still near-zero-latency. Exiting post-recording is what\n"
+    "    # makes Windows drop the mic privacy indicator between recordings\n"
+    "    # — keeping the worker alive causes the WASAPI session to stay\n"
+    "    # held at the process level even after pa.terminate().\n"
     "    sys.stdout.write('HELLO\\n'); sys.stdout.flush()\n"
     "    try:\n"
     "        while True:\n"
@@ -700,7 +706,8 @@ _MIC_SUBPROCESS_SCRIPT = (
     "                try: dev = int(parts[1])\n"
     "                except ValueError: continue\n"
     "                dev_arg = dev if dev >= 0 else None\n"
-    "                if handle_one(dev_arg, parts[2]): break\n"
+    "                handle_one(dev_arg, parts[2])\n"
+    "                break   # exit after one recording\n"
     "            elif s == 'QUIT': break\n"
     "    except Exception as e:\n"
     "        try: sys.stderr.write('worker error: ' + str(e) + '\\n')\n"
@@ -710,27 +717,30 @@ _MIC_SUBPROCESS_SCRIPT = (
 
 
 class SubprocessAudioRecorder:
-    """Record the mic via a persistent subprocess worker.
+    """Record the mic via a pre-spawned, one-shot subprocess worker.
 
     Mimics AudioRecorder's public API (start/stop/is_recording/audio_data)
     so it can be swapped in without touching the calling code.
 
-    Architecture:
-      - One worker subprocess spawned at __init__; kept alive across
-        recordings. Python + pyaudio imports happen ONCE at startup
-        (~500ms cold, amortised over the whole session).
-      - start()/stop() send short text commands over the worker's stdin.
-        Each recording opens a fresh PyAudio stream and writes a WAV
-        file; this keeps per-stream state clean while avoiding the
-        ~220ms subprocess spawn cost that was eating the leading word
-        of every recording in the previous design.
-      - On silent-capture detection (handled by WhisperTypeApp), the
-        worker is killed + respawned to refresh the process-level
-        PortAudio cache that caused the original stale-handle bug.
+    Architecture (the key trick is "pre-spawn, not persist"):
+      - We always have one IDLE worker subprocess alive, already with
+        Python + pyaudio imported (HELLO received). Spawning happens at
+        __init__ AND in the background after every recording completes.
+      - start() writes 'START …' to the idle worker's stdin. Because it's
+        already hot, the PyAudio stream opens in ~1 ms — the leading
+        word of the user's speech is captured, not eaten by a cold
+        subprocess spawn.
+      - stop() sends STOP, waits for DONE, then the worker EXITS. This
+        is critical for the Windows mic privacy indicator — keeping the
+        worker alive would hold the WASAPI session at the process level
+        and leave the indicator visible between recordings even though
+        the stream is closed. Spawning a replacement happens in a
+        background thread so the user's next press is still fast.
+      - On silent capture, _kill_worker + _spawn_worker refreshes the
+        process-level PortAudio cache (the original session-6 bug).
 
-    audio_data: returns empty list (real buffer lives in the worker).
-    latest_levels: RMS bars streamed from the worker at ~20Hz, used by
-    WhisperTypeApp._waveform_updater.
+    audio_data: empty (real buffer lives in the worker).
+    latest_levels: RMS bars streamed from the worker at ~20 Hz.
     """
 
     def __init__(self, sample_rate=16000, channels=1, input_device_index=None):
@@ -867,8 +877,20 @@ class SubprocessAudioRecorder:
             if wav_path:
                 try: os.remove(wav_path)
                 except Exception: pass
+            # Pre-spawn next worker in background so the user's next
+            # press is still fast.
+            threading.Thread(target=self._spawn_worker, daemon=True).start()
             return np.array([], dtype=np.float32)
         self._worker_done.clear()
+
+        # Worker exits itself after DONE. Clear our handle and pre-spawn
+        # a replacement NOW so it'll be hot when the user presses again.
+        # Critical: this is what lets Windows drop the mic privacy
+        # indicator between recordings.
+        with self._worker_lock:
+            self._proc = None
+            self._worker_hello.clear()
+        threading.Thread(target=self._spawn_worker, daemon=True).start()
 
         wav_path = self._wav_path
         self._wav_path = None
