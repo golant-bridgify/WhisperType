@@ -2504,7 +2504,8 @@ class OverlayNotification:
             user32.SetWindowLongW.restype = ctypes.c_long
 
             GWL_EXSTYLE = -20
-            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_TRANSPARENT = 0x00000020   # click-through
+            WS_EX_NOACTIVATE = 0x08000000    # never receive focus/activation
             WS_EX_LAYERED = 0x00080000
             GA_ROOT = 2
 
@@ -2514,7 +2515,14 @@ class OverlayNotification:
             top_hwnd = user32.GetAncestor(frame_hwnd, GA_ROOT) or frame_hwnd
 
             ex_style = user32.GetWindowLongW(top_hwnd, GWL_EXSTYLE)
-            new_style = ex_style | WS_EX_TRANSPARENT | WS_EX_LAYERED
+            # WS_EX_TRANSPARENT alone isn't always enough — Windows still
+            # does a focus-handoff evaluation when something is clicked near
+            # a topmost layered window, which on the user's machine makes
+            # adjacent desktop icons pulse between their hover / pressed
+            # states. WS_EX_NOACTIVATE tells the OS "this window can never
+            # be the active/focused window", so there's no activation race
+            # to trigger that pulse.
+            new_style = ex_style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE
             user32.SetWindowLongW(top_hwnd, GWL_EXSTYLE, new_style)
         except Exception as e:
             log.debug("Click-through flag setup failed: %s", e)
