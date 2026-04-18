@@ -2540,6 +2540,11 @@ class WhisperTypeApp:
         # at time-of-paste so a follow-up recording can't confuse undo.
         self._last_paste = None
         self._last_paste_lock = threading.Lock()
+        # Silent-capture tracking — if we get >1 silent capture in quick
+        # succession, PortAudio state is stale and won't recover in-process.
+        # Counter triggers an auto-restart.
+        self._consecutive_silent = 0
+        self._last_silent_time = 0.0
 
     def run(self):
         """Main entry point."""
@@ -2644,6 +2649,15 @@ class WhisperTypeApp:
                         "Start with Windows",
                         lambda: self._toggle_auto_start(),
                         checked=lambda item: is_auto_start_enabled(),
+                    ),
+                    pystray.Menu.SEPARATOR,
+                    # Manual audio-stack fix: restarting a long-running
+                    # WhisperType instance (>8h idle) fixes stale PortAudio
+                    # state that causes silent captures. Auto-triggered
+                    # after 2 consecutive silent captures too.
+                    pystray.MenuItem(
+                        "🔄  Restart WhisperType",
+                        lambda: self._restart_whispertype("manual"),
                     ),
                 ),
             ),
@@ -3350,17 +3364,7 @@ class WhisperTypeApp:
         if duration_sec >= 1.5:
             audio_rms = float(np.sqrt(np.mean(audio ** 2) + 1e-12))
             if audio_rms < 0.003:  # ~-50dB — effectively silent
-                log.warning(
-                    "Silent audio detected: duration=%.1fs but RMS=%.5f. "
-                    "Mic likely didn't capture (common after Windows sleep). "
-                    "Skipping transcription.",
-                    duration_sec, audio_rms,
-                )
-                self.overlay.show_error("Mic silent — try again or check mic")
-                self._flash_error_tray("Mic captured silence — try again")
-                if self.tray_icon and self._recording_generation == self._recording_generation:
-                    # Tray will be restored by _flash_error_tray's timer
-                    pass
+                self._handle_silent_capture(duration_sec, audio_rms)
                 return
 
         # Short recordings: skip streaming partial, do single fast transcription
@@ -3459,6 +3463,8 @@ class WhisperTypeApp:
                         text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
+                        # Real audio → reset silent-capture counter
+                        self._consecutive_silent = 0
                         ok = self._do_paste(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         if ok:
@@ -3490,6 +3496,8 @@ class WhisperTypeApp:
                         text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
                         display_text = text.replace('\u200F', '').replace('\u200E', '')
                         log.info("Transcribed (%d chars): %s", len(display_text), display_text)
+                        # Real audio → reset silent-capture counter
+                        self._consecutive_silent = 0
                         ok = self._do_paste(text, mode=self.config.get("paste_mode", "auto_paste"))
                         add_history_entry(text, duration_sec, self.config["model_size"], source, self._get_task())
                         if ok:
@@ -4140,6 +4148,76 @@ class WhisperTypeApp:
         if device == "off":
             return
         play_beep(1000, 100, device_index=device)
+
+    def _handle_silent_capture(self, duration_sec, rms):
+        """Called when a recording came back silent (RMS below threshold).
+
+        Behaviour:
+        - First silent within a 2-minute window: log + flash error + show
+          overlay (even if silent_mode is on — this is an error the user
+          must see).
+        - Second silent within 2 minutes: PortAudio state is clearly stuck.
+          Trigger an automatic restart of the process, which our empirical
+          testing shows reliably fixes the issue.
+        """
+        now = time.time()
+        # Reset counter if the last silent was long ago
+        if now - self._last_silent_time > 120:
+            self._consecutive_silent = 0
+        self._consecutive_silent += 1
+        self._last_silent_time = now
+
+        log.warning(
+            "Silent audio detected (#%d): duration=%.1fs RMS=%.5f. "
+            "Mic likely didn't capture (PortAudio state stale after long idle).",
+            self._consecutive_silent, duration_sec, rms,
+        )
+
+        if self._consecutive_silent >= 2:
+            # Two in a row = stale state is persistent. Auto-restart.
+            log.warning("2 consecutive silent captures — auto-restarting to fix "
+                        "stale PortAudio state")
+            self._force_show_error_overlay(
+                "🔄 Audio stack stuck — restarting WhisperType..."
+            )
+            self._flash_error_tray("Auto-restarting to fix audio...", duration_sec=5.0)
+            # Give the user a moment to see the overlay, then restart
+            threading.Thread(
+                target=lambda: (time.sleep(1.5), self._restart_whispertype("silent-audio")),
+                daemon=True,
+            ).start()
+            return
+
+        # First silent — visible error, ask user to try once more.
+        # Force-show the overlay even in silent_mode — silent failure is
+        # exactly the case silent_mode should NOT hide.
+        self._force_show_error_overlay(
+            "Mic silent — try again (will auto-restart if persists)"
+        )
+        self._flash_error_tray("Mic captured silence — try again", duration_sec=5.0)
+
+    def _force_show_error_overlay(self, msg):
+        """Show an error overlay bypassing silent_mode.
+
+        silent_mode is meant to suppress SUCCESS feedback (the waveform
+        and 'Done' overlays) — but an error that blocks transcription is
+        precisely what the user needs to see. Temporarily flip silent off,
+        show, then flip it back.
+        """
+        was_silent = self.overlay.silent
+        try:
+            self.overlay.silent = False
+            self.overlay.show(f"  ⚠  {msg}  ",
+                              bg_color="#6b0f1a", duration=3500)
+        except Exception:
+            pass
+        finally:
+            # Restore after a delay — we can't restore immediately because
+            # the show command is queued for the Tk thread
+            def _restore():
+                time.sleep(4.0)
+                self.overlay.silent = was_silent
+            threading.Thread(target=_restore, daemon=True).start()
 
     def _flash_error_tray(self, msg, duration_sec=3.0):
         """Briefly set the tray icon to the 'error' state, then restore to idle.
@@ -5106,6 +5184,63 @@ class WhisperTypeApp:
         if self.tray_icon:
             self.tray_icon.stop()
         os._exit(0)
+
+    def _restart_whispertype(self, reason="manual"):
+        """Launch a fresh WhisperType instance and quit the current one.
+
+        This is the guaranteed fix for stale PortAudio / WASAPI state after
+        very long idle periods. A fresh process gets fresh PortAudio init,
+        and all our empirical testing shows that fixes the silent-capture
+        bug completely.
+
+        Mutex handling:
+          - Current process holds 'WhisperType_SingleInstance' mutex
+          - We spawn the new process with a 1.5s delay (via a timer thread)
+          - Meanwhile we call _quit() immediately, which releases the mutex
+            via atexit
+          - By the time the new process spawns, mutex is free
+        """
+        log.info("Restart requested (reason=%s)", reason)
+        import subprocess
+        try:
+            # Figure out how to relaunch — reuses the same logic as the
+            # Windows startup shortcut
+            target, args, working, _icon = _get_startup_target()
+
+            def launch_new():
+                # Small delay to let current process exit + release mutex
+                time.sleep(1.5)
+                try:
+                    # Build command line. 'args' is a quoted string from
+                    # _get_startup_target — subprocess.Popen wants a list,
+                    # so we strip the surrounding quotes if any.
+                    cmd = [target]
+                    if args:
+                        arg = args.strip()
+                        if arg.startswith('"') and arg.endswith('"'):
+                            arg = arg[1:-1]
+                        cmd.append(arg)
+                    log.info("Launching fresh instance: %s", cmd)
+                    subprocess.Popen(
+                        cmd,
+                        cwd=working or None,
+                        creationflags=0x00000008,  # DETACHED_PROCESS
+                        close_fds=True,
+                    )
+                except Exception as e:
+                    log.error("Fresh instance launch failed: %s", e)
+
+            threading.Thread(target=launch_new, daemon=True).start()
+            try:
+                self.overlay.show("  🔄  Restarting WhisperType...  ",
+                                  bg_color="#1e6091", duration=2000)
+            except Exception:
+                pass
+            # Give the overlay + thread a moment, then exit
+            time.sleep(0.2)
+            self._quit()
+        except Exception as e:
+            log.exception("Restart orchestration failed: %s", e)
 
 
 # ============================================================
