@@ -19,6 +19,49 @@ import queue
 import logging
 import numpy as np
 
+# Enable per-monitor DPI awareness BEFORE any tkinter window is created.
+# Without this, Windows bilinear-stretches the overlay window by the user's
+# DPI scale (e.g. 125% / 150%) and every PIL-rendered pill edge turns into
+# a blurry smear — which is the "pixelation" users report on modern
+# displays. With DPI awareness on, tkinter renders at physical pixels and
+# our PIL AA shows through cleanly. Try the best API first and fall back.
+_DPI_SCALE = 1.0   # overwritten below on Windows
+if sys.platform == "win32":
+    try:
+        import ctypes
+        try:
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4) — Win10 1703+
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor v1
+            except Exception:
+                ctypes.windll.user32.SetProcessDPIAware()
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            _DPI_SCALE = max(1.0, ctypes.windll.gdi32.GetDeviceCaps(hdc, 90) / 96.0)
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _apply_dpi_scaling_to_tk(root):
+    """Bump tk's internal scaling factor to match physical DPI.
+
+    With DPI awareness on, tkinter draws at physical pixels. Its default
+    scaling (1.333, calibrated for 96 DPI) then renders fonts and widget
+    sizes too small on a 150% / 200% display. Multiplying the scaling
+    factor by the real DPI ratio restores the perceived size.
+    """
+    if _DPI_SCALE <= 1.01:
+        return
+    try:
+        root.tk.call('tk', 'scaling', 1.333 * _DPI_SCALE)
+    except Exception:
+        pass
+
 # --- Logging (replaces print, no console window needed) ---
 # Uses RotatingFileHandler so the log never grows unbounded — on a PC
 # running auto-start daily, a plain FileHandler would reach hundreds of MB
@@ -2370,6 +2413,21 @@ class OverlayNotification:
         self._hide_after_id = None   # pending auto-hide Tk timer id
         self.silent = False          # when True, show_* methods no-op
         self._tk_queue = queue.Queue()
+
+        # With DPI awareness on, canvas coordinates and PhotoImage sizes
+        # are in physical pixels. Scale pixel-space dimensions so the pill
+        # keeps its perceived size across DPI settings. (Font size is
+        # handled separately via tk's scaling factor — points, not pixels.)
+        s = _DPI_SCALE
+        self.CANVAS_HEIGHT = int(round(self.CANVAS_HEIGHT * s))
+        self.BAR_WIDTH = max(2, int(round(self.BAR_WIDTH * s)))
+        self.BAR_GAP = max(1, int(round(self.BAR_GAP * s)))
+        self.PILL_MARGIN = max(1, int(round(self.PILL_MARGIN * s)))
+        self.SHADOW_DX = max(1, int(round(self.SHADOW_DX * s)))
+        self.SHADOW_DY = max(1, int(round(self.SHADOW_DY * s)))
+        self.TEXT_PADDING_X = int(round(self.TEXT_PADDING_X * s))
+        self.WAVE_PADDING_X = int(round(self.WAVE_PADDING_X * s))
+
         self._thread = threading.Thread(target=self._run_tk, daemon=True)
         self._thread.start()
         time.sleep(0.3)
@@ -2378,6 +2436,7 @@ class OverlayNotification:
         import tkinter as tk
         import tkinter.font as tkfont
         self._root = tk.Tk()
+        _apply_dpi_scaling_to_tk(self._root)
         self._root.withdraw()
         self._root.overrideredirect(True)
         self._root.attributes('-topmost', True)
@@ -2389,6 +2448,8 @@ class OverlayNotification:
 
         families = set(tkfont.families(self._root))
         family = "Segoe UI Variable Text" if "Segoe UI Variable Text" in families else "Segoe UI"
+        # Font size in points — tk's scaling factor (set above) converts
+        # to physical pixels correctly on any DPI.
         self._font = tkfont.Font(family=family, size=11, weight="normal")
 
         self._canvas = tk.Canvas(
@@ -2453,17 +2514,11 @@ class OverlayNotification:
     def _hex_to_rgb(h):
         return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
 
-    @staticmethod
-    def _pil_pill(draw, px1, py1, px2, py2, r, fill):
-        """Draw a pill shape on a PIL ImageDraw (two ellipses + a rectangle)."""
-        draw.ellipse([px1, py1, px1 + 2 * r, py2], fill=fill)
-        draw.ellipse([px2 - 2 * r, py1, px2, py2], fill=fill)
-        draw.rectangle([px1 + r, py1, px2 - r, py2], fill=fill)
-
     def _draw_pill(self, w, h, fill_start, fill_end, draw_shadow=True):
-        """Render a pill+shadow PIL image at 4× supersample, downsample with
-        LANCZOS for AA, composite against TRANSPARENT_KEY, and put it on the
-        canvas. Replaces tkinter's aliased create_oval so edges are smooth.
+        """Render pill+shadow via PIL's `rounded_rectangle` (single atomic
+        primitive — no visible seam between caps and the middle) at 4×
+        supersample, downsample with LANCZOS for AA, composite against
+        TRANSPARENT_KEY, and paint onto the canvas as a PhotoImage.
         """
         if not self._canvas:
             return
@@ -2471,52 +2526,54 @@ class OverlayNotification:
 
         SS = self.SS
         SW, SH = w * SS, h * SS
-        # Supersampled rect for the pill
         PM = self.PILL_MARGIN * SS
         SDX = self.SHADOW_DX * SS
         SDY = self.SHADOW_DY * SS
-        sp_x1, sp_y1 = PM, PM
-        sp_x2, sp_y2 = SW - PM - SDX, SH - PM - SDY
-        r = (sp_y2 - sp_y1) // 2
+        # Inclusive bounding boxes (PIL interprets the end coords inclusively)
+        px1, py1 = PM, PM
+        px2, py2 = SW - PM - SDX - 1, SH - PM - SDY - 1
+        r = (py2 - py1) // 2
+        pill_bbox = (px1, py1, px2, py2)
+        shadow_bbox = (px1 + SDX, py1 + SDY, px2 + SDX, py2 + SDY)
 
         img = Image.new('RGBA', (SW, SH), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         if draw_shadow:
             sc = (*self._hex_to_rgb(self.SHADOW_COLOR), 255)
-            self._pil_pill(draw, sp_x1 + SDX, sp_y1 + SDY,
-                           sp_x2 + SDX, sp_y2 + SDY, r, sc)
+            draw.rounded_rectangle(shadow_bbox, radius=r, fill=sc)
 
         if fill_start == fill_end:
             fc = (*self._hex_to_rgb(fill_start), 255)
-            self._pil_pill(draw, sp_x1, sp_y1, sp_x2, sp_y2, r, fc)
+            draw.rounded_rectangle(pill_bbox, radius=r, fill=fc)
         else:
-            # Gradient middle + matching caps. Draw one line per column
-            # across the pill's bbox, then clip via a rounded mask.
+            # Gradient via mask: paint one line per column on a full-bbox
+            # gradient image, then clip to the rounded-rect mask.
             grad = Image.new('RGBA', (SW, SH), (0, 0, 0, 0))
             gdraw = ImageDraw.Draw(grad)
-            width_px = sp_x2 - sp_x1
+            width_px = px2 - px1 + 1
             for col in range(width_px):
                 t = col / max(1, width_px - 1)
                 c = self._interp_color(fill_start, fill_end, t)
-                gdraw.line([(sp_x1 + col, sp_y1), (sp_x1 + col, sp_y2)],
+                gdraw.line([(px1 + col, py1), (px1 + col, py2)],
                            fill=(*self._hex_to_rgb(c), 255))
             mask = Image.new('L', (SW, SH), 0)
-            mdraw = ImageDraw.Draw(mask)
-            self._pil_pill(mdraw, sp_x1, sp_y1, sp_x2, sp_y2, r, 255)
+            ImageDraw.Draw(mask).rounded_rectangle(pill_bbox, radius=r, fill=255)
             img.paste(grad, (0, 0), mask)
 
-        # Downsample with high-quality filter → AA edges
+        # Downsample with LANCZOS → smooth AA edges.
         final = img.resize((w, h), Image.LANCZOS)
-        # Composite against TRANSPARENT_KEY (PhotoImage needs RGB). Dark key
-        # keeps the ~1px AA fringe subtle and shadow-like.
+        # tk.PhotoImage doesn't accept RGBA directly; composite against
+        # TRANSPARENT_KEY so -transparentcolor makes the non-pill area
+        # disappear. Key is kept very dark so the ~1px AA fringe looks
+        # like a faint shadow rim rather than a bright halo.
         bg_rgb = self._hex_to_rgb(self.TRANSPARENT_KEY)
         bg = Image.new('RGB', (w, h), bg_rgb)
         bg.paste(final, (0, 0), final.split()[3])
 
         self._pill_photo = ImageTk.PhotoImage(bg)
         self._canvas.delete("pill_img")
-        # Insert first so bars/text end up on top.
+        # Insert first so bars/text end up on top in canvas z-order.
         self._canvas.create_image(0, 0, anchor='nw',
                                   image=self._pill_photo, tags="pill_img")
 
@@ -4234,6 +4291,7 @@ class WhisperTypeApp:
 
             # Create a hidden root for the file dialog
             root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
             root.withdraw()
             root.attributes('-topmost', True)
 
@@ -5129,6 +5187,7 @@ class WhisperTypeApp:
             import tkinter as tk
 
             root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
             root.title("Change Hotkey")
             root.configure(bg="#1e1e2e")
             root.resizable(False, False)
@@ -5280,6 +5339,7 @@ class WhisperTypeApp:
             import tkinter as tk
 
             root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
             root.title("Custom Vocabulary")
             root.configure(bg="#1e1e2e")
             root.resizable(False, False)
@@ -5449,6 +5509,7 @@ class WhisperTypeApp:
             import tkinter as tk
 
             root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
             root.title("Groq API Key")
             root.configure(bg="#1e1e2e")
             root.resizable(False, False)
@@ -5784,6 +5845,7 @@ class WhisperTypeApp:
             history.reverse()  # newest first
 
             root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
             root.title("WhisperType - History")
             root.geometry("700x500")
             root.attributes('-topmost', True)
