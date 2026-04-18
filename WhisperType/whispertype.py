@@ -114,6 +114,13 @@ DEFAULT_CONFIG = {
     # handles. Default 10 min matches typical Windows display timeout.
     # Set to 0 to disable.
     "auto_restart_on_wake_idle_min": 10,
+    # Subprocess mic recorder: record each utterance in a fresh Python
+    # subprocess. Guarantees pristine PortAudio state per recording,
+    # immune to the stale-WASAPI-handle bug that otherwise needs the
+    # watchdogs above to work around. Costs ~300ms spawn latency per
+    # recording. Not available in PyInstaller-frozen mode (no standalone
+    # python.exe to invoke). Set false to revert to in-process recording.
+    "use_subprocess_mic": True,
 }
 
 
@@ -392,6 +399,26 @@ def is_user_admin():
         return False
 
 
+def find_python_interpreter():
+    """Return the path to a Python interpreter we can invoke with ``-c``.
+
+    Returns None when running as a PyInstaller one-file bundle (sys.frozen
+    is True and there's no standalone python.exe alongside our .exe).
+    Callers use this to conditionally spawn Python subprocesses; when None
+    they should fall back to in-process logic.
+
+    Prefers pythonw.exe (no console flash) over python.exe.
+    """
+    if getattr(sys, 'frozen', False):
+        return None
+    py_dir = os.path.dirname(sys.executable)
+    for name in ("pythonw.exe", "python.exe"):
+        cand = os.path.join(py_dir, name)
+        if os.path.exists(cand):
+            return cand
+    return sys.executable
+
+
 def get_system_idle_seconds():
     """Return seconds since the last user input (keyboard or mouse).
 
@@ -517,6 +544,179 @@ class AudioRecorder:
         raw = b"".join(self.audio_data)
         audio_np = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         return audio_np
+
+
+# ============================================================
+# Subprocess Audio Recorder — isolated per-recording Python process
+# ============================================================
+# Inline Python script run by the subprocess. Takes two argv:
+#   1. input_device_index (int, -1 = system default)
+#   2. output WAV path
+# Records mono 16kHz int16 until the parent closes stdin, then writes
+# the WAV and exits. Runs in a fresh Python process so PortAudio
+# state is guaranteed pristine per recording — immune to the
+# stale-WASAPI-handle bug that bites after 8+h uptime or a
+# display-sleep / mic-USB-power-cycle.
+_MIC_SUBPROCESS_SCRIPT = (
+    "import sys, wave, threading, pyaudio\n"
+    "dev = int(sys.argv[1]); out = sys.argv[2]\n"
+    "dev_arg = dev if dev >= 0 else None\n"
+    "frames = []; lock = threading.Lock()\n"
+    "def cb(data, fc, ti, st):\n"
+    "    with lock: frames.append(data)\n"
+    "    return (None, pyaudio.paContinue)\n"
+    "pa = pyaudio.PyAudio()\n"
+    "try:\n"
+    "    try:\n"
+    "        s = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,\n"
+    "                    input=True, input_device_index=dev_arg,\n"
+    "                    frames_per_buffer=1024, stream_callback=cb)\n"
+    "    except Exception:\n"
+    "        s = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,\n"
+    "                    input=True, frames_per_buffer=1024, stream_callback=cb)\n"
+    "    s.start_stream()\n"
+    "    try: sys.stdin.buffer.read(1)\n"
+    "    except Exception: pass\n"
+    "    s.stop_stream(); s.close()\n"
+    "    with lock: raw = b''.join(frames)\n"
+    "    with wave.open(out, 'wb') as wf:\n"
+    "        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)\n"
+    "        wf.writeframes(raw)\n"
+    "finally:\n"
+    "    pa.terminate()\n"
+)
+
+
+class SubprocessAudioRecorder:
+    """Record the mic in an isolated Python subprocess.
+
+    Mimics AudioRecorder's public API (start/stop/is_recording/audio_data)
+    so it can be swapped in without touching the calling code.
+
+    Why: PortAudio keeps process-level WASAPI device handles cached. When
+    the mic's USB power cycles (e.g. webcam on a monitor that sleeps),
+    every new pyaudio.PyAudio() within the SAME process still gets the
+    stale handle, even if we terminate() and re-init cleanly. The stream
+    "opens" (Windows even shows the privacy-mic indicator) but callbacks
+    return zero-filled frames. Empirically verified: a fresh Python
+    process from the same user session at the same moment captures real
+    audio; WhisperType's long-running process captures RMS=0.00002.
+
+    Running each recording in a subprocess gives us a fresh PortAudio
+    state every time — immune to the staleness. Cost: ~300ms spawn
+    latency at the start of each recording (amortised across a speech
+    utterance, barely noticeable).
+
+    IPC:
+      - Spawn `python -c <script> <device_idx> <wav_path>`
+      - Subprocess streams audio to an in-memory list, waits on stdin
+      - When parent closes stdin, subprocess finalises the WAV and exits
+      - Parent reads the WAV file and returns it as numpy array
+
+    audio_data: returns empty list. The live frames live in the subprocess
+    so we can't expose them. Callers that depend on live audio_data
+    (waveform animation, streaming transcription) simply get "nothing to
+    display" — acceptable trade-off for the reliability win. Groq backend
+    users don't stream, and silent_mode users don't see the waveform.
+    """
+
+    def __init__(self, sample_rate=16000, channels=1, input_device_index=None):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.input_device_index = input_device_index
+        self.is_recording = False
+        self.audio_data = []   # compat stub — always empty for subprocess
+        self._proc = None
+        self._wav_path = None
+
+    def start(self):
+        import subprocess
+        import tempfile
+        interp = find_python_interpreter()
+        if interp is None:
+            raise RuntimeError("Subprocess recorder requires python.exe — not "
+                               "available in frozen mode")
+        fd, self._wav_path = tempfile.mkstemp(suffix=".wav", prefix="wt_mic_")
+        os.close(fd)
+
+        dev_arg = str(self.input_device_index) if self.input_device_index is not None else "-1"
+        try:
+            self._proc = subprocess.Popen(
+                [interp, "-c", _MIC_SUBPROCESS_SCRIPT, dev_arg, self._wav_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+                bufsize=0,
+            )
+            self.is_recording = True
+        except Exception as e:
+            log.error("SubprocessAudioRecorder: spawn failed: %s", e)
+            # Clean up the tempfile if spawn failed
+            try:
+                os.remove(self._wav_path)
+            except Exception:
+                pass
+            self._wav_path = None
+            raise
+
+    def stop(self) -> np.ndarray:
+        import subprocess
+        self.is_recording = False
+        if self._proc is None:
+            return np.array([], dtype=np.float32)
+
+        # Signal subprocess to stop: closing stdin unblocks its read(1)
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+        except Exception as e:
+            log.warning("SubprocessAudioRecorder: stdin close failed: %s", e)
+
+        # Wait (with timeout) for subprocess to finalise and exit
+        try:
+            rc = self._proc.wait(timeout=6.0)
+            if rc != 0:
+                err_output = ""
+                try:
+                    if self._proc.stderr:
+                        err_output = self._proc.stderr.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
+                log.warning("SubprocessAudioRecorder: subprocess exited with rc=%s, stderr=%r",
+                            rc, err_output)
+        except subprocess.TimeoutExpired:
+            log.warning("SubprocessAudioRecorder: subprocess didn't exit in 6s — killing")
+            try:
+                self._proc.kill()
+                self._proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        finally:
+            self._proc = None
+
+        # Read back the WAV
+        wav_path = self._wav_path
+        self._wav_path = None
+        if not wav_path or not os.path.exists(wav_path):
+            log.warning("SubprocessAudioRecorder: WAV missing at %s — empty capture", wav_path)
+            return np.array([], dtype=np.float32)
+
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                raw = wf.readframes(wf.getnframes())
+        except Exception as e:
+            log.warning("SubprocessAudioRecorder: WAV read failed: %s", e)
+            raw = b""
+        finally:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+
+        if not raw:
+            return np.array([], dtype=np.float32)
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 # ============================================================
@@ -2340,23 +2540,10 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
         return
 
     # Specific device → try to run PyAudio in a subprocess (crash-safe).
-    # When frozen (PyInstaller), we can't spawn `-c python -c "..."`, so fall
-    # back to in-process PyAudio with a format-supported guard — it's less
-    # safe but the format check prevents the worst crashes.
+    # When frozen (PyInstaller), we can't spawn `python -c "..."`, so fall
+    # back to in-process PyAudio with a format-supported guard.
     import subprocess
-
-    # Find a real python interpreter to run -c with. None if we're frozen.
-    def _find_python_interpreter():
-        if getattr(sys, 'frozen', False):
-            return None  # PyInstaller: no standalone python.exe available
-        py_dir = os.path.dirname(sys.executable)
-        for name in ("pythonw.exe", "python.exe"):
-            cand = os.path.join(py_dir, name)
-            if os.path.exists(cand):
-                return cand
-        return sys.executable
-
-    interp = _find_python_interpreter()
+    interp = find_python_interpreter()
 
     if interp:
         try:
@@ -2466,9 +2653,25 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
 class WhisperTypeApp:
     def __init__(self):
         self.config = load_config()
-        self.recorder = AudioRecorder(
-            input_device_index=self.config.get("input_device_index"),
+        # Pick the recorder implementation. Subprocess-isolated is the
+        # default because it eliminates the stale-PortAudio / WASAPI-handle
+        # bug structurally. Falls back to in-process if:
+        #   • user explicitly disabled it via config
+        #   • we're frozen (no python.exe to spawn)
+        use_subproc = (
+            self.config.get("use_subprocess_mic", True)
+            and find_python_interpreter() is not None
         )
+        if use_subproc:
+            self.recorder = SubprocessAudioRecorder(
+                input_device_index=self.config.get("input_device_index"),
+            )
+            log.info("Mic recorder: SubprocessAudioRecorder (isolated per-recording)")
+        else:
+            self.recorder = AudioRecorder(
+                input_device_index=self.config.get("input_device_index"),
+            )
+            log.info("Mic recorder: in-process AudioRecorder")
         # Loopback recorder for system audio (WASAPI loopback)
         if LoopbackRecorder.is_available():
             loopback_info = LoopbackRecorder.find_loopback_device(
