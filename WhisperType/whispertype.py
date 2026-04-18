@@ -2307,39 +2307,54 @@ def add_history_entry(text, duration_sec=0, model="", source="microphone", task=
 # Visual Overlay Notification
 # ============================================================
 class OverlayNotification:
-    """Floating pill-shaped overlay — translucent, modern, white waveform.
+    """Floating pill-shaped overlay — real-circle caps, subtle drop shadow,
+    horizontal-gradient fill, all white waveform.
 
-    Rendered as a rounded polygon on a transparent-color tk window so the
-    visible surface is a true pill instead of a boxy rectangle. All content
-    (text, bars) lives on a single Canvas.
+    Rendered with Windows `-transparentcolor` so the visible shape is a
+    true pill silhouette (not a boxy rectangle). All content (caps, middle
+    slices, bars, text, shadow) lives on a single Canvas.
     """
 
-    # Must match WAVEFORM_NUM_BARS at module level — the subprocess
-    # recorder streams exactly this many pre-computed levels back.
+    # Must match WAVEFORM_NUM_BARS — the subprocess streams exactly that
+    # many pre-computed bar levels back to the parent.
     NUM_BARS = WAVEFORM_NUM_BARS
     BAR_WIDTH = 3
     BAR_GAP = 3
     CANVAS_HEIGHT = 44
     PILL_MARGIN = 2
+    SHADOW_DX = 2       # shadow offset right
+    SHADOW_DY = 3       # shadow offset down
     TEXT_PADDING_X = 28
     WAVE_PADDING_X = 22
 
-    # Windows: pixels of this color are made fully transparent by
-    # -transparentcolor, giving us an actual pill silhouette. Picked to be
-    # extremely unlikely to appear in any legitimate foreground content.
+    # Pixels painted with this color become fully transparent on Windows.
     TRANSPARENT_KEY = '#010203'
+    SHADOW_COLOR = '#070b14'   # very dark slate — subtle "3D" hint
 
-    # Neutral pill for the waveform — lets the white bars pop without
-    # the rainbow look.
-    WAVE_PILL_FILL = '#0b1220'
-    WAVE_PILL_BORDER = '#334155'
-    # White-ish bar gradient by level (low → mid → high). No more red/green.
-    BAR_COLOR_LOW = '#475569'    # slate-600, quiet
+    # Waveform pill is intentionally neutral so the white bars pop.
+    WAVE_PILL_FILL_START = '#0b1220'
+    WAVE_PILL_FILL_END = '#182235'
+    BAR_COLOR_LOW = '#475569'    # slate-600 (quiet)
     BAR_COLOR_MID = '#cbd5e1'    # slate-300
-    BAR_COLOR_HIGH = '#f8fafc'   # near-white, loud
+    BAR_COLOR_HIGH = '#f8fafc'   # near-white (loud)
 
-    DEFAULT_TEXT_BG = '#1a1a2e'  # used when caller passes no bg_color
+    DEFAULT_TEXT_BG = '#1e293b'
     TEXT_COLOR = '#f1f5f9'
+
+    # Map legacy solid bg_color values to a modern (start, end) gradient
+    # pair. Callers keep passing a single color; we render it as a
+    # horizontal shine. The orange transcribing pill in particular becomes
+    # a cool indigo→slate sweep that feels less dated.
+    _GRADIENT_REMAP = {
+        '#f77f00': ('#334155', '#1e293b'),  # transcribing — was orange
+        '#2d6a4f': ('#047857', '#065f46'),  # done
+        '#6b0f1a': ('#991b1b', '#7f1d1d'),  # error
+        '#1e64c8': ('#1e40af', '#1e3a8a'),  # loading (blue)
+        '#1e6091': ('#3730a3', '#1e3a8a'),  # hotkey banner
+        '#d08770': ('#92400e', '#78350f'),  # warning
+        '#4c6085': ('#334155', '#1e293b'),  # undo
+        '#1a1a2e': ('#1e293b', '#0f172a'),  # default
+    }
 
     def __init__(self):
         self._root = None
@@ -2348,32 +2363,26 @@ class OverlayNotification:
         self._font = None
         self._waveform_mode = False
         self._visible = False
-        self.silent = False  # When True, all show_* methods no-op
+        self._hide_after_id = None   # pending auto-hide Tk timer id
+        self.silent = False          # when True, show_* methods no-op
         self._tk_queue = queue.Queue()
         self._thread = threading.Thread(target=self._run_tk, daemon=True)
         self._thread.start()
-        # Wait for tk to be ready
         time.sleep(0.3)
 
     def _run_tk(self):
-        """Run the tkinter mainloop in its own thread."""
         import tkinter as tk
         import tkinter.font as tkfont
-
         self._root = tk.Tk()
         self._root.withdraw()
         self._root.overrideredirect(True)
         self._root.attributes('-topmost', True)
-        # Make the rectangular window look pill-shaped: the non-pill pixels
-        # are drawn in TRANSPARENT_KEY and Windows paints nothing there.
         try:
             self._root.attributes('-transparentcolor', self.TRANSPARENT_KEY)
         except Exception:
-            # Non-Windows fallback: window stays rectangular, still works.
             pass
         self._root.configure(bg=self.TRANSPARENT_KEY)
 
-        # Prefer Windows 11's variable font, fall back to classic Segoe UI.
         families = set(tkfont.families(self._root))
         family = "Segoe UI Variable Text" if "Segoe UI Variable Text" in families else "Segoe UI"
         self._font = tkfont.Font(family=family, size=11, weight="normal")
@@ -2389,7 +2398,6 @@ class OverlayNotification:
         self._root.mainloop()
 
     def _check_queue(self):
-        """Process pending commands from other threads."""
         try:
             while not self._tk_queue.empty():
                 cmd = self._tk_queue.get_nowait()
@@ -2399,30 +2407,82 @@ class OverlayNotification:
         if self._root:
             self._root.after(50, self._check_queue)
 
-    def _draw_pill(self, w, h, fill, outline=None):
-        """(Re)paint the pill background on the canvas at the given size."""
+    def _cancel_pending_hide(self):
+        """Kill any pending auto-hide Tk timer. Must run on the Tk thread.
+
+        Critical fix: without this, a show_done(duration=1500) followed by
+        a new show_waveform() inside that 1500ms window would leave the
+        old timer live — it'd fire mid-recording and withdraw the window,
+        making the waveform mysteriously disappear while the user is
+        still holding the hotkey.
+        """
+        if self._hide_after_id is not None and self._root:
+            try:
+                self._root.after_cancel(self._hide_after_id)
+            except Exception:
+                pass
+            self._hide_after_id = None
+
+    @classmethod
+    def _resolve_gradient(cls, bg):
+        """Accept None / '#rrggbb' / (start, end) and return (start, end)."""
+        if bg is None:
+            return (cls.DEFAULT_TEXT_BG, cls.DEFAULT_TEXT_BG)
+        if isinstance(bg, tuple) and len(bg) == 2:
+            return bg
+        if bg in cls._GRADIENT_REMAP:
+            return cls._GRADIENT_REMAP[bg]
+        return (bg, bg)
+
+    @staticmethod
+    def _interp_color(c1, c2, t):
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        return f'#{int(r1+(r2-r1)*t):02x}{int(g1+(g2-g1)*t):02x}{int(b1+(b2-b1)*t):02x}'
+
+    def _pill_rect(self, w, h):
+        """(px1, py1, px2, py2) — the bounding box of the visible pill."""
+        PM = self.PILL_MARGIN
+        return (PM, PM, w - PM - self.SHADOW_DX, h - PM - self.SHADOW_DY)
+
+    def _draw_pill(self, w, h, fill_start, fill_end, draw_shadow=True):
+        """Paint pill (real-circle caps + optional gradient middle) + shadow."""
         if not self._canvas:
             return
         self._canvas.delete("pill")
-        radius = (h - 2 * self.PILL_MARGIN) // 2
-        x1, y1 = self.PILL_MARGIN, self.PILL_MARGIN
-        x2, y2 = w - self.PILL_MARGIN, h - self.PILL_MARGIN
-        # Smoothed polygon approximates a rounded rectangle. Corner points
-        # are duplicated so the smooth curve hugs them more tightly.
-        pts = [
-            x1 + radius, y1,
-            x2 - radius, y1, x2, y1,
-            x2, y1 + radius, x2, y2 - radius,
-            x2, y2, x2 - radius, y2,
-            x1 + radius, y2, x1, y2,
-            x1, y2 - radius, x1, y1 + radius,
-            x1, y1,
-        ]
-        self._canvas.create_polygon(
-            pts, smooth=True, splinesteps=36,
-            fill=fill, outline=outline or fill, width=1,
-            tags="pill",
-        )
+        self._canvas.delete("shadow")
+
+        px1, py1, px2, py2 = self._pill_rect(w, h)
+        r = (py2 - py1) // 2   # real circle radius
+
+        if draw_shadow:
+            sx1, sy1 = px1 + self.SHADOW_DX, py1 + self.SHADOW_DY
+            sx2, sy2 = px2 + self.SHADOW_DX, py2 + self.SHADOW_DY
+            sc = self.SHADOW_COLOR
+            self._canvas.create_oval(sx1, sy1, sx1 + 2*r, sy2, fill=sc, outline="", tags="shadow")
+            self._canvas.create_oval(sx2 - 2*r, sy1, sx2, sy2, fill=sc, outline="", tags="shadow")
+            self._canvas.create_rectangle(sx1 + r, sy1, sx2 - r, sy2, fill=sc, outline="", tags="shadow")
+
+        # Main pill: caps in start/end colors, middle filled or sliced gradient.
+        self._canvas.create_oval(px1, py1, px1 + 2*r, py2,
+                                 fill=fill_start, outline="", tags="pill")
+        self._canvas.create_oval(px2 - 2*r, py1, px2, py2,
+                                 fill=fill_end, outline="", tags="pill")
+        mid_x1, mid_x2 = px1 + r, px2 - r
+        if mid_x2 > mid_x1:
+            if fill_start == fill_end:
+                self._canvas.create_rectangle(mid_x1, py1, mid_x2, py2,
+                                              fill=fill_start, outline="", tags="pill")
+            else:
+                N = 28  # gradient slice count — smooth enough at this size
+                slice_w = (mid_x2 - mid_x1) / N
+                for i in range(N):
+                    t = i / max(1, N - 1)
+                    c = self._interp_color(fill_start, fill_end, t)
+                    sx1 = mid_x1 + i * slice_w
+                    sx2 = sx1 + slice_w + 1  # +1 overlap kills 1px seams
+                    self._canvas.create_rectangle(sx1, py1, sx2, py2,
+                                                  fill=c, outline="", tags="pill")
 
     def show(self, text, bg_color=None, fg_color=None, duration=0):
         """Show a pill-shaped notification. duration=0 stays until hidden."""
@@ -2431,21 +2491,26 @@ class OverlayNotification:
         def _do():
             if not self._root or not self._canvas or not self._font:
                 return
+            self._cancel_pending_hide()
             self._waveform_mode = False
             self._bars = []
             self._canvas.delete("bars")
             self._canvas.delete("text")
 
-            fill = bg_color or self.DEFAULT_TEXT_BG
+            start, end = self._resolve_gradient(bg_color)
             fg = fg_color or self.TEXT_COLOR
 
             text_w = self._font.measure(text)
             h = self.CANVAS_HEIGHT
-            w = max(text_w + 2 * self.TEXT_PADDING_X, h + 20)
+            pill_h = h - 2 * self.PILL_MARGIN - self.SHADOW_DY
+            min_pill_w = pill_h + 16   # keep caps from collapsing into each other
+            w = max(text_w + 2 * self.TEXT_PADDING_X, min_pill_w) + self.SHADOW_DX
             self._canvas.configure(width=w, height=h)
-            self._draw_pill(w, h, fill=fill)
+            self._draw_pill(w, h, fill_start=start, fill_end=end)
+
+            px1, py1, px2, py2 = self._pill_rect(w, h)
             self._canvas.create_text(
-                w // 2, h // 2, text=text,
+                (px1 + px2) // 2, (py1 + py2) // 2, text=text,
                 fill=fg, font=self._font, tags="text",
             )
 
@@ -2456,13 +2521,23 @@ class OverlayNotification:
             self._visible = True
 
             if duration > 0:
-                self._root.after(duration, self.hide)
-
+                self._hide_after_id = self._root.after(duration, self._do_hide_from_tk)
         self._tk_queue.put(_do)
 
+    def _do_hide_from_tk(self):
+        """Timer callback fired from Tk's event loop. Inline, no queue round-trip."""
+        self._hide_after_id = None
+        if self._root:
+            try:
+                self._root.withdraw()
+            except Exception:
+                pass
+            self._visible = False
+            self._waveform_mode = False
+
     def hide(self):
-        """Hide the overlay."""
         def _do():
+            self._cancel_pending_hide()
             if self._root:
                 self._root.withdraw()
                 self._visible = False
@@ -2470,12 +2545,12 @@ class OverlayNotification:
         self._tk_queue.put(_do)
 
     def show_waveform(self):
-        """Switch overlay to waveform visualization mode (neutral pill + white bars)."""
         if self.silent:
             return
         def _do():
             if not self._root or not self._canvas:
                 return
+            self._cancel_pending_hide()
             self._canvas.delete("bars")
             self._canvas.delete("text")
             self._bars = []
@@ -2483,11 +2558,14 @@ class OverlayNotification:
 
             h = self.CANVAS_HEIGHT
             bars_w = self.NUM_BARS * (self.BAR_WIDTH + self.BAR_GAP) - self.BAR_GAP
-            w = bars_w + 2 * self.WAVE_PADDING_X
+            w = bars_w + 2 * self.WAVE_PADDING_X + self.SHADOW_DX
             self._canvas.configure(width=w, height=h)
-            self._draw_pill(w, h, fill=self.WAVE_PILL_FILL, outline=self.WAVE_PILL_BORDER)
+            self._draw_pill(w, h,
+                            fill_start=self.WAVE_PILL_FILL_START,
+                            fill_end=self.WAVE_PILL_FILL_END)
 
-            cy = h // 2
+            px1, py1, px2, py2 = self._pill_rect(w, h)
+            cy = (py1 + py2) // 2
             for i in range(self.NUM_BARS):
                 x = self.WAVE_PADDING_X + i * (self.BAR_WIDTH + self.BAR_GAP)
                 bar = self._canvas.create_rectangle(
@@ -2504,15 +2582,16 @@ class OverlayNotification:
         self._tk_queue.put(_do)
 
     def update_waveform(self, levels):
-        """Update bar heights + colour (white gradient). levels: list of 0.0-1.0."""
         if self.silent:
             return
         def _do():
             if not self._canvas or not self._waveform_mode or not self._bars:
                 return
             h = self.CANVAS_HEIGHT
-            cy = h // 2
-            max_h = h // 2 - 5
+            py1 = self.PILL_MARGIN
+            py2 = h - self.PILL_MARGIN - self.SHADOW_DY
+            cy = (py1 + py2) // 2
+            max_h = (py2 - py1) // 2 - 3
             for i, bar in enumerate(self._bars):
                 if i >= len(levels):
                     continue
@@ -2530,7 +2609,6 @@ class OverlayNotification:
         self._tk_queue.put(_do)
 
     def hide_waveform(self):
-        """Remove bars (but keep the window — `show()` can repaint immediately)."""
         def _do():
             self._waveform_mode = False
             self._bars = []
