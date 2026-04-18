@@ -101,6 +101,12 @@ DEFAULT_CONFIG = {
     # to the focused window) AND restore the previous clipboard content
     # immediately. Only works within 60s of the paste.
     "undo_hotkey": "ctrl+alt+z",
+    # Idle watchdog: silently restart WhisperType after N hours of no
+    # recording activity, to avoid stale-PortAudio silent captures after
+    # long idle (e.g. overnight). Set to 0 to disable. Default 4 hours.
+    # Restart only fires when no recording / meeting is in progress and
+    # the process has been alive >= 1 hour.
+    "auto_restart_idle_hours": 4,
 }
 
 
@@ -2545,6 +2551,9 @@ class WhisperTypeApp:
         # Counter triggers an auto-restart.
         self._consecutive_silent = 0
         self._last_silent_time = 0.0
+        # Process start time — used by the idle watchdog to know process
+        # uptime (don't auto-restart within the first hour of a fresh launch).
+        self._process_start_time = time.time()
 
     def run(self):
         """Main entry point."""
@@ -2689,6 +2698,14 @@ class WhisperTypeApp:
             log.info("Undo hotkey registered: %s", undo_hk)
         except Exception as e:
             log.warning("Could not register undo hotkey: %s", e)
+
+        # Start the idle watchdog — restarts us every N hours idle to
+        # avoid the stale-PortAudio silent-capture bug that hits after
+        # ~8 hours. Checks every 30 min, only fires when nothing active.
+        threshold = float(self.config.get("auto_restart_idle_hours", 4) or 0)
+        if threshold > 0:
+            threading.Thread(target=self._idle_watchdog, daemon=True).start()
+            log.info("Idle watchdog running (threshold: %.1f hours)", threshold)
 
         # Wait for Windows Explorer / taskbar to be ready before showing the tray
         # icon. Fixes the case where auto-start launches WhisperType before the
@@ -3079,6 +3096,57 @@ class WhisperTypeApp:
         threading.Thread(
             target=self._recording_watchdog, args=(watchdog_gen,), daemon=True
         ).start()
+
+    def _idle_watchdog(self):
+        """Background thread that pre-emptively restarts WhisperType after
+        long idle to avoid stale-PortAudio silent captures.
+
+        The problem: PortAudio caches WASAPI device handles per-process.
+        After ~8 hours idle (overnight, weekend) those handles go stale
+        and every recording returns silent. A fresh process is the only
+        reliable fix. Rather than letting the user discover this on their
+        first morning press, we silently restart during the idle period
+        itself — the user doesn't notice because they're AFK.
+
+        Rules:
+          - Config 'auto_restart_idle_hours' = 0 disables entirely
+          - Only restart if all hold:
+              * idle duration >= threshold
+              * process uptime >= 1 hour (avoid instant restart loops)
+              * no recording / meeting active right now
+          - Check every 30 minutes
+        """
+        CHECK_INTERVAL_SEC = 30 * 60
+        MIN_UPTIME_SEC = 60 * 60  # 1 hour — don't restart if just started
+
+        while True:
+            time.sleep(CHECK_INTERVAL_SEC)
+            try:
+                threshold_hours = float(self.config.get("auto_restart_idle_hours", 4) or 0)
+                if threshold_hours <= 0:
+                    continue  # disabled
+                now = time.time()
+                uptime = now - self._process_start_time
+                if uptime < MIN_UPTIME_SEC:
+                    continue
+                # Reference time = last recording, or process start if never
+                # recorded yet
+                reference = self._last_recording_time if self._last_recording_time > 0 else self._process_start_time
+                idle_sec = now - reference
+                if idle_sec < threshold_hours * 3600:
+                    continue
+                # Guard: don't restart in the middle of something
+                if self.is_recording or self._is_meeting_active():
+                    continue
+                log.info(
+                    "Idle watchdog: %.1fh idle (threshold %.1fh), uptime %.1fh — "
+                    "pre-emptive restart to refresh PortAudio state",
+                    idle_sec / 3600, threshold_hours, uptime / 3600,
+                )
+                self._restart_whispertype("idle-watchdog")
+                return  # this thread dies with the process
+            except Exception as e:
+                log.error("Idle watchdog error: %s", e)
 
     def _recording_watchdog(self, generation):
         """Stop runaway recordings. Runs once per recording session.
