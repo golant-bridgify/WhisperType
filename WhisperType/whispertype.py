@@ -549,6 +549,11 @@ class AudioRecorder:
 # ============================================================
 # Subprocess Audio Recorder — isolated per-recording Python process
 # ============================================================
+# Must match OverlayNotification.NUM_BARS (the subprocess pre-computes
+# this many bar levels so the parent overlay can render without touching
+# raw audio — the parent has no access to the subprocess's PyAudio buffer).
+WAVEFORM_NUM_BARS = 28
+
 # Inline Python script run by the subprocess. Takes two argv:
 #   1. input_device_index (int, -1 = system default)
 #   2. output WAV path
@@ -557,14 +562,43 @@ class AudioRecorder:
 # state is guaranteed pristine per recording — immune to the
 # stale-WASAPI-handle bug that bites after 8+h uptime or a
 # display-sleep / mic-USB-power-cycle.
+#
+# Also streams per-bar RMS levels on stdout (~20Hz) as space-separated
+# floats terminated by \n so the parent can animate the waveform overlay
+# without access to the raw PCM buffer.
 _MIC_SUBPROCESS_SCRIPT = (
-    "import sys, wave, threading, pyaudio\n"
+    "import sys, wave, threading, time, math, struct, pyaudio\n"
+    f"NB = {WAVEFORM_NUM_BARS}\n"
     "dev = int(sys.argv[1]); out = sys.argv[2]\n"
     "dev_arg = dev if dev >= 0 else None\n"
-    "frames = []; lock = threading.Lock()\n"
+    "frames = []; lock = threading.Lock(); running = [True]\n"
     "def cb(data, fc, ti, st):\n"
     "    with lock: frames.append(data)\n"
     "    return (None, pyaudio.paContinue)\n"
+    "def streamer():\n"
+    "    # Compute NB log-scaled RMS levels from the last ~250ms of audio\n"
+    "    # and write them to stdout so the parent can render the waveform.\n"
+    "    while running[0]:\n"
+    "        time.sleep(0.05)\n"
+    "        with lock:\n"
+    "            if not frames: continue\n"
+    "            recent = b''.join(frames[-4:])\n"
+    "        n = len(recent) // 2\n"
+    "        if n < NB: continue\n"
+    "        seg = n // NB\n"
+    "        if seg <= 0: continue\n"
+    "        levels = []\n"
+    "        for i in range(NB):\n"
+    "            chunk = recent[i*seg*2:(i+1)*seg*2]\n"
+    "            vals = struct.unpack(f'<{seg}h', chunk)\n"
+    "            rms = math.sqrt(sum(v*v for v in vals) / seg) / 32768.0\n"
+    "            if rms <= 1e-6: lv = 0.0\n"
+    "            else: lv = max(0.0, min(1.0, (20*math.log10(rms+1e-10)+60)/55))\n"
+    "            levels.append(lv)\n"
+    "        try:\n"
+    "            sys.stdout.write(' '.join(f'{l:.3f}' for l in levels) + '\\n')\n"
+    "            sys.stdout.flush()\n"
+    "        except Exception: break\n"
     "pa = pyaudio.PyAudio()\n"
     "try:\n"
     "    try:\n"
@@ -575,8 +609,10 @@ _MIC_SUBPROCESS_SCRIPT = (
     "        s = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,\n"
     "                    input=True, frames_per_buffer=1024, stream_callback=cb)\n"
     "    s.start_stream()\n"
+    "    threading.Thread(target=streamer, daemon=True).start()\n"
     "    try: sys.stdin.buffer.read(1)\n"
     "    except Exception: pass\n"
+    "    running[0] = False\n"
     "    s.stop_stream(); s.close()\n"
     "    with lock: raw = b''.join(frames)\n"
     "    with wave.open(out, 'wb') as wf:\n"
@@ -626,8 +662,13 @@ class SubprocessAudioRecorder:
         self.input_device_index = input_device_index
         self.is_recording = False
         self.audio_data = []   # compat stub — always empty for subprocess
+        # Waveform display levels streamed from the subprocess over stdout.
+        # Updated ~20× per second. Read by WhisperTypeApp._waveform_updater
+        # (which can't compute them itself — audio_data is empty here).
+        self.latest_levels = [0.0] * WAVEFORM_NUM_BARS
         self._proc = None
         self._wav_path = None
+        self._level_reader = None
 
     def start(self):
         import subprocess
@@ -644,12 +685,18 @@ class SubprocessAudioRecorder:
             self._proc = subprocess.Popen(
                 [interp, "-c", _MIC_SUBPROCESS_SCRIPT, dev_arg, self._wav_path],
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,   # read per-bar levels for waveform
                 stderr=subprocess.PIPE,
                 creationflags=0x08000000,  # CREATE_NO_WINDOW
                 bufsize=0,
             )
             self.is_recording = True
+            self.latest_levels = [0.0] * WAVEFORM_NUM_BARS
+            # Start the reader AFTER is_recording is True so a super-fast
+            # first line isn't dropped by the `if not is_recording: break` guard.
+            self._level_reader = threading.Thread(
+                target=self._read_levels, daemon=True)
+            self._level_reader.start()
         except Exception as e:
             log.error("SubprocessAudioRecorder: spawn failed: %s", e)
             # Clean up the tempfile if spawn failed
@@ -659,6 +706,25 @@ class SubprocessAudioRecorder:
                 pass
             self._wav_path = None
             raise
+
+    def _read_levels(self):
+        """Parse '<f> <f> ... <f>\n' lines from the subprocess and cache them."""
+        proc = self._proc
+        if not proc or not proc.stdout:
+            return
+        try:
+            for line in iter(proc.stdout.readline, b''):
+                if not self.is_recording:
+                    break
+                try:
+                    parts = line.decode('ascii', errors='ignore').strip().split()
+                    if len(parts) != WAVEFORM_NUM_BARS:
+                        continue
+                    self.latest_levels = [float(p) for p in parts]
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def stop(self) -> np.ndarray:
         import subprocess
@@ -2241,18 +2307,45 @@ def add_history_entry(text, duration_sec=0, model="", source="microphone", task=
 # Visual Overlay Notification
 # ============================================================
 class OverlayNotification:
-    """A floating overlay window for visual feedback and waveform visualization."""
+    """Floating pill-shaped overlay — translucent, modern, white waveform.
 
-    NUM_BARS = 30
-    BAR_WIDTH = 4
-    BAR_GAP = 2
-    CANVAS_HEIGHT = 36
+    Rendered as a rounded polygon on a transparent-color tk window so the
+    visible surface is a true pill instead of a boxy rectangle. All content
+    (text, bars) lives on a single Canvas.
+    """
+
+    # Must match WAVEFORM_NUM_BARS at module level — the subprocess
+    # recorder streams exactly this many pre-computed levels back.
+    NUM_BARS = WAVEFORM_NUM_BARS
+    BAR_WIDTH = 3
+    BAR_GAP = 3
+    CANVAS_HEIGHT = 44
+    PILL_MARGIN = 2
+    TEXT_PADDING_X = 28
+    WAVE_PADDING_X = 22
+
+    # Windows: pixels of this color are made fully transparent by
+    # -transparentcolor, giving us an actual pill silhouette. Picked to be
+    # extremely unlikely to appear in any legitimate foreground content.
+    TRANSPARENT_KEY = '#010203'
+
+    # Neutral pill for the waveform — lets the white bars pop without
+    # the rainbow look.
+    WAVE_PILL_FILL = '#0b1220'
+    WAVE_PILL_BORDER = '#334155'
+    # White-ish bar gradient by level (low → mid → high). No more red/green.
+    BAR_COLOR_LOW = '#475569'    # slate-600, quiet
+    BAR_COLOR_MID = '#cbd5e1'    # slate-300
+    BAR_COLOR_HIGH = '#f8fafc'   # near-white, loud
+
+    DEFAULT_TEXT_BG = '#1a1a2e'  # used when caller passes no bg_color
+    TEXT_COLOR = '#f1f5f9'
 
     def __init__(self):
         self._root = None
-        self._label = None
         self._canvas = None
         self._bars = []
+        self._font = None
         self._waveform_mode = False
         self._visible = False
         self.silent = False  # When True, all show_* methods no-op
@@ -2265,44 +2358,33 @@ class OverlayNotification:
     def _run_tk(self):
         """Run the tkinter mainloop in its own thread."""
         import tkinter as tk
+        import tkinter.font as tkfont
 
         self._root = tk.Tk()
         self._root.withdraw()
         self._root.overrideredirect(True)
         self._root.attributes('-topmost', True)
-        self._root.attributes('-alpha', 0.85)
-        self._root.configure(bg='#1a1a2e')
+        # Make the rectangular window look pill-shaped: the non-pill pixels
+        # are drawn in TRANSPARENT_KEY and Windows paints nothing there.
+        try:
+            self._root.attributes('-transparentcolor', self.TRANSPARENT_KEY)
+        except Exception:
+            # Non-Windows fallback: window stays rectangular, still works.
+            pass
+        self._root.configure(bg=self.TRANSPARENT_KEY)
 
-        self._label = tk.Label(
-            self._root,
-            text="",
-            font=("Segoe UI", 14, "bold"),
-            fg="white",
-            bg="#1a1a2e",
-            padx=20,
-            pady=10,
-        )
-        self._label.pack()
+        # Prefer Windows 11's variable font, fall back to classic Segoe UI.
+        families = set(tkfont.families(self._root))
+        family = "Segoe UI Variable Text" if "Segoe UI Variable Text" in families else "Segoe UI"
+        self._font = tkfont.Font(family=family, size=11, weight="normal")
 
-        # Canvas for waveform visualization
-        canvas_w = self.NUM_BARS * (self.BAR_WIDTH + self.BAR_GAP) + 20
         self._canvas = tk.Canvas(
             self._root,
-            width=canvas_w,
-            height=self.CANVAS_HEIGHT,
-            bg='#1a1a2e',
+            bg=self.TRANSPARENT_KEY,
             highlightthickness=0,
+            borderwidth=0,
         )
-        # Pre-create bar rectangles
-        cy = self.CANVAS_HEIGHT // 2
-        for i in range(self.NUM_BARS):
-            x = i * (self.BAR_WIDTH + self.BAR_GAP) + 10
-            bar = self._canvas.create_rectangle(
-                x, cy - 1, x + self.BAR_WIDTH, cy + 1,
-                fill='#4ade80', outline='',
-            )
-            self._bars.append(bar)
-
+        self._canvas.pack()
         self._check_queue()
         self._root.mainloop()
 
@@ -2317,30 +2399,64 @@ class OverlayNotification:
         if self._root:
             self._root.after(50, self._check_queue)
 
-    def show(self, text, bg_color="#e63946", fg_color="white", duration=0):
-        """Show the overlay. duration=0 means stay until hidden."""
+    def _draw_pill(self, w, h, fill, outline=None):
+        """(Re)paint the pill background on the canvas at the given size."""
+        if not self._canvas:
+            return
+        self._canvas.delete("pill")
+        radius = (h - 2 * self.PILL_MARGIN) // 2
+        x1, y1 = self.PILL_MARGIN, self.PILL_MARGIN
+        x2, y2 = w - self.PILL_MARGIN, h - self.PILL_MARGIN
+        # Smoothed polygon approximates a rounded rectangle. Corner points
+        # are duplicated so the smooth curve hugs them more tightly.
+        pts = [
+            x1 + radius, y1,
+            x2 - radius, y1, x2, y1,
+            x2, y1 + radius, x2, y2 - radius,
+            x2, y2, x2 - radius, y2,
+            x1 + radius, y2, x1, y2,
+            x1, y2 - radius, x1, y1 + radius,
+            x1, y1,
+        ]
+        self._canvas.create_polygon(
+            pts, smooth=True, splinesteps=36,
+            fill=fill, outline=outline or fill, width=1,
+            tags="pill",
+        )
+
+    def show(self, text, bg_color=None, fg_color=None, duration=0):
+        """Show a pill-shaped notification. duration=0 stays until hidden."""
         if self.silent:
             return
         def _do():
-            if not self._root or not self._label:
+            if not self._root or not self._canvas or not self._font:
                 return
-            self._label.config(text=text, bg=bg_color, fg=fg_color)
-            self._root.configure(bg=bg_color)
+            self._waveform_mode = False
+            self._bars = []
+            self._canvas.delete("bars")
+            self._canvas.delete("text")
 
-            # Update size and center at top of screen
-            self._root.update_idletasks()
-            w = self._label.winfo_reqwidth() + 10
-            h = self._label.winfo_reqheight() + 6
+            fill = bg_color or self.DEFAULT_TEXT_BG
+            fg = fg_color or self.TEXT_COLOR
+
+            text_w = self._font.measure(text)
+            h = self.CANVAS_HEIGHT
+            w = max(text_w + 2 * self.TEXT_PADDING_X, h + 20)
+            self._canvas.configure(width=w, height=h)
+            self._draw_pill(w, h, fill=fill)
+            self._canvas.create_text(
+                w // 2, h // 2, text=text,
+                fill=fg, font=self._font, tags="text",
+            )
+
             screen_w = self._root.winfo_screenwidth()
             x = (screen_w - w) // 2
-            y = 18
-            self._root.geometry(f"{w}x{h}+{x}+{y}")
+            self._root.geometry(f"{w}x{h}+{x}+22")
             self._root.deiconify()
-            self._root.attributes('-alpha', 0.9)
             self._visible = True
 
             if duration > 0:
-                self._root.after(duration, self._fade_out)
+                self._root.after(duration, self.hide)
 
         self._tk_queue.put(_do)
 
@@ -2350,81 +2466,76 @@ class OverlayNotification:
             if self._root:
                 self._root.withdraw()
                 self._visible = False
+                self._waveform_mode = False
         self._tk_queue.put(_do)
 
-    def _fade_out(self):
-        """Gradually fade out the overlay."""
-        if not self._root or not self._visible or self._waveform_mode:
-            return
-        try:
-            current = self._root.attributes('-alpha')
-            if current > 0.1:
-                self._root.attributes('-alpha', current - 0.15)
-                self._root.after(40, self._fade_out)
-            else:
-                self._root.withdraw()
-                self._visible = False
-        except Exception:
-            pass
-
     def show_waveform(self):
-        """Switch overlay to waveform visualization mode."""
+        """Switch overlay to waveform visualization mode (neutral pill + white bars)."""
         if self.silent:
             return
         def _do():
             if not self._root or not self._canvas:
                 return
-            self._label.pack_forget()
-            self._canvas.pack(padx=10, pady=4)
+            self._canvas.delete("bars")
+            self._canvas.delete("text")
+            self._bars = []
             self._waveform_mode = True
-            self._root.configure(bg='#1a1a2e')
 
-            # Size and position
-            canvas_w = self.NUM_BARS * (self.BAR_WIDTH + self.BAR_GAP) + 40
-            w = canvas_w
-            h = self.CANVAS_HEIGHT + 8
+            h = self.CANVAS_HEIGHT
+            bars_w = self.NUM_BARS * (self.BAR_WIDTH + self.BAR_GAP) - self.BAR_GAP
+            w = bars_w + 2 * self.WAVE_PADDING_X
+            self._canvas.configure(width=w, height=h)
+            self._draw_pill(w, h, fill=self.WAVE_PILL_FILL, outline=self.WAVE_PILL_BORDER)
+
+            cy = h // 2
+            for i in range(self.NUM_BARS):
+                x = self.WAVE_PADDING_X + i * (self.BAR_WIDTH + self.BAR_GAP)
+                bar = self._canvas.create_rectangle(
+                    x, cy - 1, x + self.BAR_WIDTH, cy + 1,
+                    fill=self.BAR_COLOR_LOW, outline="", tags="bars",
+                )
+                self._bars.append(bar)
+
             screen_w = self._root.winfo_screenwidth()
-            x = (screen_w - w) // 2
-            self._root.geometry(f"{w}x{h}+{x}+18")
+            x0 = (screen_w - w) // 2
+            self._root.geometry(f"{w}x{h}+{x0}+22")
             self._root.deiconify()
-            self._root.attributes('-alpha', 0.92)
             self._visible = True
         self._tk_queue.put(_do)
 
     def update_waveform(self, levels):
-        """Update bar heights. levels: list of floats 0.0-1.0."""
+        """Update bar heights + colour (white gradient). levels: list of 0.0-1.0."""
         if self.silent:
             return
         def _do():
-            if not self._canvas or not self._waveform_mode:
+            if not self._canvas or not self._waveform_mode or not self._bars:
                 return
-            cy = self.CANVAS_HEIGHT // 2
+            h = self.CANVAS_HEIGHT
+            cy = h // 2
+            max_h = h // 2 - 5
             for i, bar in enumerate(self._bars):
-                if i < len(levels):
-                    h = max(1, int(levels[i] * (self.CANVAS_HEIGHT // 2 - 2)))
-                    x = i * (self.BAR_WIDTH + self.BAR_GAP) + 10
-                    self._canvas.coords(bar, x, cy - h, x + self.BAR_WIDTH, cy + h)
-                    # Color gradient: green → yellow → red
-                    lv = levels[i]
-                    if lv > 0.7:
-                        color = '#ef4444'
-                    elif lv > 0.4:
-                        color = '#fbbf24'
-                    else:
-                        color = '#4ade80'
-                    self._canvas.itemconfig(bar, fill=color)
+                if i >= len(levels):
+                    continue
+                lv = max(0.0, min(1.0, float(levels[i])))
+                bar_h = max(1, int(lv * max_h))
+                x = self.WAVE_PADDING_X + i * (self.BAR_WIDTH + self.BAR_GAP)
+                self._canvas.coords(bar, x, cy - bar_h, x + self.BAR_WIDTH, cy + bar_h)
+                if lv > 0.7:
+                    color = self.BAR_COLOR_HIGH
+                elif lv > 0.3:
+                    color = self.BAR_COLOR_MID
+                else:
+                    color = self.BAR_COLOR_LOW
+                self._canvas.itemconfig(bar, fill=color)
         self._tk_queue.put(_do)
 
     def hide_waveform(self):
-        """Switch back from waveform to label mode."""
+        """Remove bars (but keep the window — `show()` can repaint immediately)."""
         def _do():
-            if not self._root:
-                return
             self._waveform_mode = False
+            self._bars = []
             if self._canvas:
-                self._canvas.pack_forget()
-            if self._label:
-                self._label.pack()
+                self._canvas.delete("bars")
         self._tk_queue.put(_do)
 
     def show_recording(self):
@@ -2432,15 +2543,16 @@ class OverlayNotification:
 
     def show_processing(self):
         self.hide_waveform()
-        self.show("  ⏳  Transcribing...  ", bg_color="#f77f00")
+        self.show("⏳  Transcribing…", bg_color="#f77f00")
 
     def show_done(self, char_count=0):
         self.hide_waveform()
-        msg = f"  ✅  Done! ({char_count} chars)  " if char_count else "  ✅  Done!  "
+        msg = f"✓  Done · {char_count} chars" if char_count else "✓  Done"
         self.show(msg, bg_color="#2d6a4f", duration=1500)
 
     def show_error(self, msg="Error"):
-        self.show(f"  ❌  {msg}  ", bg_color="#6b0f1a", duration=2000)
+        self.hide_waveform()
+        self.show(f"✕  {msg}", bg_color="#6b0f1a", duration=2200)
 
 
 # ============================================================
@@ -3557,9 +3669,29 @@ class WhisperTypeApp:
             try:
                 source = self.config.get("recording_source", "microphone")
 
-                # Get mic samples
+                # Preferred path: SubprocessAudioRecorder streams pre-computed
+                # per-bar levels from its PyAudio subprocess because the raw
+                # buffer isn't accessible in this process. If it's active,
+                # just mirror those levels into the overlay (and skip the
+                # manual RMS math below).
+                sub_levels = None
+                sub_recorder = self.recorder if isinstance(self.recorder, SubprocessAudioRecorder) else None
+                if sub_recorder is not None and source in ("microphone", "both"):
+                    candidate = list(sub_recorder.latest_levels)
+                    if len(candidate) == NUM_BARS and any(lv > 0 for lv in candidate):
+                        sub_levels = candidate
+
+                if sub_levels is not None and source == "microphone":
+                    # Mic-only + subprocess stream: just render.
+                    self.overlay.update_waveform(sub_levels)
+                    consecutive_errors = 0
+                    time.sleep(0.05)
+                    continue
+
+                # Get mic samples (legacy in-process path, or "both" mode
+                # where we still have loopback to mix in).
                 mic_samples = np.array([], dtype=np.float32)
-                if source in ("microphone", "both") and self.recorder.audio_data:
+                if source in ("microphone", "both") and sub_recorder is None and self.recorder.audio_data:
                     chunks = list(self.recorder.audio_data[-4:])
                     if chunks:
                         raw = b"".join(chunks)
@@ -3586,6 +3718,13 @@ class WhisperTypeApp:
                     samples = np.abs(loopback_samples)
                 elif len(mic_samples) > 0:
                     samples = np.abs(mic_samples)
+                elif sub_levels is not None:
+                    # source="both", subprocess has mic levels, loopback silent →
+                    # fall back to the subprocess-only levels.
+                    self.overlay.update_waveform(sub_levels)
+                    consecutive_errors = 0
+                    time.sleep(0.05)
+                    continue
                 else:
                     time.sleep(0.05)
                     continue
@@ -3608,6 +3747,11 @@ class WhisperTypeApp:
                     else:
                         level = 0.0
                     levels.append(level)
+
+                # In "both" mode with both streams, blend in the subprocess mic
+                # levels so a silent loopback doesn't wash out a speaking mic.
+                if sub_levels is not None and len(levels) == len(sub_levels):
+                    levels = [max(a, b) for a, b in zip(levels, sub_levels)]
 
                 self.overlay.update_waveform(levels)
                 consecutive_errors = 0  # reset on success
