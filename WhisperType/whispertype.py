@@ -2375,7 +2375,7 @@ class OverlayNotification:
     # a subtle shadow rather than a bright halo.
     TRANSPARENT_KEY = '#030310'
     SHADOW_COLOR = '#070b14'   # very dark slate — subtle "3D" hint
-    SS = 4                     # supersample factor for AA pill rendering
+    SS = 8                     # supersample factor for AA pill rendering
 
     # Waveform pill is intentionally neutral so the white bars pop.
     WAVE_PILL_FILL_START = '#0b1220'
@@ -2445,6 +2445,17 @@ class OverlayNotification:
         except Exception:
             pass
         self._root.configure(bg=self.TRANSPARENT_KEY)
+        # Make the overlay click-through: without WS_EX_TRANSPARENT, clicks
+        # on the transparent pixels still land on the overlay window (which
+        # does nothing with them) and the 20Hz canvas repaints during
+        # recording make desktop icons under the overlay area shimmer as
+        # Windows keeps re-evaluating hit-testing. With WS_EX_TRANSPARENT
+        # the overlay is invisible to the mouse entirely.
+        #
+        # Deferred so -transparentcolor has already finished applying
+        # WS_EX_LAYERED by the time we OR in WS_EX_TRANSPARENT — otherwise
+        # a later tk attribute change would clobber the bit we just set.
+        self._root.after(150, self._make_click_through)
 
         families = set(tkfont.families(self._root))
         family = "Segoe UI Variable Text" if "Segoe UI Variable Text" in families else "Segoe UI"
@@ -2471,6 +2482,42 @@ class OverlayNotification:
             pass
         if self._root:
             self._root.after(50, self._check_queue)
+
+    def _make_click_through(self):
+        """Add WS_EX_TRANSPARENT so mouse events pass through the overlay.
+        Targets the top-level layered window (not the inner tkinter frame).
+        No-op on non-Windows or on failure.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            # argtypes are CRITICAL on 64-bit Python: without them, HWND
+            # return values get truncated to 32-bit int and GetAncestor
+            # may return a bogus address or 0.
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user32.GetAncestor.restype = ctypes.c_void_p
+            user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.GetWindowLongW.restype = ctypes.c_long
+            user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+            user32.SetWindowLongW.restype = ctypes.c_long
+
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_LAYERED = 0x00080000
+            GA_ROOT = 2
+
+            # Walk up to the OS-level top-level window (the one that holds
+            # WS_EX_LAYERED). tkinter wraps the Tk widget in an inner frame.
+            frame_hwnd = self._root.winfo_id()
+            top_hwnd = user32.GetAncestor(frame_hwnd, GA_ROOT) or frame_hwnd
+
+            ex_style = user32.GetWindowLongW(top_hwnd, GWL_EXSTYLE)
+            new_style = ex_style | WS_EX_TRANSPARENT | WS_EX_LAYERED
+            user32.SetWindowLongW(top_hwnd, GWL_EXSTYLE, new_style)
+        except Exception as e:
+            log.debug("Click-through flag setup failed: %s", e)
 
     def _cancel_pending_hide(self):
         """Kill any pending auto-hide Tk timer. Must run on the Tk thread.
