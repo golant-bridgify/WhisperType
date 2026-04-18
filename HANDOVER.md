@@ -1,6 +1,6 @@
 # WhisperType — Handover Notes
 
-*Last updated: 2026-04-17, end of session 5. Repo state: master @ `a999d61`, `origin/master` synced.*
+*Last updated: 2026-04-18, end of session 6. Repo state: master @ `61c3dbc`, `origin/master` synced.*
 
 This doc is for the next developer (or future you) picking up WhisperType. Read this first, then [CLAUDE.md](CLAUDE.md) for architecture details, then [WhisperType/README.md](WhisperType/README.md) for user-facing usage.
 
@@ -10,7 +10,7 @@ This doc is for the next developer (or future you) picking up WhisperType. Read 
 
 - **Working and stable.** Production-quality for personal use. All 29 automated tests pass.
 - **Core features are complete:** recording, transcription (local + cloud), AI cleanup, custom vocabulary, meeting mode, undo, hotkey UI.
-- **Last session added 6 major features + 15+ bug fixes + a test suite.**
+- **Session 6 (this one) eliminated the stale-PortAudio silent-capture bug at the architectural level** via per-recording subprocess isolation. That bug was the last critical reliability issue.
 - **No known critical bugs.**
 
 ---
@@ -25,7 +25,7 @@ C:\Users\Naor\Downloads\WhisperType\
 ├── LICENSE
 ├── .gitignore
 └── WhisperType\
-    ├── whispertype.py     ← Everything. 5,100 lines. Monolithic on purpose.
+    ├── whispertype.py     ← Everything. ~5,300 lines. Monolithic on purpose.
     ├── run_tests.py       ← 29 tests. Run before/after any change.
     ├── generate_icon.py   ← Regenerate whispertype.ico
     ├── requirements.txt
@@ -115,10 +115,11 @@ For meetings, `MeetingSession` owns its own recorders and runs a background thre
 
 ---
 
-## Features added in the last session (chronological)
+## Features added (chronological, across all sessions)
 
 Each feature links to the relevant commit for diff-level context.
 
+### Session 5 (2026-04-17) — Features + stability
 | Feature | Commit | One-line description |
 |---|---|---|
 | Icon state polish | `46eb2dd` | `processing` + `loading` icons visually distinct |
@@ -128,7 +129,7 @@ Each feature links to the relevant commit for diff-level context.
 | Silent-failure guards | `a723e8c` | `_flash_error_tray`, clipboard retry, log rotation, generation counter |
 | "תודה רבה" fix | `777841b` | Whole-text hallucinations are erased + tray flash red X |
 | Icon redesign | `4d33834` | Dark slate + cyan neon (Design D) |
-| WASAPI wake-from-sleep fix | `f0ad814` | Silent-audio detection + warmup on long idle |
+| WASAPI wake-from-sleep first-attempt | `f0ad814` | Silent-audio detection + warmup on long idle |
 | **AI Cleanup** | `ceaf825` | `GroqLLMCleaner` + 4 styles |
 | Cleanup prompt strengthening | `9f006c8` | Added `Proofread` style, better typo correction |
 | **Custom Vocabulary** | `edaf65a` | `"git push"` permanent fix |
@@ -136,23 +137,61 @@ Each feature links to the relevant commit for diff-level context.
 | **Meeting Mode** | `679e738` | `MeetingSession` + LLM summary + markdown output |
 | **Undo Last Paste** | `34ab478` | `Ctrl+Alt+Z` + auto-restore clipboard |
 | **Hotkey UI + Test Suite** | `a999d61` | Change hotkey from menu + 29 tests |
+| Handover docs (first pass) | `87cee08` | CLAUDE.md + HANDOVER.md + README.md refresh |
+
+### Session 6 (2026-04-18) — The stale-PortAudio saga
+| Feature | Commit | One-line description |
+|---|---|---|
+| Reactive silent-capture auto-restart | `2504af8` | After 2 consecutive silents, auto-restart; manual 'Restart WhisperType' tray item |
+| Long-idle watchdog | `5c78229` | Silent restart after 4h with no recording |
+| **Display-wake watchdog** | `7e22320` | `GetLastInputInfo` polling; restart when user returns from ≥10 min idle — catches mic-on-monitor power cycles |
+| **⭐ SubprocessAudioRecorder** | `61c3dbc` | Structural fix — every recording in a fresh Python subprocess. Stale-PortAudio bug is now impossible. |
+
+---
+
+## The stale-PortAudio bug — documented in detail
+
+Because this dominated session 6, here's the background for anyone who sees weird silent captures in the future.
+
+**Symptom:** after several hours or a monitor sleep+wake cycle, WhisperType captures recordings where:
+- Windows shows the privacy mic indicator (stream opens fine)
+- PyAudio callbacks fire (frames are returned)
+- But RMS ≈ 0.00002 (frames are zero-filled)
+
+Sound Recorder and a fresh Python process using the same mic at the same moment capture real audio. So the hardware is fine — only the long-running WhisperType process is affected.
+
+**Root cause:** PortAudio (the C library under PyAudio) keeps WASAPI device handles cached at the process level. When the mic's USB power cycles (in this user's case, because the webcam mic is attached to a monitor that goes to sleep), the cached handle becomes stale. Even `pa.terminate() + pa.PyAudio()` cycles within the same process don't clear it — apparently the caching is below the PyAudio reference-count layer.
+
+**Why subprocess works:** a fresh Python process means fresh PortAudio module-level state. No cache to be stale.
+
+**Defence-in-depth stack (from most structural to most reactive):**
+
+1. **`SubprocessAudioRecorder`** (`61c3dbc`) — The fix. Each recording in a fresh subprocess. Bug can't happen.
+2. **Display-wake watchdog** (`7e22320`) — polls `GetLastInputInfo` every 10s, restarts when user returns from ≥10 min idle. Still useful if some other class of state-staleness appears.
+3. **Long-idle watchdog** (`5c78229`) — 4h silent restart. Belt + suspenders.
+4. **Silent-capture detection** (`777841b` + `2504af8`) — `_handle_silent_capture` logs + flashes red X + counts consecutive silents.
+5. **Auto-restart on 2 consecutive silents** (`2504af8`) — last-resort recovery.
+6. **Manual 'Restart WhisperType' tray item** — always available.
+
+Layer 1 should catch 100% of cases; 2-6 remain as safety nets in case a different process-level state issue ever emerges.
 
 ---
 
 ## What might surprise you about the code
 
 ### 1. Single-file monolith, but consistent structure
-5,100 lines in one file is a deliberate choice — makes the app easier to package, distribute, and debug. Structure is:
+~5,300 lines in one file is a deliberate choice — makes the app easier to package, distribute, and debug. Structure is:
 1. Imports + config + logging
-2. Utility functions (audio, hallucination, config)
-3. Transcriber classes
-4. GroqLLMCleaner
-5. Meeting mode
-6. Paste helpers
-7. Auto-start + history
-8. OverlayNotification
-9. Beep helpers
-10. WhisperTypeApp (the main class, ~2,500 lines)
+2. Utility functions (audio, hallucination, config, `find_python_interpreter`, `get_system_idle_seconds`)
+3. Recorder classes (AudioRecorder, **SubprocessAudioRecorder**, LoopbackRecorder)
+4. Transcriber classes (FasterWhisper, OpenVINO, Groq)
+5. GroqLLMCleaner
+6. Meeting mode
+7. Paste helpers
+8. Auto-start + history
+9. OverlayNotification
+10. Beep helpers
+11. WhisperTypeApp (the main class, ~2,800 lines)
 
 ### 2. Generation counter for tray icon race
 `self._recording_generation` is incremented on every `_start_recording()`. Background transcription threads capture the generation at start; the `finally` block only resets the icon to green if the generation is still current. Without this, a slow transcription from recording #1 could clobber the red icon of an in-progress recording #2.
@@ -171,6 +210,17 @@ Because llama-3.3-70b is trained to be helpful, when the raw transcription sound
 
 ### 6. The `_do_paste` wrapper
 Don't call `output_text(text, mode=...)` directly from new code. Use `self._do_paste(text, mode)` instead — it handles clipboard-before snapshotting, undo state recording, and auto-restore scheduling.
+
+### 7. `SubprocessAudioRecorder.audio_data` is always empty
+The real audio buffer lives in the subprocess. Anything that reads `self.recorder.audio_data` for live monitoring (`_streaming_worker`, `_waveform_updater`) gets an empty list and no-ops gracefully. That's OK because:
+- streaming worker already skips for Groq backend
+- waveform updater is hidden in silent_mode anyway
+If a future feature genuinely needs live frames from the subprocess, consider upgrading to the "pre-spawned helper with stdin/stdout frame streaming" architecture — designed and considered in session 6 but deferred for simplicity.
+
+### 8. The watchdogs are orthogonal layers, not a chain
+Each watchdog fires independently based on its own trigger. They overlap intentionally:
+- Idle-watchdog (4h) and display-wake watchdog (10min) both might fire on the same long idle — whichever hits first wins, the other's restart call becomes a no-op (process already exiting).
+- Reactive silent-capture auto-restart only fires if the proactive ones missed. With SubprocessAudioRecorder as the structural fix, all watchdogs should now be **rarely used** — they're defense-in-depth, not hot-path.
 
 ---
 

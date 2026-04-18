@@ -209,9 +209,19 @@ Key settings you might want to tweak:
   "transcription_backend": "groq",
   "silent_mode": false,
   "clipboard_auto_restore": true,
-  "undo_hotkey": "ctrl+alt+z"
+  "undo_hotkey": "ctrl+alt+z",
+  "use_subprocess_mic": true,
+  "auto_restart_idle_hours": 4,
+  "auto_restart_on_wake_idle_min": 10
 }
 ```
+
+### Reliability knobs (Session 6 additions)
+
+WhisperType runs each mic recording in an isolated Python subprocess by default (`use_subprocess_mic: true`). This is the primary fix for the "silent capture after long idle" problem some setups exhibit. Plus two watchdogs as defense-in-depth:
+
+- `auto_restart_idle_hours: 4` — If the app has been running for 4+ hours without a recording, silently restart in the background. Set to `0` to disable.
+- `auto_restart_on_wake_idle_min: 10` — If you return to the computer after ≥10 min of keyboard/mouse idle, WhisperType silently restarts to ensure fresh audio state. Particularly useful if your mic is powered through a monitor that sleeps. Set to `0` to disable.
 
 ---
 
@@ -244,7 +254,7 @@ Pick via Tray → Model. Use Groq if you've set an API key — it's 5-10× faste
 - Add `git, push` to Custom Vocabulary (Tray → Options → Custom Vocabulary...).
 
 **"I just tried transcribing after my laptop woke from sleep and got garbage"**
-- The first recording after long idle triggers a WASAPI warmup automatically. If you still get silent audio, the app will detect it and ask you to try again.
+- Each recording now runs in an isolated Python subprocess with fresh PortAudio state (`use_subprocess_mic: true`), so this shouldn't happen. If it still does: three layers of safety follow — a display-wake watchdog that pre-emptively restarts the app on return from ≥10 min idle, a silent-audio detector that flashes a red tray icon instead of pasting garbage, and an auto-restart if two consecutive recordings come back silent. Worst case: Tray → Options → `🔄 Restart WhisperType`.
 
 **"My clipboard got overwritten"**
 - Not anymore — `clipboard_auto_restore` is on by default. Your previous clipboard content is restored ~2s after the paste.

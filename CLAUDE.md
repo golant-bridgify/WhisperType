@@ -1,7 +1,7 @@
 # WhisperType — Development Context
 
 ## Project Overview
-**WhisperType** is a Windows speech-to-text app — a SuperWhisper alternative that runs as a system-tray icon with global-hotkey recording, local/cloud Whisper transcription, AI-powered cleanup, and auto-paste. Single-file Python app (~5,100 lines, monolithic by design).
+**WhisperType** is a Windows speech-to-text app — a SuperWhisper alternative that runs as a system-tray icon with global-hotkey recording, local/cloud Whisper transcription, AI-powered cleanup, and auto-paste. Single-file Python app (~5,300 lines, monolithic by design).
 
 **User:** Naor. Windows, Intel Core Ultra 7 265K (20 cores, Intel Arc iGPU, NPU). No NVIDIA GPU. Hebrew-speaking developer; dictates mixed Hebrew + English including programming/product terms. Prefers minimal UI — runs with `silent_mode: true`, `beep_device_index: "off"`.
 
@@ -44,11 +44,12 @@ Beep:     %APPDATA%\WhisperType\beep.wav         (48kHz stereo, regenerated on s
 - `WhisperTranscriber = FasterWhisperTranscriber` — Backward-compat alias
 - `GroqTranscriber(BaseTranscriber)` — Cloud backend via api.groq.com. Supports `task=transcribe/translate`, `he_en_bias`, `custom_vocabulary`.
 - `GroqLLMCleaner` — Post-transcription polish via llama-3.3-70b-versatile. 4 styles + 3-layer injection guard.
-- `AudioRecorder` — Mic capture via PyAudio (16kHz mono int16)
-- `LoopbackRecorder` — System audio via PyAudioWPatch WASAPI loopback
+- `AudioRecorder` — In-process mic capture via PyAudio (16kHz mono int16). Kept as fallback for PyInstaller-frozen mode.
+- `SubprocessAudioRecorder` ⭐ — **Default** for mic capture (Session 6). Spawns a fresh Python subprocess per recording; each recording gets pristine PortAudio state. Structural fix for the stale-WASAPI-handle bug that silent-captures after long idle / display sleep.
+- `LoopbackRecorder` — System audio via PyAudioWPatch WASAPI loopback (in-process — loopback doesn't hit the same bug as mic)
 - `MeetingSession` — Long-form chunked capture (45s rotating recorder) + LLM summary
 - `OverlayNotification` — Tkinter floating overlay + waveform
-- `WhisperTypeApp` — Main orchestrator (tray, hotkey, recording, transcription, meeting, undo)
+- `WhisperTypeApp` — Main orchestrator (tray, hotkey, recording, transcription, meeting, undo, watchdogs)
 
 ### Key Helpers
 - `clipboard_paste(text)` → bool — Paste via clipboard with retry + readback verification
@@ -61,6 +62,8 @@ Beep:     %APPDATA%\WhisperType\beep.wav         (48kHz stereo, regenerated on s
 - `list_input_devices()`, `list_output_devices()`, `list_loopback_devices()` — Device enumeration, deduped by name
 - `resample_audio()`, `mix_audio()` — Audio utilities
 - `is_user_admin()` — Windows admin check (warns at startup if not)
+- `find_python_interpreter()` → path or None — Module-level helper; used by both SubprocessAudioRecorder and `play_beep` to spawn subprocesses. Returns None in frozen PyInstaller mode so callers can fall back.
+- `get_system_idle_seconds()` → float — Wraps Windows `GetLastInputInfo` to get seconds since last user keyboard/mouse activity. Drives the display-wake watchdog.
 
 ### Module-level State
 - `_config_lock`, `_history_lock` — threading.Lock serializing JSON writes (atomic via `.tmp` + `os.replace`)
@@ -75,13 +78,19 @@ Beep:     %APPDATA%\WhisperType\beep.wav         (48kHz stereo, regenerated on s
   - `_hotkey_listener` — event-driven, waits on `threading.Event` set by `keyboard.add_hotkey` callback (swappable live)
   - Model loader
   - Overlay Tk mainloop
-  - Streaming transcription worker (preview mode, local backend)
-  - Waveform updater (~20 FPS, rate-limited on persistent errors)
+  - Streaming transcription worker (preview mode, local backend) — **no-op for SubprocessAudioRecorder** since audio_data is empty
+  - Waveform updater (~20 FPS, rate-limited on persistent errors) — **no-op for SubprocessAudioRecorder** too
   - Recording watchdog (auto-stops at 10 min)
   - Meeting rotation loop (`_rotation_loop`, every 45s)
   - Per-chunk transcription workers (meeting)
   - Clipboard auto-restore timer (fire-and-forget 2s)
   - Undo hotkey callback (`keyboard.add_hotkey`, non-blocking)
+  - **`_idle_watchdog`** (Session 6) — Checks every 30 min if idle > 4h, silently restarts the app to refresh PortAudio
+  - **`_display_wake_watchdog`** (Session 6) — Polls `GetLastInputInfo` every 10s; detects user returning from ≥10 min idle and triggers silent restart (catches mic-on-monitor power cycle)
+- **Subprocesses (spawned + torn down per operation):**
+  - `SubprocessAudioRecorder` — fresh Python per recording (~220ms warm spawn). Recorder opens PyAudio, records to WAV, exits when parent closes stdin.
+  - `play_beep(device_index=N)` — beep subprocess for specific-device output (isolates PortAudio from Focusrite crashes)
+  - `_restart_whispertype()` — spawns a fresh WhisperType instance before quitting current, with a 1.5s delay for mutex release
 
 ### Recording Flow (press-to-talk)
 ```
@@ -181,7 +190,10 @@ Ctrl+Alt+Z pressed (via keyboard.add_hotkey):
   "cleanup_llm_model": "llama-3.3-70b-versatile",
   "custom_vocabulary": "git, push, React, Kubernetes, ...",
   "clipboard_auto_restore": true,
-  "undo_hotkey": "ctrl+alt+z"
+  "undo_hotkey": "ctrl+alt+z",
+  "auto_restart_idle_hours": 4,              // Session 6: restart after 4h no recording
+  "auto_restart_on_wake_idle_min": 10,       // Session 6: restart when user returns from 10+ min system idle
+  "use_subprocess_mic": true                 // Session 6: isolate mic capture in a fresh Python subprocess
 }
 ```
 
@@ -207,7 +219,9 @@ Status: Loading... (dynamic)
   ├─ Transcribe File → Hebrew / English
   ├─ History (dialog)
   ├─ Set Groq API Key... (dialog)
-  └─ Start with Windows (checkbox)
+  ├─ Start with Windows (checkbox)
+  ├─ ─────
+  └─ 🔄  Restart WhisperType                    ←(Session 6)
 Quit
 ```
 
@@ -274,7 +288,28 @@ Quit
 - Hebrew/English bias for Whisper
 - Fallback to local on cloud failure
 
-### Session 5 (2026-04-17): Big intelligence + safety sweep — **this session**
+### Session 6 (2026-04-18): The stale-PortAudio saga + structural fix — **this session**
+User reported: after 8-hour idle, transcriptions returned silent audio (RMS=0.00002) even though Sound Recorder and a fresh Python test process both worked. Extensive diagnosis identified the true cause: **USB webcam-mic attached to the monitor, which powers down with the display**. When the display wakes, the mic re-enumerates but WhisperType's long-running PortAudio still has stale WASAPI device handles — streams "open" (Windows shows the privacy mic indicator) but frames arrive as all-zero.
+
+Fix progression, most-reactive → most-structural:
+- **Auto-restart on 2 consecutive silents** (`2504af8`) — reactive last-resort recovery
+- **Idle watchdog** (`5c78229`) — 4h threshold; silent restart if no recording activity
+- **Display-wake watchdog** (`7e22320`) — polls `GetLastInputInfo` every 10s; detects user returning from ≥10 min idle (catches the monitor-sleep-mic-cycle)
+- **SubprocessAudioRecorder** (`61c3dbc`) — ⭐ the structural fix. Each recording spawns a fresh Python subprocess. Pristine PortAudio every time. Watchdogs stay as cheap defence-in-depth but are no longer load-bearing.
+
+Also added during session 6:
+- Manual 'Restart WhisperType' tray item (on top of the auto-restart paths)
+- `_force_show_error_overlay` — bypasses `silent_mode` for ERROR states (silent mode should hide success, never hide failure)
+- `_handle_silent_capture` — centralises silent-audio handling
+- `get_system_idle_seconds()` — Windows GetLastInputInfo helper (with DWORD-wrap handling)
+- `find_python_interpreter()` — extracted to module level for reuse between subprocess beep and subprocess recorder
+
+**Known trade-offs of SubprocessAudioRecorder:**
+- `recorder.audio_data` always empty (the real buffer lives in the subprocess). Waveform updater + streaming worker are no-ops. User has `silent_mode=true` (waveform hidden) and uses Groq (streaming skipped for Groq), so zero user-visible regression.
+- ~220ms warm spawn latency at each recording start — eats a tiny bit of the leading audio, usually fine because the user's first syllable comes ~500ms after pressing.
+- Falls back to `AudioRecorder` if `find_python_interpreter()` returns None (frozen PyInstaller bundle).
+
+### Session 5 (2026-04-17): Big intelligence + safety sweep
 - **Bug hunting (15+ fixes):** hallucination-strip erase fix, hotkey busy-loop, is_recording state bleed, log rotation (RotatingFileHandler), clipboard retry + readback verification, transcription generation counter (race fix), recording watchdog, PyAudio try/finally, error icon state, admin check, silent-audio detection, WASAPI warmup, legacy config migration
 - **Feature — AI Cleanup:** `GroqLLMCleaner` class, 4 styles (Casual/Proofread/Email/Code), with 3-layer anti-injection guard (system prompt + `<transcription>` delimiters + 1.5× length cap) after discovering the cleanup LLM was expanding "I want to review the code" into a 2,020-char AWS implementation plan
 - **Feature — Custom Vocabulary:** per-user term list fed to Whisper's `prompt`/`initial_prompt` + LLM cleanup system prompt. Fixes "git push" → "בגד פושע" permanently. Dialog in tray menu.
