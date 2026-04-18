@@ -107,6 +107,13 @@ DEFAULT_CONFIG = {
     # Restart only fires when no recording / meeting is in progress and
     # the process has been alive >= 1 hour.
     "auto_restart_idle_hours": 4,
+    # Display-wake watchdog: silently restart when the user returns from
+    # >= N minutes of system idle (GetLastInputInfo). This catches the
+    # USB-webcam-on-monitor case: monitor sleeps → mic powers off →
+    # monitor wakes → mic re-enumerates but our PortAudio has stale
+    # handles. Default 10 min matches typical Windows display timeout.
+    # Set to 0 to disable.
+    "auto_restart_on_wake_idle_min": 10,
 }
 
 
@@ -383,6 +390,40 @@ def is_user_admin():
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def get_system_idle_seconds():
+    """Return seconds since the last user input (keyboard or mouse).
+
+    Uses Windows GetLastInputInfo. This is SYSTEM idle time — time since
+    the user touched input devices, regardless of what our process is
+    doing. Used by the display-wake watchdog to detect 'user just
+    returned from a break': on this user's setup the monitor powers down
+    after idle, which cuts power to the USB-attached webcam/mic, and
+    when they come back the device re-enumerates. Our PortAudio's cached
+    handles are stale at that point, so we restart the whole process.
+    """
+    if os.name != 'nt':
+        return 0.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT),
+                        ("dwTime", wintypes.DWORD)]
+
+        lii = LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 0.0
+        tick = ctypes.windll.kernel32.GetTickCount()
+        # GetTickCount is a uint32 that wraps after ~49.7 days. Handle the
+        # wrap-around by clamping to [0, 2^32) semantics.
+        delta = (tick - lii.dwTime) & 0xFFFFFFFF
+        return delta / 1000.0
+    except Exception:
+        return 0.0
 
 
 # Serialize config writes across threads. Config is written from the tray
@@ -2707,6 +2748,17 @@ class WhisperTypeApp:
             threading.Thread(target=self._idle_watchdog, daemon=True).start()
             log.info("Idle watchdog running (threshold: %.1f hours)", threshold)
 
+        # Start the display-wake watchdog — catches the 'mic powered
+        # through the monitor' case: display sleeps → mic USB powers off
+        # → display wakes → mic re-enumerates but our PortAudio is stale.
+        # Triggers restart the MOMENT the user returns from idle, before
+        # they press Ctrl+Space and get a silent capture.
+        wake_threshold = float(self.config.get("auto_restart_on_wake_idle_min", 10) or 0)
+        if wake_threshold > 0:
+            threading.Thread(target=self._display_wake_watchdog, daemon=True).start()
+            log.info("Display-wake watchdog running (threshold: %.0f min idle)",
+                     wake_threshold)
+
         # Wait for Windows Explorer / taskbar to be ready before showing the tray
         # icon. Fixes the case where auto-start launches WhisperType before the
         # shell is fully loaded and the icon silently fails to register.
@@ -3096,6 +3148,70 @@ class WhisperTypeApp:
         threading.Thread(
             target=self._recording_watchdog, args=(watchdog_gen,), daemon=True
         ).start()
+
+    def _display_wake_watchdog(self):
+        """Detect user returning from idle → silent restart to refresh audio.
+
+        Designed specifically for the 'webcam/mic plugged into the monitor'
+        setup: when Windows powers down the display after N minutes of
+        inactivity, USB power to the monitor's attached devices also cuts,
+        which yanks the mic out of the system. When the monitor wakes, the
+        mic re-enumerates — but our PortAudio's cached device handles
+        point at the PREVIOUS enumeration, so captures come back silent.
+
+        Algorithm:
+          - Poll Windows GetLastInputInfo every 10s
+          - Track whether we were 'long idle' on the previous poll
+          - When we transition from long-idle → active (current idle < 30s
+            but previous was > threshold), assume the mic just came back
+            and we need a fresh process to pick it up cleanly. Restart.
+
+        Shorter poll interval than the hours-based watchdog (10s vs 30min)
+        because the window between 'user returns' and 'user presses hotkey'
+        can be just a few seconds.
+        """
+        CHECK_INTERVAL_SEC = 10
+        MIN_UPTIME_SEC = 60
+        was_long_idle = False
+
+        while True:
+            time.sleep(CHECK_INTERVAL_SEC)
+            try:
+                threshold_min = float(
+                    self.config.get("auto_restart_on_wake_idle_min", 10) or 0
+                )
+                if threshold_min <= 0:
+                    continue
+                uptime = time.time() - self._process_start_time
+                if uptime < MIN_UPTIME_SEC:
+                    continue
+
+                idle_sec = get_system_idle_seconds()
+                threshold_sec = threshold_min * 60
+                is_long_idle = idle_sec >= threshold_sec
+
+                # Transition detection: was long-idle, now active
+                just_returned = was_long_idle and not is_long_idle and idle_sec < 30
+                was_long_idle = is_long_idle
+
+                if not just_returned:
+                    continue
+
+                # Don't restart in the middle of something
+                if self.is_recording or self._is_meeting_active():
+                    log.info("Display-wake detected but active recording/meeting "
+                             "— skipping restart")
+                    continue
+
+                log.info(
+                    "Display-wake detected: user returned after >= %d min idle "
+                    "(current idle %.0fs, uptime %.1fh) — restarting to refresh audio",
+                    int(threshold_min), idle_sec, uptime / 3600,
+                )
+                self._restart_whispertype("display-wake")
+                return  # this thread dies with the process
+            except Exception as e:
+                log.error("Display-wake watchdog: %s", e)
 
     def _idle_watchdog(self):
         """Background thread that pre-emptively restarts WhisperType after
