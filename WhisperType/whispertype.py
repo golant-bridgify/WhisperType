@@ -2328,8 +2328,11 @@ class OverlayNotification:
     WAVE_PADDING_X = 22
 
     # Pixels painted with this color become fully transparent on Windows.
-    TRANSPARENT_KEY = '#010203'
+    # Kept very dark so the ~1px AA fringe from PIL compositing blends into
+    # a subtle shadow rather than a bright halo.
+    TRANSPARENT_KEY = '#030310'
     SHADOW_COLOR = '#070b14'   # very dark slate — subtle "3D" hint
+    SS = 4                     # supersample factor for AA pill rendering
 
     # Waveform pill is intentionally neutral so the white bars pop.
     WAVE_PILL_FILL_START = '#0b1220'
@@ -2361,6 +2364,7 @@ class OverlayNotification:
         self._canvas = None
         self._bars = []
         self._font = None
+        self._pill_photo = None      # keeps the current PIL/PhotoImage alive
         self._waveform_mode = False
         self._visible = False
         self._hide_after_id = None   # pending auto-hide Tk timer id
@@ -2445,44 +2449,76 @@ class OverlayNotification:
         PM = self.PILL_MARGIN
         return (PM, PM, w - PM - self.SHADOW_DX, h - PM - self.SHADOW_DY)
 
+    @staticmethod
+    def _hex_to_rgb(h):
+        return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
+
+    @staticmethod
+    def _pil_pill(draw, px1, py1, px2, py2, r, fill):
+        """Draw a pill shape on a PIL ImageDraw (two ellipses + a rectangle)."""
+        draw.ellipse([px1, py1, px1 + 2 * r, py2], fill=fill)
+        draw.ellipse([px2 - 2 * r, py1, px2, py2], fill=fill)
+        draw.rectangle([px1 + r, py1, px2 - r, py2], fill=fill)
+
     def _draw_pill(self, w, h, fill_start, fill_end, draw_shadow=True):
-        """Paint pill (real-circle caps + optional gradient middle) + shadow."""
+        """Render a pill+shadow PIL image at 4× supersample, downsample with
+        LANCZOS for AA, composite against TRANSPARENT_KEY, and put it on the
+        canvas. Replaces tkinter's aliased create_oval so edges are smooth.
+        """
         if not self._canvas:
             return
-        self._canvas.delete("pill")
-        self._canvas.delete("shadow")
+        from PIL import Image, ImageDraw, ImageTk
 
-        px1, py1, px2, py2 = self._pill_rect(w, h)
-        r = (py2 - py1) // 2   # real circle radius
+        SS = self.SS
+        SW, SH = w * SS, h * SS
+        # Supersampled rect for the pill
+        PM = self.PILL_MARGIN * SS
+        SDX = self.SHADOW_DX * SS
+        SDY = self.SHADOW_DY * SS
+        sp_x1, sp_y1 = PM, PM
+        sp_x2, sp_y2 = SW - PM - SDX, SH - PM - SDY
+        r = (sp_y2 - sp_y1) // 2
+
+        img = Image.new('RGBA', (SW, SH), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
 
         if draw_shadow:
-            sx1, sy1 = px1 + self.SHADOW_DX, py1 + self.SHADOW_DY
-            sx2, sy2 = px2 + self.SHADOW_DX, py2 + self.SHADOW_DY
-            sc = self.SHADOW_COLOR
-            self._canvas.create_oval(sx1, sy1, sx1 + 2*r, sy2, fill=sc, outline="", tags="shadow")
-            self._canvas.create_oval(sx2 - 2*r, sy1, sx2, sy2, fill=sc, outline="", tags="shadow")
-            self._canvas.create_rectangle(sx1 + r, sy1, sx2 - r, sy2, fill=sc, outline="", tags="shadow")
+            sc = (*self._hex_to_rgb(self.SHADOW_COLOR), 255)
+            self._pil_pill(draw, sp_x1 + SDX, sp_y1 + SDY,
+                           sp_x2 + SDX, sp_y2 + SDY, r, sc)
 
-        # Main pill: caps in start/end colors, middle filled or sliced gradient.
-        self._canvas.create_oval(px1, py1, px1 + 2*r, py2,
-                                 fill=fill_start, outline="", tags="pill")
-        self._canvas.create_oval(px2 - 2*r, py1, px2, py2,
-                                 fill=fill_end, outline="", tags="pill")
-        mid_x1, mid_x2 = px1 + r, px2 - r
-        if mid_x2 > mid_x1:
-            if fill_start == fill_end:
-                self._canvas.create_rectangle(mid_x1, py1, mid_x2, py2,
-                                              fill=fill_start, outline="", tags="pill")
-            else:
-                N = 28  # gradient slice count — smooth enough at this size
-                slice_w = (mid_x2 - mid_x1) / N
-                for i in range(N):
-                    t = i / max(1, N - 1)
-                    c = self._interp_color(fill_start, fill_end, t)
-                    sx1 = mid_x1 + i * slice_w
-                    sx2 = sx1 + slice_w + 1  # +1 overlap kills 1px seams
-                    self._canvas.create_rectangle(sx1, py1, sx2, py2,
-                                                  fill=c, outline="", tags="pill")
+        if fill_start == fill_end:
+            fc = (*self._hex_to_rgb(fill_start), 255)
+            self._pil_pill(draw, sp_x1, sp_y1, sp_x2, sp_y2, r, fc)
+        else:
+            # Gradient middle + matching caps. Draw one line per column
+            # across the pill's bbox, then clip via a rounded mask.
+            grad = Image.new('RGBA', (SW, SH), (0, 0, 0, 0))
+            gdraw = ImageDraw.Draw(grad)
+            width_px = sp_x2 - sp_x1
+            for col in range(width_px):
+                t = col / max(1, width_px - 1)
+                c = self._interp_color(fill_start, fill_end, t)
+                gdraw.line([(sp_x1 + col, sp_y1), (sp_x1 + col, sp_y2)],
+                           fill=(*self._hex_to_rgb(c), 255))
+            mask = Image.new('L', (SW, SH), 0)
+            mdraw = ImageDraw.Draw(mask)
+            self._pil_pill(mdraw, sp_x1, sp_y1, sp_x2, sp_y2, r, 255)
+            img.paste(grad, (0, 0), mask)
+
+        # Downsample with high-quality filter → AA edges
+        final = img.resize((w, h), Image.LANCZOS)
+        # Composite against TRANSPARENT_KEY (PhotoImage needs RGB). Dark key
+        # keeps the ~1px AA fringe subtle and shadow-like.
+        bg_rgb = self._hex_to_rgb(self.TRANSPARENT_KEY)
+        bg = Image.new('RGB', (w, h), bg_rgb)
+        bg.paste(final, (0, 0), final.split()[3])
+
+        self._pill_photo = ImageTk.PhotoImage(bg)
+        self._canvas.delete("pill_img")
+        # Insert first so bars/text end up on top.
+        self._canvas.create_image(0, 0, anchor='nw',
+                                  image=self._pill_photo, tags="pill_img")
 
     def show(self, text, bg_color=None, fg_color=None, duration=0):
         """Show a pill-shaped notification. duration=0 stays until hidden."""
