@@ -590,113 +590,147 @@ class AudioRecorder:
 
 
 # ============================================================
-# Subprocess Audio Recorder — isolated per-recording Python process
+# Subprocess Audio Recorder — persistent mic-capture worker
 # ============================================================
 # Must match OverlayNotification.NUM_BARS (the subprocess pre-computes
 # this many bar levels so the parent overlay can render without touching
 # raw audio — the parent has no access to the subprocess's PyAudio buffer).
 WAVEFORM_NUM_BARS = 28
 
-# Inline Python script run by the subprocess. Takes two argv:
-#   1. input_device_index (int, -1 = system default)
-#   2. output WAV path
-# Records mono 16kHz int16 until the parent closes stdin, then writes
-# the WAV and exits. Runs in a fresh Python process so PortAudio
-# state is guaranteed pristine per recording — immune to the
-# stale-WASAPI-handle bug that bites after 8+h uptime or a
-# display-sleep / mic-USB-power-cycle.
+# Persistent-worker Python script executed via `python -c`.
 #
-# Also streams per-bar RMS levels on stdout (~20Hz) as space-separated
-# floats terminated by \n so the parent can animate the waveform overlay
-# without access to the raw PCM buffer.
+# Why persistent: a fresh-subprocess-per-recording approach (session 6)
+# eliminated the stale-PortAudio bug, but each Popen/import costs ~220ms
+# warm / ~1400ms cold — so the first word after hotkey press was getting
+# eaten. This rewrite spawns the worker ONCE at app startup and keeps it
+# alive across recordings, driven over stdin. Each recording still opens
+# a fresh PyAudio stream, so PortAudio's per-stream state is clean; the
+# process-level WASAPI cache (where the original stale bug lived) is
+# refreshed by respawning the worker on silent-capture detection or via
+# the existing idle/wake watchdogs that restart the whole app.
+#
+# Protocol (text over stdin/stdout, one command per line):
+#   Parent → Worker:
+#     "START <dev> <wav_path>\n"   begin recording to that WAV file
+#     "STOP\n"                     stop + finalize the WAV
+#     "QUIT\n"                     exit cleanly (or EOF stdin)
+#   Worker → Parent:
+#     "HELLO\n"                    worker is alive, ready for commands
+#     "READY\n"                    PyAudio stream opened, capture active
+#     "DONE\n"                     WAV written, ready for next recording
+#     "<f1> <f2> ... <fN>\n"       per-bar RMS levels (~20Hz, N = NB)
 _MIC_SUBPROCESS_SCRIPT = (
     "import sys, wave, threading, time, math, struct, pyaudio\n"
     f"NB = {WAVEFORM_NUM_BARS}\n"
-    "dev = int(sys.argv[1]); out = sys.argv[2]\n"
-    "dev_arg = dev if dev >= 0 else None\n"
-    "frames = []; lock = threading.Lock(); running = [True]\n"
-    "def cb(data, fc, ti, st):\n"
-    "    with lock: frames.append(data)\n"
-    "    return (None, pyaudio.paContinue)\n"
-    "def streamer():\n"
-    "    # Compute NB log-scaled RMS levels from the last ~250ms of audio\n"
-    "    # and write them to stdout so the parent can render the waveform.\n"
-    "    while running[0]:\n"
-    "        time.sleep(0.05)\n"
-    "        with lock:\n"
-    "            if not frames: continue\n"
-    "            recent = b''.join(frames[-4:])\n"
-    "        n = len(recent) // 2\n"
-    "        if n < NB: continue\n"
-    "        seg = n // NB\n"
-    "        if seg <= 0: continue\n"
-    "        levels = []\n"
-    "        for i in range(NB):\n"
-    "            chunk = recent[i*seg*2:(i+1)*seg*2]\n"
-    "            vals = struct.unpack(f'<{seg}h', chunk)\n"
-    "            rms = math.sqrt(sum(v*v for v in vals) / seg) / 32768.0\n"
-    "            if rms <= 1e-6: lv = 0.0\n"
-    "            else: lv = max(0.0, min(1.0, (20*math.log10(rms+1e-10)+60)/55))\n"
-    "            levels.append(lv)\n"
-    "        try:\n"
-    "            sys.stdout.write(' '.join(f'{l:.3f}' for l in levels) + '\\n')\n"
-    "            sys.stdout.flush()\n"
-    "        except Exception: break\n"
-    "pa = pyaudio.PyAudio()\n"
-    "try:\n"
+    "def handle_one(dev_arg, out_path):\n"
+    "    frames = []; lock = threading.Lock(); running = [True]\n"
+    "    def cb(data, fc, ti, st):\n"
+    "        with lock: frames.append(data)\n"
+    "        return (None, pyaudio.paContinue)\n"
+    "    def streamer():\n"
+    "        while running[0]:\n"
+    "            time.sleep(0.05)\n"
+    "            with lock:\n"
+    "                if not frames: continue\n"
+    "                recent = b''.join(frames[-4:])\n"
+    "            n = len(recent) // 2\n"
+    "            if n < NB: continue\n"
+    "            seg = n // NB\n"
+    "            if seg <= 0: continue\n"
+    "            levels = []\n"
+    "            for i in range(NB):\n"
+    "                chunk = recent[i*seg*2:(i+1)*seg*2]\n"
+    "                vals = struct.unpack('<' + 'h'*seg, chunk)\n"
+    "                rms = math.sqrt(sum(v*v for v in vals) / seg) / 32768.0\n"
+    "                if rms <= 1e-6: lv = 0.0\n"
+    "                else: lv = max(0.0, min(1.0, (20*math.log10(rms+1e-10)+60)/55))\n"
+    "                levels.append(lv)\n"
+    "            try:\n"
+    "                sys.stdout.write(' '.join('%.3f' % l for l in levels) + '\\n')\n"
+    "                sys.stdout.flush()\n"
+    "            except Exception: break\n"
+    "    pa = pyaudio.PyAudio()\n"
+    "    stream = None\n"
     "    try:\n"
-    "        s = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,\n"
-    "                    input=True, input_device_index=dev_arg,\n"
-    "                    frames_per_buffer=1024, stream_callback=cb)\n"
-    "    except Exception:\n"
-    "        s = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,\n"
-    "                    input=True, frames_per_buffer=1024, stream_callback=cb)\n"
-    "    s.start_stream()\n"
-    "    threading.Thread(target=streamer, daemon=True).start()\n"
-    "    try: sys.stdin.buffer.read(1)\n"
-    "    except Exception: pass\n"
-    "    running[0] = False\n"
-    "    s.stop_stream(); s.close()\n"
-    "    with lock: raw = b''.join(frames)\n"
-    "    with wave.open(out, 'wb') as wf:\n"
-    "        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)\n"
-    "        wf.writeframes(raw)\n"
-    "finally:\n"
-    "    pa.terminate()\n"
+    "        try:\n"
+    "            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,\n"
+    "                             input=True, input_device_index=dev_arg,\n"
+    "                             frames_per_buffer=1024, stream_callback=cb)\n"
+    "        except Exception:\n"
+    "            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,\n"
+    "                             input=True, frames_per_buffer=1024, stream_callback=cb)\n"
+    "        stream.start_stream()\n"
+    "        sys.stdout.write('READY\\n'); sys.stdout.flush()\n"
+    "        threading.Thread(target=streamer, daemon=True).start()\n"
+    "        got_quit = False\n"
+    "        while True:\n"
+    "            line = sys.stdin.readline()\n"
+    "            if not line:\n"
+    "                got_quit = True; break\n"
+    "            s = line.strip()\n"
+    "            if s == 'STOP': break\n"
+    "            if s == 'QUIT':\n"
+    "                got_quit = True; break\n"
+    "        running[0] = False\n"
+    "        try: stream.stop_stream()\n"
+    "        except Exception: pass\n"
+    "        try: stream.close()\n"
+    "        except Exception: pass\n"
+    "        with lock: raw = b''.join(frames)\n"
+    "        try:\n"
+    "            with wave.open(out_path, 'wb') as wf:\n"
+    "                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)\n"
+    "                wf.writeframes(raw)\n"
+    "        except Exception as e:\n"
+    "            sys.stderr.write('wav write failed: ' + str(e) + '\\n')\n"
+    "        sys.stdout.write('DONE\\n'); sys.stdout.flush()\n"
+    "        return got_quit\n"
+    "    finally:\n"
+    "        pa.terminate()\n"
+    "def main():\n"
+    "    sys.stdout.write('HELLO\\n'); sys.stdout.flush()\n"
+    "    try:\n"
+    "        while True:\n"
+    "            line = sys.stdin.readline()\n"
+    "            if not line: break\n"
+    "            s = line.strip()\n"
+    "            if s.startswith('START '):\n"
+    "                parts = s.split(' ', 2)\n"
+    "                if len(parts) < 3: continue\n"
+    "                try: dev = int(parts[1])\n"
+    "                except ValueError: continue\n"
+    "                dev_arg = dev if dev >= 0 else None\n"
+    "                if handle_one(dev_arg, parts[2]): break\n"
+    "            elif s == 'QUIT': break\n"
+    "    except Exception as e:\n"
+    "        try: sys.stderr.write('worker error: ' + str(e) + '\\n')\n"
+    "        except Exception: pass\n"
+    "main()\n"
 )
 
 
 class SubprocessAudioRecorder:
-    """Record the mic in an isolated Python subprocess.
+    """Record the mic via a persistent subprocess worker.
 
     Mimics AudioRecorder's public API (start/stop/is_recording/audio_data)
     so it can be swapped in without touching the calling code.
 
-    Why: PortAudio keeps process-level WASAPI device handles cached. When
-    the mic's USB power cycles (e.g. webcam on a monitor that sleeps),
-    every new pyaudio.PyAudio() within the SAME process still gets the
-    stale handle, even if we terminate() and re-init cleanly. The stream
-    "opens" (Windows even shows the privacy-mic indicator) but callbacks
-    return zero-filled frames. Empirically verified: a fresh Python
-    process from the same user session at the same moment captures real
-    audio; WhisperType's long-running process captures RMS=0.00002.
+    Architecture:
+      - One worker subprocess spawned at __init__; kept alive across
+        recordings. Python + pyaudio imports happen ONCE at startup
+        (~500ms cold, amortised over the whole session).
+      - start()/stop() send short text commands over the worker's stdin.
+        Each recording opens a fresh PyAudio stream and writes a WAV
+        file; this keeps per-stream state clean while avoiding the
+        ~220ms subprocess spawn cost that was eating the leading word
+        of every recording in the previous design.
+      - On silent-capture detection (handled by WhisperTypeApp), the
+        worker is killed + respawned to refresh the process-level
+        PortAudio cache that caused the original stale-handle bug.
 
-    Running each recording in a subprocess gives us a fresh PortAudio
-    state every time — immune to the staleness. Cost: ~300ms spawn
-    latency at the start of each recording (amortised across a speech
-    utterance, barely noticeable).
-
-    IPC:
-      - Spawn `python -c <script> <device_idx> <wav_path>`
-      - Subprocess streams audio to an in-memory list, waits on stdin
-      - When parent closes stdin, subprocess finalises the WAV and exits
-      - Parent reads the WAV file and returns it as numpy array
-
-    audio_data: returns empty list. The live frames live in the subprocess
-    so we can't expose them. Callers that depend on live audio_data
-    (waveform animation, streaming transcription) simply get "nothing to
-    display" — acceptable trade-off for the reliability win. Groq backend
-    users don't stream, and silent_mode users don't see the waveform.
+    audio_data: returns empty list (real buffer lives in the worker).
+    latest_levels: RMS bars streamed from the worker at ~20Hz, used by
+    WhisperTypeApp._waveform_updater.
     """
 
     def __init__(self, sample_rate=16000, channels=1, input_device_index=None):
@@ -705,112 +739,142 @@ class SubprocessAudioRecorder:
         self.input_device_index = input_device_index
         self.is_recording = False
         self.audio_data = []   # compat stub — always empty for subprocess
-        # Waveform display levels streamed from the subprocess over stdout.
-        # Updated ~20× per second. Read by WhisperTypeApp._waveform_updater
-        # (which can't compute them itself — audio_data is empty here).
         self.latest_levels = [0.0] * WAVEFORM_NUM_BARS
         self._proc = None
         self._wav_path = None
-        self._level_reader = None
+        self._reader_thread = None
+        self._worker_hello = threading.Event()   # set when worker prints HELLO
+        self._worker_done = threading.Event()    # set when worker prints DONE
+        self._worker_lock = threading.Lock()     # guards spawn/kill
+        self._spawn_worker()
 
-    def start(self):
+    def _spawn_worker(self):
+        """Spawn the persistent worker. Idempotent — no-op if already alive."""
         import subprocess
-        import tempfile
-        interp = find_python_interpreter()
-        if interp is None:
-            raise RuntimeError("Subprocess recorder requires python.exe — not "
-                               "available in frozen mode")
-        fd, self._wav_path = tempfile.mkstemp(suffix=".wav", prefix="wt_mic_")
-        os.close(fd)
-
-        dev_arg = str(self.input_device_index) if self.input_device_index is not None else "-1"
-        try:
-            self._proc = subprocess.Popen(
-                [interp, "-c", _MIC_SUBPROCESS_SCRIPT, dev_arg, self._wav_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,   # read per-bar levels for waveform
-                stderr=subprocess.PIPE,
-                creationflags=0x08000000,  # CREATE_NO_WINDOW
-                bufsize=0,
-            )
-            self.is_recording = True
-            self.latest_levels = [0.0] * WAVEFORM_NUM_BARS
-            # Start the reader AFTER is_recording is True so a super-fast
-            # first line isn't dropped by the `if not is_recording: break` guard.
-            self._level_reader = threading.Thread(
-                target=self._read_levels, daemon=True)
-            self._level_reader.start()
-        except Exception as e:
-            log.error("SubprocessAudioRecorder: spawn failed: %s", e)
-            # Clean up the tempfile if spawn failed
+        with self._worker_lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return
+            interp = find_python_interpreter()
+            if interp is None:
+                return  # frozen mode — caller falls back to AudioRecorder
+            self._worker_hello.clear()
+            self._worker_done.clear()
             try:
-                os.remove(self._wav_path)
-            except Exception:
-                pass
-            self._wav_path = None
-            raise
+                self._proc = subprocess.Popen(
+                    [interp, "-c", _MIC_SUBPROCESS_SCRIPT],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                    bufsize=0,
+                )
+            except Exception as e:
+                log.error("SubprocessAudioRecorder: worker spawn failed: %s", e)
+                self._proc = None
+                return
+            self._reader_thread = threading.Thread(
+                target=self._read_output, daemon=True)
+            self._reader_thread.start()
 
-    def _read_levels(self):
-        """Parse '<f> <f> ... <f>\n' lines from the subprocess and cache them."""
+    def _read_output(self):
+        """Parse the worker's stdout: HELLO / READY / DONE keywords plus
+        RMS-level lines. Each message is one line."""
         proc = self._proc
         if not proc or not proc.stdout:
             return
         try:
-            for line in iter(proc.stdout.readline, b''):
-                if not self.is_recording:
-                    break
-                try:
-                    parts = line.decode('ascii', errors='ignore').strip().split()
-                    if len(parts) != WAVEFORM_NUM_BARS:
-                        continue
-                    self.latest_levels = [float(p) for p in parts]
-                except Exception:
+            for raw in iter(proc.stdout.readline, b''):
+                line = raw.decode('ascii', errors='ignore').strip()
+                if not line:
                     continue
+                if line == 'HELLO':
+                    self._worker_hello.set()
+                elif line == 'READY':
+                    pass  # recording stream opened — informational
+                elif line == 'DONE':
+                    self._worker_done.set()
+                else:
+                    parts = line.split()
+                    if len(parts) == WAVEFORM_NUM_BARS:
+                        try:
+                            self.latest_levels = [float(p) for p in parts]
+                        except Exception:
+                            continue
         except Exception:
             pass
 
-    def stop(self) -> np.ndarray:
-        import subprocess
-        self.is_recording = False
+    def _ensure_worker_alive(self, timeout=5.0):
+        """Spawn the worker if needed and wait for its HELLO signal."""
+        if self._proc is None or self._proc.poll() is not None:
+            self._spawn_worker()
         if self._proc is None:
-            return np.array([], dtype=np.float32)
+            return False
+        return self._worker_hello.wait(timeout=timeout)
 
-        # Signal subprocess to stop: closing stdin unblocks its read(1)
-        try:
-            if self._proc.stdin:
-                self._proc.stdin.close()
-        except Exception as e:
-            log.warning("SubprocessAudioRecorder: stdin close failed: %s", e)
+    def start(self):
+        import tempfile
+        if not self._ensure_worker_alive():
+            raise RuntimeError("Subprocess worker not available")
 
-        # Wait (with timeout) for subprocess to finalise and exit
+        fd, self._wav_path = tempfile.mkstemp(suffix=".wav", prefix="wt_mic_")
+        os.close(fd)
+
+        dev = self.input_device_index if self.input_device_index is not None else -1
+        cmd = f"START {dev} {self._wav_path}\n".encode("utf-8")
+
+        self._worker_done.clear()
+        self.latest_levels = [0.0] * WAVEFORM_NUM_BARS
+
         try:
-            rc = self._proc.wait(timeout=6.0)
-            if rc != 0:
-                err_output = ""
+            self._proc.stdin.write(cmd)
+            self._proc.stdin.flush()
+            self.is_recording = True
+        except (BrokenPipeError, OSError) as e:
+            log.warning("Worker stdin write failed (%s) — respawning and retrying", e)
+            self._kill_worker()
+            if not self._ensure_worker_alive():
                 try:
-                    if self._proc.stderr:
-                        err_output = self._proc.stderr.read().decode("utf-8", errors="replace")[:500]
+                    os.remove(self._wav_path)
                 except Exception:
                     pass
-                log.warning("SubprocessAudioRecorder: subprocess exited with rc=%s, stderr=%r",
-                            rc, err_output)
-        except subprocess.TimeoutExpired:
-            log.warning("SubprocessAudioRecorder: subprocess didn't exit in 6s — killing")
-            try:
-                self._proc.kill()
-                self._proc.wait(timeout=2.0)
-            except Exception:
-                pass
-        finally:
-            self._proc = None
+                self._wav_path = None
+                raise RuntimeError("Worker unavailable after respawn")
+            self._proc.stdin.write(cmd)
+            self._proc.stdin.flush()
+            self.is_recording = True
 
-        # Read back the WAV
+    def stop(self) -> np.ndarray:
+        if not self.is_recording:
+            return np.array([], dtype=np.float32)
+        self.is_recording = False
+
+        if self._proc is None or self._proc.poll() is not None:
+            self._wav_path = None
+            return np.array([], dtype=np.float32)
+
+        try:
+            self._proc.stdin.write(b"STOP\n")
+            self._proc.stdin.flush()
+        except Exception as e:
+            log.warning("Worker STOP write failed: %s", e)
+
+        # Wait for the worker to finalise the WAV and signal DONE.
+        if not self._worker_done.wait(timeout=8.0):
+            log.warning("Worker DONE not received in 8s — killing for respawn")
+            self._kill_worker()
+            wav_path = self._wav_path
+            self._wav_path = None
+            if wav_path:
+                try: os.remove(wav_path)
+                except Exception: pass
+            return np.array([], dtype=np.float32)
+        self._worker_done.clear()
+
         wav_path = self._wav_path
         self._wav_path = None
         if not wav_path or not os.path.exists(wav_path):
-            log.warning("SubprocessAudioRecorder: WAV missing at %s — empty capture", wav_path)
+            log.warning("SubprocessAudioRecorder: WAV missing at %s", wav_path)
             return np.array([], dtype=np.float32)
-
         try:
             with wave.open(wav_path, "rb") as wf:
                 raw = wf.readframes(wf.getnframes())
@@ -818,14 +882,59 @@ class SubprocessAudioRecorder:
             log.warning("SubprocessAudioRecorder: WAV read failed: %s", e)
             raw = b""
         finally:
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
+            try: os.remove(wav_path)
+            except Exception: pass
 
         if not raw:
             return np.array([], dtype=np.float32)
         return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    def _kill_worker(self):
+        """Force-kill the worker. Next start() will respawn with a fresh
+        PortAudio cache — this is the recovery path for silent-capture."""
+        with self._worker_lock:
+            proc = self._proc
+            self._proc = None
+            self._worker_hello.clear()
+            self._worker_done.clear()
+            if proc is None:
+                return
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+
+    def respawn_after_stale(self):
+        """Called by the parent app when a silent capture suggests the
+        worker's PortAudio cache has gone stale. Next start() respawns."""
+        log.info("SubprocessAudioRecorder: respawning worker after stale capture")
+        self._kill_worker()
+        self._spawn_worker()
+
+    def shutdown(self):
+        """Send QUIT and let the worker exit cleanly. For app shutdown."""
+        with self._worker_lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                self._proc = None
+                return
+            try:
+                proc.stdin.write(b"QUIT\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+            self._proc = None
 
 
 # ============================================================
@@ -5020,7 +5129,17 @@ class WhisperTypeApp:
             ).start()
             return
 
-        # First silent — visible error, ask user to try once more.
+        # First silent — kill + respawn the persistent mic worker so the
+        # next recording gets a fresh PortAudio cache. Cheap (~300ms next
+        # recording) compared to a full app restart. If it still comes
+        # back silent, the consecutive counter will hit 2 and we
+        # hard-restart the whole app above.
+        if isinstance(self.recorder, SubprocessAudioRecorder):
+            try:
+                self.recorder.respawn_after_stale()
+            except Exception as e:
+                log.warning("Worker respawn failed: %s", e)
+
         # Force-show the overlay even in silent_mode — silent failure is
         # exactly the case silent_mode should NOT hide.
         self._force_show_error_overlay(
@@ -6024,6 +6143,12 @@ class WhisperTypeApp:
 
     def _quit(self):
         log.info("Quitting WhisperType...")
+        # Clean up the persistent mic worker (best-effort).
+        if isinstance(self.recorder, SubprocessAudioRecorder):
+            try:
+                self.recorder.shutdown()
+            except Exception:
+                pass
         if self.tray_icon:
             self.tray_icon.stop()
         os._exit(0)
