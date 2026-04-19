@@ -3416,24 +3416,32 @@ class WhisperTypeApp:
         except Exception as e:
             log.warning("Could not register undo hotkey: %s", e)
 
-        # Start the idle watchdog — restarts us every N hours idle to
-        # avoid the stale-PortAudio silent-capture bug that hits after
-        # ~8 hours. Checks every 30 min, only fires when nothing active.
-        threshold = float(self.config.get("auto_restart_idle_hours", 4) or 0)
-        if threshold > 0:
-            threading.Thread(target=self._idle_watchdog, daemon=True).start()
-            log.info("Idle watchdog running (threshold: %.1f hours)", threshold)
+        # These two watchdogs existed to fight the stale-PortAudio bug by
+        # restarting the whole app after long idle / display-wake. With
+        # the subprocess-based recorder that handles staleness per
+        # recording (respawn-on-silent), those whole-app restarts are now
+        # just disruption — the user sees the tray blink through loading
+        # and occasionally loses focus for a second. Skip them entirely
+        # when the subprocess recorder is active; fall back to the
+        # original behaviour only if we're on the in-process AudioRecorder
+        # (e.g. frozen-PyInstaller mode, where subprocesses don't work).
+        subprocess_mic_active = isinstance(self.recorder, SubprocessAudioRecorder)
+        if subprocess_mic_active:
+            log.info(
+                "Idle + display-wake watchdogs skipped: subprocess recorder "
+                "handles stale-PortAudio per-recording via respawn-on-silent."
+            )
+        else:
+            threshold = float(self.config.get("auto_restart_idle_hours", 4) or 0)
+            if threshold > 0:
+                threading.Thread(target=self._idle_watchdog, daemon=True).start()
+                log.info("Idle watchdog running (threshold: %.1f hours)", threshold)
 
-        # Start the display-wake watchdog — catches the 'mic powered
-        # through the monitor' case: display sleeps → mic USB powers off
-        # → display wakes → mic re-enumerates but our PortAudio is stale.
-        # Triggers restart the MOMENT the user returns from idle, before
-        # they press Ctrl+Space and get a silent capture.
-        wake_threshold = float(self.config.get("auto_restart_on_wake_idle_min", 10) or 0)
-        if wake_threshold > 0:
-            threading.Thread(target=self._display_wake_watchdog, daemon=True).start()
-            log.info("Display-wake watchdog running (threshold: %.0f min idle)",
-                     wake_threshold)
+            wake_threshold = float(self.config.get("auto_restart_on_wake_idle_min", 10) or 0)
+            if wake_threshold > 0:
+                threading.Thread(target=self._display_wake_watchdog, daemon=True).start()
+                log.info("Display-wake watchdog running (threshold: %.0f min idle)",
+                         wake_threshold)
 
         # Wait for Windows Explorer / taskbar to be ready before showing the tray
         # icon. Fixes the case where auto-start launches WhisperType before the
