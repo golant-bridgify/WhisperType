@@ -384,13 +384,16 @@ def t_cleaner_casual_hebrew():
     cl = _cleaner()
     raw = "אה אז אני הולק לפגישה אממ עם הצוות"
     out = cl.clean(raw, style="casual")
-    # Should remove fillers and fix הולק→הולך
+    # Casual is now typos-only: must fix הולק→הולך, but fillers stay
+    # and overall length must stay within ±15% of the input.
     assert "הולך" in out, f"expected הולך in {out!r}"
-    assert "אממ" not in out
-    assert len(out) < len(raw), f"expected shorter, got {len(out)} vs {len(raw)}"
+    assert "אממ" in out, f"filler should be preserved in casual mode: {out!r}"
+    length_ratio = len(out) / len(raw)
+    assert 0.85 <= length_ratio <= 1.15, \
+        f"casual mode should stay near-identical length (got ratio {length_ratio:.2f}): {out!r}"
 
 
-_test("cleaner: casual Hebrew removes fillers + fixes typos", t_cleaner_casual_hebrew)
+_test("cleaner: casual fixes spelling typos without stripping fillers", t_cleaner_casual_hebrew)
 
 
 def t_cleaner_expansion_blocked():

@@ -1642,17 +1642,17 @@ class GroqLLMCleaner:
     # Per-style "what to fix" rules. These are APPENDED to the guard prefix.
     STYLE_PROMPTS = {
         "casual": (
-            "- Remove filler words (um, uh, like, אה, יעני, בעצם, כאילו, "
-            "אממ, נו).\n"
-            "- Add proper punctuation and sentence casing.\n"
-            "- Fix spelling errors, typos, and obvious mis-hearings (wrong "
-            "homophone, wrong letter at end of word, missing letter). "
-            "Example Hebrew: 'הולק' → 'הולך'. "
-            "Example English: 'there going' → 'they're going'.\n"
-            "- Fix basic grammar errors (verb agreement, prepositions).\n"
-            "- Preserve the speaker's voice, style, and intentional slang.\n"
-            "- Keep the SAME LANGUAGE as the input (Hebrew stays Hebrew, "
-            "English stays English, mixed stays mixed)."
+            "- Fix ONLY spelling errors and obvious mis-hearings where the "
+            "wrong homophone / letter was transcribed. Examples: Hebrew "
+            "'הולק' → 'הולך'; English 'there going' → 'they're going'.\n"
+            "- Do NOT remove filler words ('um', 'uh', 'אה', 'כאילו', "
+            "'אממ', 'יעני' — keep them verbatim if the user said them).\n"
+            "- Do NOT change phrasing, word order, or sentence structure.\n"
+            "- Do NOT add, remove, or re-punctuate sentences. Keep the "
+            "punctuation exactly as it arrived.\n"
+            "- Do NOT shorten or tighten anything.\n"
+            "- Output length must be within ±10% of the input length.\n"
+            "- Keep the same language as the input."
         ),
         "proofread": (
             "- Fix spelling, grammar, punctuation, and capitalisation "
@@ -1794,10 +1794,10 @@ class GroqLLMCleaner:
             # the user-visible failure mode that prompted this tightening.
             # Casual/email permit more filler removal.
             MIN_RATIOS = {
-                "proofread": 0.80,   # ±20% — proofread must preserve length
+                "casual":    0.85,   # typo-only: must stay near-identical length
+                "proofread": 0.80,   # grammar+punctuation: keep content words
                 "code":      0.80,
-                "casual":    0.55,
-                "email":     0.55,
+                "email":     0.55,   # email polish: permits real filler removal
             }
             min_ratio = MIN_RATIOS.get(style, 0.55)
             min_len = max(3, int(len(payload_text) * min_ratio))
