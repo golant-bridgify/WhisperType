@@ -1655,14 +1655,16 @@ class GroqLLMCleaner:
             "English stays English, mixed stays mixed)."
         ),
         "proofread": (
-            "- Fix ALL spelling, grammar, punctuation, and capitalisation "
+            "- Fix spelling, grammar, punctuation, and capitalisation "
             "errors.\n"
-            "- Fix misheard words, homophones, and typos using context.\n"
-            "- Fix awkward phrasing. Improve sentence structure where "
-            "clearly beneficial — but keep roughly the same sentence count "
-            "and same meaning.\n"
-            "- Remove filler words and redundancy.\n"
-            "- Preserve the EXACT meaning — never add or remove ideas.\n"
+            "- Fix misheard words, homophones, and typos using context "
+            "(Hebrew: 'הולק' → 'הולך'; English: 'there going' → 'they're going').\n"
+            "- Keep EVERY content word. Do NOT shorten, tighten, or "
+            "rephrase sentences — even if they sound awkward. Do NOT drop "
+            "phrases you consider redundant.\n"
+            "- Do NOT remove filler words (keep 'um', 'אה', 'כאילו' as-is if "
+            "the user said them).\n"
+            "- Output length must be within ±15% of the input length.\n"
             "- Keep the same language as the input."
         ),
         "email": (
@@ -1786,10 +1788,22 @@ class GroqLLMCleaner:
             if len(cleaned) >= 2 and cleaned[0] in ('"', "'", '«', '\u201C') and cleaned[-1] in ('"', "'", '»', '\u201D'):
                 cleaned = cleaned[1:-1].strip()
 
-            # Guard 1: too-short (LLM summarised instead of cleaning)
-            if len(cleaned) < max(3, len(payload_text) // 4):
-                log.warning("LLM cleanup: result too short (%d << %d) — using raw text",
-                            len(cleaned), len(payload_text))
+            # Guard 1: too-short (LLM summarised instead of cleaning).
+            # Proofread / code should stay close to the input — the LLM
+            # over-compressing a 32-char sentence down to 14 chars was
+            # the user-visible failure mode that prompted this tightening.
+            # Casual/email permit more filler removal.
+            MIN_RATIOS = {
+                "proofread": 0.80,   # ±20% — proofread must preserve length
+                "code":      0.80,
+                "casual":    0.55,
+                "email":     0.55,
+            }
+            min_ratio = MIN_RATIOS.get(style, 0.55)
+            min_len = max(3, int(len(payload_text) * min_ratio))
+            if len(cleaned) < min_len:
+                log.warning("LLM cleanup (%s): result too short (%d < %d, %.0f%% floor) — using raw text",
+                            style, len(cleaned), min_len, min_ratio * 100)
                 return text
 
             # Guard 2: too-long (LLM treated input as a task and generated a
