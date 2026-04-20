@@ -3136,6 +3136,14 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
 class WhisperTypeApp:
     def __init__(self):
         self.config = load_config()
+        # Always start with 'casual' cleanup style on every launch.
+        # User can change it mid-session via the tray menu; next restart
+        # it resets to casual so typo-correction is guaranteed on by default.
+        if self.config.get("cleanup_style") != "casual":
+            log.info("Resetting cleanup_style to 'casual' on startup "
+                     "(was %r)", self.config.get("cleanup_style"))
+            self.config["cleanup_style"] = "casual"
+            save_config(self.config)
         # Pick the recorder implementation. Subprocess-isolated is the
         # default because it eliminates the stale-PortAudio / WASAPI-handle
         # bug structurally. Falls back to in-process if:
