@@ -1,301 +1,183 @@
-# WhisperType — Handover Notes
+# WhisperType — Handover
 
-*Last updated: 2026-04-18, end of session 6. Repo state: master @ `61c3dbc`, `origin/master` synced.*
+*Last session: 2026-04-18 → 2026-04-20 (session 7). Master at `ecf83f5`, pushed to `origin/master`. 29/29 tests pass.*
 
-This doc is for the next developer (or future you) picking up WhisperType. Read this first, then [CLAUDE.md](CLAUDE.md) for architecture details, then [WhisperType/README.md](WhisperType/README.md) for user-facing usage.
-
----
-
-## TL;DR of current state
-
-- **Working and stable.** Production-quality for personal use. All 29 automated tests pass.
-- **Core features are complete:** recording, transcription (local + cloud), AI cleanup, custom vocabulary, meeting mode, undo, hotkey UI.
-- **Session 6 (this one) eliminated the stale-PortAudio silent-capture bug at the architectural level** via per-recording subprocess isolation. That bug was the last critical reliability issue.
-- **No known critical bugs.**
+Read this first, then [CLAUDE.md](CLAUDE.md) for architecture and project history. You should not need anything else to continue.
 
 ---
 
-## Where the work is
+## Goal
+
+Session 7 started as a UI polish session (user turned off `silent_mode` → became aware of overlay issues) and grew into a broader polish + reliability round:
+
+1. Make the press-to-talk overlay modern and sharp (pill shape, AA edges, subtle gradient, no red/green traffic-light waveform).
+2. Fix a slew of user-reported behavioural issues: tray icon flicker on release, waveform not animating, desktop-icon shimmer on clicks near overlay, app silently restarting itself, LLM cleanup rewriting instead of proofreading, mic privacy indicator staying visible between recordings, leading words eaten by subprocess spawn.
+3. Improve transcription accuracy within the limits of Whisper on Hebrew.
+
+All four user-visible complaints are fixed at the code level. Transcription accuracy is now bounded by Whisper itself (~88–90 % on a literary Hebrew paragraph with a close mic) and by the user's settings that are still at suboptimal defaults in their config.
+
+---
+
+## Completed + verified
+
+### 12 commits this session, all pushed
+
+| commit | what | verified how |
+|---|---|---|
+| `a5447c8` | Hold-mode tray flicker fix (debounce + clear `_hotkey_event` after stop) + skip local-model load when Groq is primary (tray goes green in ~1s instead of ~10s) | Manual user test confirmed no flicker + fast startup |
+| `541b943` | Waveform animation revived under `SubprocessAudioRecorder` — worker streams pre-computed RMS levels on stdout at ~20 Hz; overlay restyled into a pill | Manual user test confirmed animation visible and responsive |
+| `4477091` | Pill gets real-circle caps, gradient fills, drop shadow; fix the hide-after-1500 ms timer race that was withdrawing the window mid-recording | 29/29 tests + manual cycle test |
+| `7c20f28` | Render the pill via PIL (4× supersample + LANCZOS) instead of `create_oval` — smooth AA edges | Manual test + full test suite |
+| `89690be` | Switch PIL primitive to `rounded_rectangle` (no seams between three shapes) + enable per-monitor DPI awareness (`SetProcessDpiAwarenessContext(-4)`) so Windows stops bilinear-stretching the overlay. All five `tk.Tk()` roots get `_apply_dpi_scaling_to_tk` | User confirmed visual fidelity |
+| `d0e5ef3` | `WS_EX_TRANSPARENT` for click-through (using `GetAncestor(GA_ROOT)` + explicit ctypes argtypes, deferred by 150 ms to survive tk's async `-transparentcolor` application) + supersample bumped to 8× | User said looks good |
+| `a6df9b8` | `WS_EX_NOACTIVATE` added — without it, click-through alone still caused desktop icons to pulse through hover/pressed states because of Windows' focus-evaluation race | User confirmed flicker stopped |
+| `2c9ebbf` | `SubprocessAudioRecorder` rewritten around a worker subprocess that handles multiple recordings — eliminated the ~220 ms spawn-per-recording that was eating leading audio | See `9cd5859` for follow-up |
+| `9cd5859` | **CRITICAL FOLLOW-UP:** the persistent worker held the WASAPI session at the process level and the mic privacy indicator stayed on between recordings. Changed to a **pre-spawn** model: each worker handles exactly one recording and exits; a replacement is spawned in a daemon thread right after `DONE`. `start()` measured at ~0.3–0.6 ms across consecutive recordings | 3-recording test with different PIDs each time |
+| `4c5fc65` | Skip idle (4 h) and display-wake (10 min) watchdogs when `SubprocessAudioRecorder` is active. User's log showed three spurious whole-app restarts in 10 hours; they're redundant now because the subprocess respawn-on-silent handles the same bug at the per-recording level | Reviewed user's log, verified triggers |
+| `7e8c0e9` | `proofread` prompt rewritten to preserve content (no rephrasing, no filler removal). Per-style min-length guards: proofread/code ≥ 80 %, casual ≥ 85 %, email ≥ 55 % (was a single 25 % floor — LLM was shrinking 32→14 char outputs through it) | Live Groq test in run_tests.py |
+| `ecf83f5` | `casual` is now **typos only** — don't change phrasing, don't remove fillers, ±10 % length. Test updated to assert `אממ` filler is preserved | Live Groq test confirmed |
+
+### Final feature lineup after this session
+
+- **Pre-spawn mic worker** at ~1 ms latency per `start()`, fresh Python subprocess per recording (so WASAPI session drops between recordings → Windows mic indicator lifecycles correctly).
+- **Click-through modern overlay:** PIL-rendered pill at 8× supersample, DPI-aware, per-monitor DPI scaling applied to all 5 tk dialogs. `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST` — the canonical click-through overlay flag set.
+- **Groq primary → ~1 s startup:** local faster-whisper model is loaded lazily in a background thread after Groq validation, with a `_wait_for_local_ready` helper in the fallback path.
+- **LLM cleanup modes ordered by aggressiveness:** casual (typos only) → proofread (+grammar/punctuation) → email (polish) → code (tech terms preserved).
+- **Watchdogs quieted:** no more surprise restarts.
+- **Waveform mirrors real audio** in both mic-only and "both" source modes (new mix path in `_waveform_updater` maxes subprocess levels with legacy loopback samples).
+
+---
+
+## In progress / open
+
+1. **Residual "some pixelation" perception on the pill.** The user said the current state is "much better" but not perfect. The remaining aliasing is the ~1 px fringe from compositing PIL's AA alpha against `TRANSPARENT_KEY = '#030310'`. The truly-clean fix is `UpdateLayeredWindow` via ctypes (per-pixel alpha, no color-key trick). It was discussed and deferred — the user accepted the current look.
+2. **User's config still has sub-optimal cleanup/bias settings** ([config.json](../AppData/Roaming/WhisperType/config.json) as of 2026-04-19):
+   - `"groq_he_en_bias": false` — should be `true` for Hebrew/English auto-detect. Told user to toggle via tray → Options → "Bias Groq to Hebrew/English".
+   - `"custom_vocabulary": ""` — told user to add frequently mis-transcribed words (e.g. `אליאס, אקראיים, הזמין, הקרין`) via tray → Custom Vocabulary.
+   - `"cleanup_style": "off"` as of last check — user was comparing modes. Casual now does the "light" behaviour they originally wanted.
+3. **Transcription accuracy:** measured 78 % → 88 % → 89 % across three mic-distance experiments on a literary Hebrew paragraph. The ceiling with this mic + Whisper large-v3-turbo seems to be ~90 %. `proofread` cleanup should push it to ~95 % but the user hasn't tried it on a real text yet.
+
+---
+
+## Failed approaches — do not repeat
+
+These are all from this session. Each was a dead end or a partial fix that a later commit had to undo.
+
+### Pill rendering
+- **`create_polygon` with `smooth=True`** (early iteration of `4477091`): jaggy, because Tkinter's GDI rendering has no AA. Also the smoothed polygon visibly approximates curves with bezier segments — looked like hand-drawn.
+- **PIL three-shape pill** (ellipse + rect + ellipse, `7c20f28`): the three shapes' AA contributions didn't align after LANCZOS downsample, so the user saw "rectangle + two circles glued together". Fix was `rounded_rectangle` — one atomic primitive (`89690be`).
+- **4× supersample**: user still saw residual pixelation. Bumping to 8× helped; `rounded_rectangle` helped more; DPI awareness helped most.
+
+### Transparency / clicks
+- **`WS_EX_TRANSPARENT` alone**: desktop icons still pulse on clicks near the overlay because Windows still does a focus-evaluation race on clicks near a layered topmost window. Needed `WS_EX_NOACTIVATE` in addition.
+- **Setting `WS_EX_TRANSPARENT` synchronously right after `self._root.attributes('-transparentcolor', ...)`**: it gets clobbered because tk applies `WS_EX_LAYERED` asynchronously and overwrites the ex-style later. Fix was `self._root.after(150, self._make_click_through)`.
+- **Default ctypes calls (no argtypes)**: `GetAncestor` returned truncated HWND values on 64-bit Python, so `WS_EX_TRANSPARENT` was being applied to the inner tkinter frame (which has no effect) instead of the top-level window. Always set `argtypes`/`restype` explicitly for Win32 calls.
+
+### Subprocess mic
+- **Persistent worker** (`2c9ebbf` — superseded by `9cd5859` the next commit): held the WASAPI session at the process level. Even with `stream.close()` + `pa.terminate()` between recordings, the Windows mic privacy indicator stayed visible until the subprocess exited. The user noticed this immediately. Pre-spawn (worker exits after each recording, parent spawns the next one in the background) was the fix.
+- **`pa.terminate() + pa.PyAudio()` within the same process to refresh PortAudio**: per the session-6 findings, this doesn't clear the process-level cache. That's why the stale-handle recovery is `_kill_worker` → spawn a fresh process, not a `terminate`/`init` cycle.
+
+### LLM cleanup
+- **Single 25 %-of-input "too-short" floor**: lets the LLM drop 44 % of content through. User reported `proofread` "doesn't work" because a 32-char input came back as 14 chars. Fixed with per-style ratios (see `7e8c0e9`).
+- **Prompt wording "remove filler words and redundancy" in `proofread`**: LLMs interpret this as permission to restructure and compress. The new `proofread` prompt explicitly says "Keep EVERY content word. Do NOT shorten… Do NOT drop phrases… Do NOT remove filler words."
+
+### Watchdogs
+- **Keeping idle/display-wake watchdogs on as defence-in-depth alongside subprocess mic**: the user had three unwanted whole-app restarts in 10 hours because of these. Disable them when the subprocess path is active.
+
+---
+
+## Key decisions (with rationale)
+
+1. **Pre-spawn worker, not persistent worker.** The persistent model eliminated spawn latency but held the WASAPI session at the process level, breaking the Windows mic privacy indicator lifecycle. Pre-spawn gives us both: fast start (~0.3 ms) AND proper indicator behaviour.
+2. **Keep `-transparentcolor` + PIL AA** instead of switching to `UpdateLayeredWindow` with per-pixel alpha. The latter would eliminate the last ~1 px AA fringe but requires a major refactor (no more tkinter canvas rendering; all pills, bars, text via PIL + Win32 blit). User accepted the current look, so the ctypes path is deferred. If you do take it on, plan ~4–6 hours including font rendering and waveform-bar re-architecture.
+3. **DPI awareness ON at the process level.** Trade-off: every `tk.Tk()` root needs `_apply_dpi_scaling_to_tk(root)` so fonts render at physical pixels. Alternative was to leave DPI unaware and live with bilinear-stretched PIL output; rejected because the user's 150 % display made everything obviously blurry.
+4. **Casual cleanup is typos-only, not "light cleanup".** The user explicitly asked for this — they didn't want *any* restructuring. The mode progression casual→proofread→email→code gives them escalating aggressiveness.
+5. **Watchdogs off under subprocess mic.** Respawn-on-silent at the per-recording level is enough. If a recording comes back silent we already respawn the worker; if two come back silent in 2 minutes, we still fall through to the full-app restart path. No reason to pre-emptively kill the app every 4 hours.
+6. **Don't auto-migrate user's `groq_he_en_bias` or `custom_vocabulary`.** They explicitly turned bias off, which may have been intentional. Suggested via chat; let them toggle themselves from the tray.
+7. **Per-style LLM length ratios.** A single 25 % floor allowed destructive summarisation in strict modes; a single 80 % floor would break email mode's legitimate filler removal. Map: casual 0.85, proofread 0.80, code 0.80, email 0.55.
+
+---
+
+## Next steps — ranked by ROI
+
+### 1. No action needed from code — ask user to flip these in the tray (<2 min, big accuracy win)
+
+```
+Tray → Options → "Bias Groq to Hebrew/English"   # turn ON
+Tray → Custom Vocabulary...                      # add: אליאס, אקראיים, הזמין, הקרין
+Tray → Options → AI Cleanup → Casual             # typos-only
+```
+
+If accuracy still feels low after these, that's Whisper's ceiling on this hardware + audio — not something code can fix short of switching models.
+
+### 2. If the user returns saying "still see pixelation" (~4–6 h code, deferred)
+
+Implement per-pixel alpha via `UpdateLayeredWindow`. Sketch:
+
+- Add ctypes bindings for `UpdateLayeredWindow`, `GetDC`, `CreateCompatibleDC`, `CreateDIBSection`, `SelectObject`, `DeleteObject`, `DeleteDC`, `ReleaseDC`, `BLENDFUNCTION`, `BITMAPINFOHEADER`, `POINT`, `SIZE`.
+- At overlay init: after `WS_EX_LAYERED` is set, *don't* call `-transparentcolor`. Instead we'll push an RGBA bitmap directly.
+- `_make_pill_photo` becomes `_push_pill_bitmap`: render the PIL RGBA image, premultiply alpha (`BGRA` byte order for Windows), create a DIB section via `CreateDIBSection`, `memmove` the bytes in, select into a memory DC, call `UpdateLayeredWindow` with `ULW_ALPHA` and `BLENDFUNCTION { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA }`.
+- Waveform bars and text must also be rendered by PIL into the bitmap (tkinter canvas items won't show once the layered window overrides the paint). Use `ImageFont.truetype("segoeui.ttf", ...)` for text.
+- Gotchas: `GetWindowLongPtrW`/`SetWindowLongPtrW` on 64-bit; always set argtypes/restype; `winfo_id()` returns the inner frame — use `GetAncestor(GA_ROOT)` as we already do in `_make_click_through`.
+
+Keep the current code path as a fallback when `UpdateLayeredWindow` fails.
+
+### 3. Other deferred items (~ROI-negative for now)
+
+- **Pre-spawned helper with stdin/stdout frame streaming** (mentioned as a nice-to-have in session 6 handover). Replaced by session 7's pre-spawn worker — latency is already at ~0.3 ms, no action needed.
+- **Auto-stop on silence** (~2–3 h).
+- **Statistics dashboard** (~2 h).
+- **Live transcript window during meetings** (~1 day).
+
+---
+
+## Context / where things live
 
 ```
 C:\Users\Naor\Downloads\WhisperType\
-├── CLAUDE.md              ← Full dev context. READ FIRST.
-├── README.md              ← (legacy, just forwards to WhisperType/README.md)
-├── HANDOVER.md            ← This file.
-├── LICENSE
-├── .gitignore
+├── CLAUDE.md                          # project architecture — READ SECOND
+├── HANDOVER.md                        # THIS FILE
+├── README.md                          # user-facing
 └── WhisperType\
-    ├── whispertype.py     ← Everything. ~5,300 lines. Monolithic on purpose.
-    ├── run_tests.py       ← 29 tests. Run before/after any change.
-    ├── generate_icon.py   ← Regenerate whispertype.ico
-    ├── requirements.txt
-    ├── build.py           ← PyInstaller build → dist/WhisperType.exe
-    ├── run.bat            ← Admin launcher
-    └── (various install/setup .bat files)
+    ├── whispertype.py                 # everything, ~5,900 lines
+    ├── run_tests.py                   # 29 tests (section 6 needs Groq key)
+    └── …
 ```
 
-User data:
-```
-%APPDATA%\WhisperType\
-├── config.json            ← All settings (written atomically under lock)
-├── whispertype.log        ← Rotating 2MB × 3 backups
-├── history.json           ← Last 1000 transcriptions (written under lock)
-├── meetings\              ← *.md files, one per meeting
-└── beep.wav               ← Regenerated on startup (48kHz stereo)
-```
+User runtime state: `%APPDATA%\WhisperType\` — `config.json`, `whispertype.log`, `history.json`, `meetings\`, `beep.wav`.
 
----
-
-## Quick orientation
-
-### Start dev mode
+### Commands
 
 ```bash
 cd WhisperType
-pip install -r requirements.txt
-python whispertype.py         # Run in place
-# OR
-run.bat                       # Run as admin (proper hotkey support)
+python whispertype.py                                 # run dev
+python run_tests.py                                   # 29 tests, needs Groq key for section 6
+python -c "import ast; ast.parse(open('whispertype.py', encoding='utf-8').read())"
 ```
 
-### Run the test suite
+Console under Windows `cp1252` can't print some Unicode arrows; if `run_tests.py` chokes on that, set `PYTHONIOENCODING=utf-8`.
 
-```bash
-python run_tests.py
-```
-
-Takes ~15 seconds. Section 6 (live Groq tests) needs an API key in `config.json`. If no key → those 6 tests fail with "No Groq API key" — the rest still pass.
-
-### Git / remote
-
-```bash
-git log --oneline -10     # recent commits
-git push origin master    # push to GitHub
-```
-
-Repo: https://github.com/Danaor/WhisperType
-
----
-
-## The mental model
-
-WhisperType is a single class (`WhisperTypeApp`) that orchestrates:
+### Git
 
 ```
-  ┌─────────────────────────────────┐
-  │        WhisperTypeApp           │
-  │                                 │
-  │  ┌───────────┐   ┌───────────┐  │
-  │  │ Recorder  │   │ Loopback  │  │        Audio IN
-  │  │ (mic)     │   │ Recorder  │  │
-  │  └─────┬─────┘   └─────┬─────┘  │
-  │        │               │        │
-  │        └───────┬───────┘        │
-  │                │                │
-  │        ┌───────▼──────────┐     │
-  │        │   Transcriber    │     │ local (faster-whisper)
-  │        │  (Groq / Local)  │─────┼─ or cloud (Groq)
-  │        └───────┬──────────┘     │
-  │                │                │
-  │        ┌───────▼──────────┐     │
-  │        │ GroqLLMCleaner   │     │ optional AI polish
-  │        └───────┬──────────┘     │
-  │                │                │
-  │        ┌───────▼──────────┐     │
-  │        │    _do_paste     │     │ Ctrl+V + save undo state
-  │        └──────────────────┘     │        Text OUT
-  │                                 │
-  │  MeetingSession (parallel)      │
-  │  ├─ rotating recorder every 45s │
-  │  └─ chunked transcription       │
-  └─────────────────────────────────┘
+repo:     https://github.com/Danaor/WhisperType
+branch:   master
+base:     877700b (pre-session docs handover)
+head:     ecf83f5 (this session)
+state:    master == origin/master, clean tree
+tests:    29/29 passing
 ```
 
-For meetings, `MeetingSession` owns its own recorders and runs a background thread that rotates them every 45 seconds, transcribing each chunk independently.
+### User specifics (for future accuracy questions)
 
----
+- Hardware: Intel Core Ultra 7 265K, Intel Arc iGPU, no NVIDIA. Monitor at **150 % DPI** (`_DPI_SCALE = 1.5`). Mic is a webcam (C920) attached to the monitor — the reason session 6's stale-PortAudio saga exists.
+- Language: Hebrew-first, English code terms. Dictates 3–30 s clips mostly.
+- Config: `silent_mode: false` (overlay visible), `recording_source: "both"` (mic + WASAPI loopback), `use_subprocess_mic: true`.
+- Accuracy measured on a literary Hebrew paragraph: 78 % (farther mic) → 88 % (closer mic) → 89 % (closer again). Consistent substitutions on `אליאס`/`אלייס`, `אקראיים`/`קריים`, `נראתה`/`נראית`. Custom vocabulary + casual cleanup should push to ~95 %.
 
-## Features added (chronological, across all sessions)
+### Session 7 files touched
 
-Each feature links to the relevant commit for diff-level context.
+- `WhisperType/whispertype.py` — 11 commits worth of change (overlay, subprocess, cleanup)
+- `WhisperType/run_tests.py` — one change (casual test assertion in `ecf83f5`)
 
-### Session 5 (2026-04-17) — Features + stability
-| Feature | Commit | One-line description |
-|---|---|---|
-| Icon state polish | `46eb2dd` | `processing` + `loading` icons visually distinct |
-| Bug sweep | `e85748a` | 15+ stability fixes: silent failures, log rotation, threading, etc. |
-| Beep crash fix | `5648826` | PortAudio subprocess isolation — Focusrite no longer kills the app |
-| Tray-state-at-startup fix | `0fd2e84` | Starts blue/loading instead of lying about being ready |
-| Silent-failure guards | `a723e8c` | `_flash_error_tray`, clipboard retry, log rotation, generation counter |
-| "תודה רבה" fix | `777841b` | Whole-text hallucinations are erased + tray flash red X |
-| Icon redesign | `4d33834` | Dark slate + cyan neon (Design D) |
-| WASAPI wake-from-sleep first-attempt | `f0ad814` | Silent-audio detection + warmup on long idle |
-| **AI Cleanup** | `ceaf825` | `GroqLLMCleaner` + 4 styles |
-| Cleanup prompt strengthening | `9f006c8` | Added `Proofread` style, better typo correction |
-| **Custom Vocabulary** | `edaf65a` | `"git push"` permanent fix |
-| Expansion prevention | `f14b716` | `<transcription>` delimiters + 1.5× length cap |
-| **Meeting Mode** | `679e738` | `MeetingSession` + LLM summary + markdown output |
-| **Undo Last Paste** | `34ab478` | `Ctrl+Alt+Z` + auto-restore clipboard |
-| **Hotkey UI + Test Suite** | `a999d61` | Change hotkey from menu + 29 tests |
-| Handover docs (first pass) | `87cee08` | CLAUDE.md + HANDOVER.md + README.md refresh |
-
-### Session 6 (2026-04-18) — The stale-PortAudio saga
-| Feature | Commit | One-line description |
-|---|---|---|
-| Reactive silent-capture auto-restart | `2504af8` | After 2 consecutive silents, auto-restart; manual 'Restart WhisperType' tray item |
-| Long-idle watchdog | `5c78229` | Silent restart after 4h with no recording |
-| **Display-wake watchdog** | `7e22320` | `GetLastInputInfo` polling; restart when user returns from ≥10 min idle — catches mic-on-monitor power cycles |
-| **⭐ SubprocessAudioRecorder** | `61c3dbc` | Structural fix — every recording in a fresh Python subprocess. Stale-PortAudio bug is now impossible. |
-
----
-
-## The stale-PortAudio bug — documented in detail
-
-Because this dominated session 6, here's the background for anyone who sees weird silent captures in the future.
-
-**Symptom:** after several hours or a monitor sleep+wake cycle, WhisperType captures recordings where:
-- Windows shows the privacy mic indicator (stream opens fine)
-- PyAudio callbacks fire (frames are returned)
-- But RMS ≈ 0.00002 (frames are zero-filled)
-
-Sound Recorder and a fresh Python process using the same mic at the same moment capture real audio. So the hardware is fine — only the long-running WhisperType process is affected.
-
-**Root cause:** PortAudio (the C library under PyAudio) keeps WASAPI device handles cached at the process level. When the mic's USB power cycles (in this user's case, because the webcam mic is attached to a monitor that goes to sleep), the cached handle becomes stale. Even `pa.terminate() + pa.PyAudio()` cycles within the same process don't clear it — apparently the caching is below the PyAudio reference-count layer.
-
-**Why subprocess works:** a fresh Python process means fresh PortAudio module-level state. No cache to be stale.
-
-**Defence-in-depth stack (from most structural to most reactive):**
-
-1. **`SubprocessAudioRecorder`** (`61c3dbc`) — The fix. Each recording in a fresh subprocess. Bug can't happen.
-2. **Display-wake watchdog** (`7e22320`) — polls `GetLastInputInfo` every 10s, restarts when user returns from ≥10 min idle. Still useful if some other class of state-staleness appears.
-3. **Long-idle watchdog** (`5c78229`) — 4h silent restart. Belt + suspenders.
-4. **Silent-capture detection** (`777841b` + `2504af8`) — `_handle_silent_capture` logs + flashes red X + counts consecutive silents.
-5. **Auto-restart on 2 consecutive silents** (`2504af8`) — last-resort recovery.
-6. **Manual 'Restart WhisperType' tray item** — always available.
-
-Layer 1 should catch 100% of cases; 2-6 remain as safety nets in case a different process-level state issue ever emerges.
-
----
-
-## What might surprise you about the code
-
-### 1. Single-file monolith, but consistent structure
-~5,300 lines in one file is a deliberate choice — makes the app easier to package, distribute, and debug. Structure is:
-1. Imports + config + logging
-2. Utility functions (audio, hallucination, config, `find_python_interpreter`, `get_system_idle_seconds`)
-3. Recorder classes (AudioRecorder, **SubprocessAudioRecorder**, LoopbackRecorder)
-4. Transcriber classes (FasterWhisper, OpenVINO, Groq)
-5. GroqLLMCleaner
-6. Meeting mode
-7. Paste helpers
-8. Auto-start + history
-9. OverlayNotification
-10. Beep helpers
-11. WhisperTypeApp (the main class, ~2,800 lines)
-
-### 2. Generation counter for tray icon race
-`self._recording_generation` is incremented on every `_start_recording()`. Background transcription threads capture the generation at start; the `finally` block only resets the icon to green if the generation is still current. Without this, a slow transcription from recording #1 could clobber the red icon of an in-progress recording #2.
-
-### 3. Threading.Event-driven hotkey
-`_hotkey_listener` doesn't block on `keyboard.wait()` anymore. Instead it waits on `self._hotkey_event`, which is set by a `keyboard.add_hotkey` callback. This lets the hotkey be swapped at runtime (for the "Change Hotkey..." dialog) without killing the listener thread.
-
-### 4. Beep runs in a subprocess on specific-device mode
-PortAudio can C-level crash on incompatible audio formats (see the Focusrite 22kHz-mono → 48kHz-stereo-only saga). So `play_beep(device_index=N)` spawns a `pythonw.exe -c "..."` subprocess that does the actual PyAudio work. A driver crash there doesn't kill the main app.
-
-### 5. Three-layer cleanup injection defense
-Because llama-3.3-70b is trained to be helpful, when the raw transcription sounds like an instruction ("I want to review the code..."), it wants to ANSWER instead of cleaning. Defenses:
-1. System prompt explicitly says "you are NOT an AI assistant, you are a text-cleaning function"
-2. User content wrapped in `<transcription>...</transcription>` tags
-3. Hard cap: if output > 1.5× input, throw it away and use raw text
-
-### 6. The `_do_paste` wrapper
-Don't call `output_text(text, mode=...)` directly from new code. Use `self._do_paste(text, mode)` instead — it handles clipboard-before snapshotting, undo state recording, and auto-restore scheduling.
-
-### 7. `SubprocessAudioRecorder.audio_data` is always empty
-The real audio buffer lives in the subprocess. Anything that reads `self.recorder.audio_data` for live monitoring (`_streaming_worker`, `_waveform_updater`) gets an empty list and no-ops gracefully. That's OK because:
-- streaming worker already skips for Groq backend
-- waveform updater is hidden in silent_mode anyway
-If a future feature genuinely needs live frames from the subprocess, consider upgrading to the "pre-spawned helper with stdin/stdout frame streaming" architecture — designed and considered in session 6 but deferred for simplicity.
-
-### 8. The watchdogs are orthogonal layers, not a chain
-Each watchdog fires independently based on its own trigger. They overlap intentionally:
-- Idle-watchdog (4h) and display-wake watchdog (10min) both might fire on the same long idle — whichever hits first wins, the other's restart call becomes a no-op (process already exiting).
-- Reactive silent-capture auto-restart only fires if the proactive ones missed. With SubprocessAudioRecorder as the structural fix, all watchdogs should now be **rarely used** — they're defense-in-depth, not hot-path.
-
----
-
-## How to add a new feature
-
-### Small feature (e.g. new option toggle)
-
-1. Add default to `DEFAULT_CONFIG` dict (top of file)
-2. Add tray menu item in `run()` where the menu is built
-3. Add handler method on `WhisperTypeApp`
-4. Call `save_config(self.config)` to persist
-5. Add a test to `run_tests.py`
-
-### New transcriber backend
-
-1. Inherit from `BaseTranscriber`
-2. Implement `load_model`, `transcribe`, `transcribe_file`
-3. Wire into `WhisperTypeApp.__init__` based on a new config key
-4. Add to `_set_backend` if switchable
-
-### New tray icon state
-
-1. Add case to `_create_icon()` method (state string → PIL drawing)
-2. Call sites update tray icon: `self.tray_icon.icon = self._create_icon("newstate")`
-3. Test in `run_tests.py` → `t_icons_all_states`
-
-### New dialog
-
-1. Create a `_open_X_dialog()` method that spawns a daemon thread running `tk.Tk()`. Don't share Tk roots across threads — this is why the overlay has its own dedicated Tk mainloop.
-2. Reuse the catppuccin-dark colour scheme (`#1e1e2e` bg, `#cdd6f4` fg, `#313244` accents) for visual consistency
-3. Add tray menu item that calls it
-
----
-
-## Pre-push checklist
-
-Before `git push`:
-
-```bash
-cd WhisperType
-python -c "import ast; ast.parse(open('whispertype.py').read())"  # syntax
-python run_tests.py  # 29 tests should all pass
-```
-
-For structural changes (class, menu, etc.):
-- Manually test the happy path: start app → model loads → press hotkey → speak → release → paste → Ctrl+Alt+Z → clipboard should be restored.
-- If you changed the tray menu, click every menu item and make sure nothing crashes.
-
----
-
-## Potential next features (ranked by ROI)
-
-From the session-5 discussion, not yet built:
-
-1. **Auto-stop on silence** (~2-3 hr) — Stop recording after 2s of silence instead of requiring hotkey release. Hands-free dictation.
-2. **Statistics dashboard** (~2 hr) — Show total words, time saved, languages used. Fun, low utility.
-3. **Audio save + re-transcribe** (~half day) — Optionally save raw audio so a failed transcription can be re-tried with a different model. Now less needed — the silent-audio detection + WASAPI warmup cover most failure modes.
-4. **Voice commands** (~1 day) — "new line", "period", etc. Low ROI when cleanup is good.
-5. **Windows power-state API hook** (~half day) — Proper `PowerRegisterSuspendResumeNotification` integration. Would replace the current warmup heuristic with an event.
-6. **Better streaming preview** (~day) — Live transcript window during recording (local backend only).
-
----
-
-## Known limitations (unlikely to be issues)
-
-1. **Python 3.13 removed `audioop`** — the beep subprocess uses byte slicing instead of `audioop.tomono`. Works, but if Python 3.14 removes `wave`, we'll need a replacement.
-2. **`keyboard` library needs admin** — standard on Windows for global hotkeys. `run.bat` elevates. Non-admin shows a warning in the log.
-3. **Single-instance via mutex** — duplicate launch returns code 0 (clean exit). User relaunching won't produce zombies.
-4. **OpenVINO code is dormant** — still in the source, hidden from UI. Keep for future Intel GPU/NPU use or delete if it bitrots.
-5. **File transcription skips AI cleanup** — intentional (long audio + token limits). If we want cleanup for files, need chunked cleanup like meeting mode does.
-
----
-
-## Support / contact
-
-- Author: Naor (naordaniel1@gmail.com)
-- Repo: https://github.com/Danaor/WhisperType
-- All session work by Claude (Anthropic Sonnet 4.6) — co-author on every commit.
+No other files in the repo were touched.
