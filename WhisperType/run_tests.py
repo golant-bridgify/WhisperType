@@ -396,6 +396,18 @@ def t_cleaner_casual_hebrew():
 _test("cleaner: casual fixes spelling typos without stripping fillers", t_cleaner_casual_hebrew)
 
 
+def t_cleaner_casual_adds_question_mark():
+    """Casual should convert a clear question ending with '.' or nothing to '?'."""
+    cl = _cleaner()
+    raw = "אז בעצם מה שאתה אומר לי, זה שנעשה תיקון בקוד ואז זה יעבוד."
+    out = cl.clean(raw, style="casual")
+    assert out.rstrip().endswith("?"), \
+        f"casual should turn the trailing '.' into '?' for a question: {out!r}"
+
+
+_test("cleaner: casual adds '?' to an unpunctuated question", t_cleaner_casual_adds_question_mark)
+
+
 def t_cleaner_expansion_blocked():
     """The AWS-expansion failure mode: must NOT expand >1.5×."""
     cl = _cleaner()
