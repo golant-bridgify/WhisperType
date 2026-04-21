@@ -422,6 +422,20 @@ def t_cleaner_casual_fixes_word_boundary_mishear():
 _test("cleaner: casual fixes 'בעלך' → 'בא לך' by context", t_cleaner_casual_fixes_word_boundary_mishear)
 
 
+def t_cleaner_casual_fixes_nonword_to_real_word():
+    """Casual should replace a non-existent Hebrew word with the phonetically
+    similar real word when one exists — e.g. 'להיבלה' is not a Hebrew word,
+    the intended word is 'להיבלע'."""
+    cl = _cleaner()
+    raw = "המילה עלולה להיבלה בתוך הרעש"
+    out = cl.clean(raw, style="casual")
+    assert "להיבלע" in out, \
+        f"expected 'להיבלה' (non-word) → 'להיבלע' (real word): {out!r}"
+
+
+_test("cleaner: casual fixes non-word Hebrew to real word", t_cleaner_casual_fixes_nonword_to_real_word)
+
+
 def t_cleaner_expansion_blocked():
     """The AWS-expansion failure mode: must NOT expand >1.5×."""
     cl = _cleaner()
