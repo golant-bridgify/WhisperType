@@ -1645,6 +1645,13 @@ class GroqLLMCleaner:
             "- Fix ONLY spelling errors and obvious mis-hearings where the "
             "wrong homophone / letter was transcribed. Examples: Hebrew "
             "'הולק' → 'הולך'; English 'there going' → 'they're going'.\n"
+            "- Fix Hebrew word-boundary mis-hearings where Whisper joined "
+            "two words into one or split one word into two, IF the "
+            "surrounding context makes the correct form unambiguous. "
+            "Examples: 'אם בעלך לעשות את זה' → 'אם בא לך לעשות את זה' "
+            "(context = wanting to do something, not a husband); "
+            "'של י' → 'שלי'; 'בסדר גמור שלך' stays as-is if it really "
+            "refers to a spouse. When in doubt, leave the text alone.\n"
             "- If a sentence is clearly a question but ends with '.' or "
             "nothing, replace the ending with '?'. This is the ONLY "
             "punctuation change allowed. Hebrew examples: 'מה השעה.' → "
@@ -1656,7 +1663,7 @@ class GroqLLMCleaner:
             "- Do NOT add, remove, or change any OTHER punctuation "
             "(commas, periods between statements, exclamation marks).\n"
             "- Do NOT shorten or tighten anything.\n"
-            "- Output length must be within ±10% of the input length.\n"
+            "- Output length must be within ±15% of the input length.\n"
             "- Keep the same language as the input."
         ),
         "proofread": (

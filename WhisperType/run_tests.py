@@ -408,6 +408,20 @@ def t_cleaner_casual_adds_question_mark():
 _test("cleaner: casual adds '?' to an unpunctuated question", t_cleaner_casual_adds_question_mark)
 
 
+def t_cleaner_casual_fixes_word_boundary_mishear():
+    """Casual should unpack 'בעלך' → 'בא לך' when the context is about wanting something."""
+    cl = _cleaner()
+    raw = "אם בעלך לעשות את זה בוא נעשה"
+    out = cl.clean(raw, style="casual")
+    assert "בא לך" in out, \
+        f"expected 'בא לך' reconstruction from context: {out!r}"
+    assert "בעלך" not in out, \
+        f"joined form should have been replaced: {out!r}"
+
+
+_test("cleaner: casual fixes 'בעלך' → 'בא לך' by context", t_cleaner_casual_fixes_word_boundary_mishear)
+
+
 def t_cleaner_expansion_blocked():
     """The AWS-expansion failure mode: must NOT expand >1.5×."""
     cl = _cleaner()
