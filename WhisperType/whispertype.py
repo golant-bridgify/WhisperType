@@ -1395,18 +1395,13 @@ class GroqTranscriber(BaseTranscriber):
     TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
     TRANSLATE_URL = "https://api.groq.com/openai/v1/audio/translations"
 
-    # Heavy bilingual prompt sent to Whisper for language-detection bias.
-    # Whisper infers the audio language partly from the prompt tokens — the
-    # more Hebrew tokens here, the stronger the bias away from French /
-    # Russian / Arabic look-alikes. We pack ~20 common Hebrew phrases so the
-    # tokenizer is saturated with Hebrew context BEFORE it hears the audio.
-    # English phrases are kept shorter (Whisper handles English natively).
+    # Bilingual prompt sent to Whisper when language is auto-detect.
+    # Whisper uses the prompt as context, which biases language detection
+    # toward Hebrew + English and away from look-alikes (French, Russian, etc.).
     HE_EN_BIAS_PROMPT = (
-        "שלום, תודה רבה, בוקר טוב, ערב טוב, מה שלומך, איך הולך, "
-        "בסדר גמור, אני רוצה, צריך לעשות, בוא נדבר, מה המצב, "
-        "אפשר לעזור, יופי מצוין, נכון מאוד, בדיוק ככה, "
-        "אין בעיה, רגע אחד, סליחה, מעולה, "
-        "Hello, thank you, meeting, project, computer."
+        "Bilingual transcription in Hebrew or English only. "
+        "שלום, תודה רבה, איך הולך, מחשב, פגישה. "
+        "Hello, thank you, how are you, meeting, computer, project."
     )
 
     def __init__(self, model_size="whisper-large-v3-turbo", api_key=""):
@@ -1537,18 +1532,7 @@ class GroqTranscriber(BaseTranscriber):
                 if self.custom_vocabulary and self.custom_vocabulary.strip():
                     data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
             else:
-                # Always send language=he. Despite the name, this doesn't
-                # force Hebrew-only output — it tells the decoder "default
-                # to Hebrew when unsure". When the audio is clearly English
-                # the decoder still emits English tokens because the audio
-                # features dominate. What it DOES block is the false
-                # French / Arabic / Russian detections that happen when
-                # Whisper is uncertain (short clips, ambient noise,
-                # technical terms). Prompt-only bias was tried twice and
-                # failed both times — the API has no "whitelist of allowed
-                # languages" parameter, so language=he is the only reliable
-                # approach.
-                data["language"] = "he"
+                # Auto-detect: bias toward Hebrew/English + user vocab
                 bias = self._build_bias_prompt()
                 if bias:
                     data["prompt"] = bias
