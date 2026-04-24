@@ -1532,21 +1532,18 @@ class GroqTranscriber(BaseTranscriber):
                 if self.custom_vocabulary and self.custom_vocabulary.strip():
                     data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
             else:
-                # Auto-detect: bias toward Hebrew/English + user vocab.
+                # Always pass language=he: the user only speaks Hebrew and
+                # English. Whisper treats this as a strong prior, not a
+                # strict filter — English audio still transcribes correctly
+                # because the decoder detects the actual spoken language.
+                # The key effect is suppressing false French / Russian /
+                # Arabic detection that produces garbage.
+                data["language"] = "he"
+                # Bias prompt adds bilingual context + custom vocabulary so
+                # Whisper favours the user's known terms.
                 bias = self._build_bias_prompt()
                 if bias:
                     data["prompt"] = bias
-                # The prompt is a SOFT hint — Whisper can still auto-detect
-                # French/Spanish/Russian on short clips. Force `language=he`
-                # as a HARD prior when the user has he/en bias enabled.
-                # Whisper treats this as a starting-point, not a strict
-                # filter: pure-English audio still transcribes correctly
-                # because the model detects actual spoken language during
-                # decoding. The key effect is suppressing look-alike
-                # language detections (French, Arabic, Russian) that would
-                # produce garbage output.
-                if self.he_en_bias:
-                    data["language"] = "he"
 
         # Scale timeout with audio duration so long clips have room to process
         duration = len(audio_np) / 16000.0
