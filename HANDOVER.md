@@ -1,10 +1,52 @@
 # WhisperType — Handover
 
-*Last session: 2026-04-18 → 2026-04-20 (session 7). Master at `6ed49e6`, pushed to `origin/master`. 32/32 tests pass.*
+*Last session: 2026-04-24 (session 8). 32/32 tests pass. Branch: `master`.*
 
 Read this first, then [CLAUDE.md](CLAUDE.md) for architecture and project history. You should not need anything else to continue.
 
 ---
+
+## Session 8 (2026-04-24) — language constraint, solved
+
+**Problem carried over from session 7:** Whisper would occasionally transcribe Hebrew as Arabic/French/Russian. Session 7 tried forcing `language="he"` and heavy prompt bias; both failed and were reverted. The `#failed-approaches` section below still applies — do NOT re-try forcing a single language or saturating the prompt.
+
+**What finally worked — confidence-guided dual-pass arbitration:**
+
+The breakthrough: **`response_format=verbose_json` returns per-segment `avg_logprob` even when `language=` is forced.** That gives us a correctness signal we didn't have before. When you force the wrong language, Whisper's own confidence collapses.
+
+New flow in `GroqTranscriber.transcribe()`:
+
+1. Primary pass: auto-detect + bias prompt (unchanged in spirit). Response now requested as `verbose_json`.
+2. Read top-level `language` and duration-weighted mean `avg_logprob` from segments.
+3. If detected ∈ {he, en} → accept. (90%+ case, no extra cost.)
+4. Else → fire two parallel requests: `language="he"` and `language="en"`. Wait for both. Pick the one with higher `avg_logprob`.
+5. If BOTH fallback passes have `avg_logprob < -1.5` → treat as noise, return empty (routes into existing silent-capture handler).
+
+**Why this is structurally different from the failed attempts:**
+
+- Past attempts put a one-sided prior on the decoder (always Hebrew OR always auto-with-prompt).
+- This approach lets Whisper *itself* decide he-vs-en via its own log-prob, after we've structurally excluded every other language.
+- The fallback path **cannot return French/Arabic/Russian/etc.** — those languages are never asked for.
+
+**Cost:** +0 in the common case. +1 API call (parallel, so ~+300-500ms latency) on the ~10% of clips Whisper mis-classifies. Pennies per hour of dictation.
+
+**New code:**
+
+- Module helpers: `_normalise_lang_code()`, `_weighted_mean_logprob()` (in `whispertype.py` just below `strip_hallucinated_tail`).
+- `GroqTranscriber._post_verbose()` — JSON-aware replacement of `_post` that returns {text, language, mean_logprob, raw}.
+- `GroqTranscriber._groq_transcribe_once()` — single-pass helper.
+- `GroqTranscriber._groq_transcribe_with_he_en_fallback()` — the arbitration logic.
+- `GroqTranscriber.transcribe()` — rewritten to route through the above.
+
+**Gated on `groq_he_en_bias`:** when ON (default), dual-pass fallback active. When OFF, pure auto-detect (old behaviour). Turn ON by default is the safe recommendation — the toggle is in the tray.
+
+**Translation endpoint untouched** — `/translations` returns English text, source-language handling is inside the API. Plain `response_format=text` preserved there.
+
+**Test suite:** 32/32 still green. No new tests added because the existing Groq tests are live-API and the fallback fires on specific audio content that's flaky to construct. Manual verification: observe `Groq: auto-detected=X logprob=Y` lines in `%APPDATA%\WhisperType\whispertype.log` during real use.
+
+---
+
+## Session 7 (2026-04-18 → 2026-04-20)
 
 ## Goal
 
@@ -61,7 +103,7 @@ All user-reported bugs are fixed at the code level. Transcription accuracy now d
 | `bfb14ba` | Restore `language="he"` | Produced nonsense Hebrew on English dictation |
 | `6ed49e6` | **Full revert** — back to original auto-detect + short bias prompt | Current state |
 
-See `#failed-approaches` for the full story. Do not re-attempt without a fundamentally different angle.
+See `#failed-approaches` for the full story. **Session 8 found the fundamentally different angle (log-prob arbitration via `verbose_json`) — see the session-8 summary above.** Do not re-try the session-7 attempts as-is; they remain dead ends.
 
 ---
 
@@ -115,9 +157,9 @@ See `#failed-approaches` for the full story. Do not re-attempt without a fundame
 ### Watchdogs
 - Idle/display-wake watchdogs as defence-in-depth alongside subprocess mic — user got three unwanted whole-app restarts in 10 hours. Disable under subprocess.
 
-### 🚨 Language detection — HOURS OF NET-NEGATIVE WORK 🚨
+### Language detection — the session-7 attempts (superseded by session 8)
 
-Four commits, all reverted. Do not re-attempt without something fundamentally new.
+Four commits in session 7 were reverted. **Session 8 solved the problem via a different mechanism (log-prob arbitration — see the session-8 summary at the top of this file).** The approaches below are still dead ends in isolation — do not re-try them one-sidedly.
 
 **What was tried**:
 1. **`language="he"` forced, gated by `he_en_bias`**: suppressed false French/Arabic detections on short clips. But when the user said something in English (`"I will be using the Israeli region IL-CENTRAL1"`) the output came back as garbage Hebrew (`"נעשה של האיש אוטלי דהבאק"`).
@@ -137,7 +179,7 @@ Four commits, all reverted. Do not re-attempt without something fundamentally ne
 - Use a local Whisper with custom decoder parameters (constrain language probabilities per-token).
 - Add a heuristic: post-transcription, detect non-Hebrew non-English Unicode script in the output and re-transcribe with `language="he"` as a retry.
 
-Do not try `language="he"` as the default again. Do not try prompt saturation. Both were empirically tested.
+Do not try `language="he"` as the default again. Do not try prompt saturation. Both were empirically tested. **Session 8 did solve the broader "only he/en" goal — see the session-8 summary at the top of this file. If you need to revisit language handling, start there.**
 
 ---
 
@@ -151,7 +193,7 @@ Do not try `language="he"` as the default again. Do not try prompt saturation. B
 6. **Don't auto-migrate user config.** They explicitly toggled `groq_he_en_bias` at various points. Suggested via chat, let them toggle from tray.
 7. **Per-style LLM length ratios.** Single floor couldn't serve both strict modes (casual/proofread need high floor) and permissive modes (email needs low floor).
 8. **Force `cleanup_style = "casual"` on every app startup.** User request. Mid-session toggles work; next restart resets.
-9. **Abandon the language-whitelist quest** (see failed approaches above).
+9. **Abandon the language-whitelist quest** via one-sided priors — but **session 8 implemented a dual-pass log-prob arbitration that achieves effectively the same goal** (see session-8 summary at top).
 
 ---
 

@@ -377,6 +377,75 @@ def strip_hallucinated_tail(text):
     return cleaned.strip()
 
 
+# Groq's `verbose_json` gives us the detected language. Normalise here so
+# downstream checks see stable ISO-639-1 codes regardless of whether the
+# API returned "he" or "hebrew" or "he-IL".
+_LANGUAGE_NAME_TO_CODE = {
+    "hebrew": "he",
+    "english": "en",
+    "arabic": "ar",
+    "french": "fr",
+    "russian": "ru",
+    "spanish": "es",
+    "german": "de",
+    "italian": "it",
+    "portuguese": "pt",
+    "dutch": "nl",
+    "polish": "pl",
+    "turkish": "tr",
+    "persian": "fa",
+    "farsi": "fa",
+    "urdu": "ur",
+    "yiddish": "yi",
+    "romanian": "ro",
+    "ukrainian": "uk",
+}
+
+
+def _normalise_lang_code(raw):
+    """Return a lowercase ISO-639-1 code. Accepts codes, names, or BCP-47 tags."""
+    if not raw:
+        return ""
+    val = str(raw).strip().lower()
+    if val in _LANGUAGE_NAME_TO_CODE:
+        return _LANGUAGE_NAME_TO_CODE[val]
+    return val.split("-", 1)[0] if "-" in val else val
+
+
+def _weighted_mean_logprob(segments):
+    """Duration-weighted mean of Whisper's per-segment avg_logprob.
+
+    `verbose_json` returns avg_logprob per segment only (no top-level
+    aggregate). Weighting by duration stops short noisy segments from
+    dominating long clean ones. Returns None if nothing usable.
+    """
+    if not segments:
+        return None
+    total_dur = 0.0
+    weighted_sum = 0.0
+    unweighted = []
+    for s in segments:
+        try:
+            lp = s.get("avg_logprob")
+            if lp is None:
+                continue
+            lp = float(lp)
+            start = float(s.get("start") or 0)
+            end = float(s.get("end") or 0)
+            dur = max(0.0, end - start)
+            if dur > 0:
+                weighted_sum += lp * dur
+                total_dur += dur
+            unweighted.append(lp)
+        except (TypeError, ValueError):
+            continue
+    if total_dur > 0:
+        return weighted_sum / total_dur
+    if unweighted:
+        return sum(unweighted) / len(unweighted)
+    return None
+
+
 # Available models with display names
 MODELS = {
     # Hebrew-optimized (ivrit.ai) - recommended
@@ -1497,6 +1566,137 @@ class GroqTranscriber(BaseTranscriber):
         response.raise_for_status()
         return response.text.strip()
 
+    def _post_verbose(self, url, files, data, timeout=30):
+        """POST to Groq expecting a `verbose_json` response.
+
+        Returns dict with keys: text, language (normalised ISO-639-1),
+        mean_logprob (duration-weighted, may be None), raw (full body).
+
+        Falls back to {"text": body_text, ...Nones} if the body isn't JSON
+        (e.g. someone called us with response_format=text by accident, or
+        Groq returned an HTML error page).
+        """
+        import requests
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+        if response.status_code == 401:
+            raise RuntimeError("Invalid Groq API key")
+        if response.status_code == 429:
+            raise RuntimeError("Groq rate limit exceeded")
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return {"text": response.text.strip(), "language": "", "mean_logprob": None, "raw": None}
+        text = (body.get("text") or "").strip()
+        lang = _normalise_lang_code(body.get("language"))
+        segments = body.get("segments") or []
+        return {
+            "text": text,
+            "language": lang,
+            "mean_logprob": _weighted_mean_logprob(segments),
+            "raw": body,
+        }
+
+    def _groq_transcribe_once(self, audio_np, language, timeout):
+        """Single /transcriptions call. Returns the dict from _post_verbose.
+
+        `language=None` → auto-detect + full bias prompt (he/en bias + vocab).
+        `language=<code>` → forced; prompt carries custom vocab only
+        (he/en bias would be redundant when language is pinned).
+        """
+        wav_buf = self._audio_to_wav_bytes(audio_np)
+        files = {"file": ("audio.wav", wav_buf, "audio/wav")}
+        data = {"model": self.model_size, "response_format": "verbose_json"}
+        if language:
+            data["language"] = language
+            if self.custom_vocabulary and self.custom_vocabulary.strip():
+                data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
+        else:
+            bias = self._build_bias_prompt()
+            if bias:
+                data["prompt"] = bias
+        return self._post_verbose(self.TRANSCRIBE_URL, files, data, timeout=timeout)
+
+    def _groq_transcribe_with_he_en_fallback(self, audio_np, timeout):
+        """Auto-detect primary; if Whisper picks anything outside {he, en},
+        run a parallel dual-pass with language=he and language=en and keep
+        whichever came back with the higher (less-negative) avg_logprob.
+
+        This is the only language-constraint mechanism Groq's API supports
+        (no whitelist parameter), and it's structural: the fallback cannot
+        return French/Arabic/etc. because those languages are never asked for.
+        """
+        primary = self._groq_transcribe_once(audio_np, language=None, timeout=timeout)
+        detected = primary.get("language") or ""
+        primary_lp = primary.get("mean_logprob")
+        lp_str = f"{primary_lp:.3f}" if primary_lp is not None else "n/a"
+
+        if detected in ("he", "en"):
+            log.info("Groq: auto-detected=%s logprob=%s (accepted)", detected, lp_str)
+            return primary
+
+        log.warning(
+            "Groq: auto-detected=%s logprob=%s — not in {he,en}, running dual-pass",
+            detected or "?", lp_str,
+        )
+
+        results = {}
+        errors = {}
+
+        def _worker(lang):
+            try:
+                results[lang] = self._groq_transcribe_once(audio_np, language=lang, timeout=timeout)
+            except Exception as e:
+                errors[lang] = e
+
+        threads = [threading.Thread(target=_worker, args=(lang,), daemon=True)
+                   for lang in ("he", "en")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # If both fallback calls failed, fall back to the (mis-detected) primary
+        # so the user still gets *something* rather than an empty paste.
+        if "he" in errors and "en" in errors:
+            log.error("Groq dual-pass: both failed (he=%s, en=%s) — keeping primary",
+                      errors["he"], errors["en"])
+            return primary
+        if "he" in errors:
+            log.warning("Groq dual-pass: he failed (%s) — using en", errors["he"])
+            out = results["en"]
+            out["language"] = "en"
+            return out
+        if "en" in errors:
+            log.warning("Groq dual-pass: en failed (%s) — using he", errors["en"])
+            out = results["he"]
+            out["language"] = "he"
+            return out
+
+        he_lp = results["he"].get("mean_logprob")
+        en_lp = results["en"].get("mean_logprob")
+        he_cmp = he_lp if he_lp is not None else float("-inf")
+        en_cmp = en_lp if en_lp is not None else float("-inf")
+        winner_lang = "he" if he_cmp >= en_cmp else "en"
+        log.info(
+            "Groq dual-pass: he_logprob=%s en_logprob=%s → picking %s",
+            f"{he_lp:.3f}" if he_lp is not None else "n/a",
+            f"{en_lp:.3f}" if en_lp is not None else "n/a",
+            winner_lang,
+        )
+
+        # Noise floor: if BOTH passes have catastrophic confidence, the audio
+        # is almost certainly not speech. Return empty so the caller routes
+        # into the existing silent-capture handler (flashes red X + doesn't paste).
+        if he_cmp < -1.5 and en_cmp < -1.5:
+            log.warning("Groq dual-pass: both logprobs < -1.5 — treating as noise, returning empty")
+            return {"text": "", "language": "", "mean_logprob": min(he_cmp, en_cmp), "raw": None}
+
+        winner = results[winner_lang]
+        winner["language"] = winner_lang
+        return winner
+
     def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
         if self.model is None:
             raise RuntimeError("Groq transcriber not initialized")
@@ -1509,11 +1709,15 @@ class GroqTranscriber(BaseTranscriber):
         if len(audio_np) < orig_len:
             log.info("Groq: trimmed %d samples of trailing silence", orig_len - len(audio_np))
 
-        wav_buf = self._audio_to_wav_bytes(audio_np)
-        files = {"file": ("audio.wav", wav_buf, "audio/wav")}
+        # Scale timeout with audio duration so long clips have room to process
+        duration = len(audio_np) / 16000.0
+        http_timeout = max(30, int(duration * 3) + 10)  # e.g. 60s audio → 190s timeout
 
+        # Translation endpoint: plain text response, no dual-pass (output is
+        # always English; source-language detection lives inside the API).
         if task == "translate":
-            url = self.TRANSLATE_URL
+            wav_buf = self._audio_to_wav_bytes(audio_np)
+            files = {"file": ("audio.wav", wav_buf, "audio/wav")}
             # Groq's /translations endpoint only supports whisper-large-v3
             # (turbo/distil don't translate). Force the right model.
             data = {"model": "whisper-large-v3", "response_format": "text"}
@@ -1522,26 +1726,23 @@ class GroqTranscriber(BaseTranscriber):
                 data["prompt"] = bias
             log.info("Groq translate: model=whisper-large-v3 bias=%s vocab=%s",
                      self.he_en_bias, bool(self.custom_vocabulary))
+            text = self._post(self.TRANSLATE_URL, files, data, timeout=http_timeout)
+            return strip_hallucinated_tail(text) if text else ""
+
+        # /transcriptions endpoint. Three routes:
+        # - forced language       → single pass with that language
+        # - auto + bias OFF       → single auto-detect (same as before)
+        # - auto + bias ON        → primary + conditional he/en dual-pass
+        forced_lang = language if language and language != "auto" else None
+
+        if forced_lang:
+            result = self._groq_transcribe_once(audio_np, language=forced_lang, timeout=http_timeout)
+        elif not self.he_en_bias:
+            result = self._groq_transcribe_once(audio_np, language=None, timeout=http_timeout)
         else:
-            url = self.TRANSCRIBE_URL
-            data = {"model": self.model_size, "response_format": "text"}
-            if language and language != "auto":
-                data["language"] = language
-                # Even with a forced language, include custom vocab so
-                # 'git push' doesn't get mistranscribed as Hebrew.
-                if self.custom_vocabulary and self.custom_vocabulary.strip():
-                    data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
-            else:
-                # Auto-detect: bias toward Hebrew/English + user vocab
-                bias = self._build_bias_prompt()
-                if bias:
-                    data["prompt"] = bias
+            result = self._groq_transcribe_with_he_en_fallback(audio_np, timeout=http_timeout)
 
-        # Scale timeout with audio duration so long clips have room to process
-        duration = len(audio_np) / 16000.0
-        http_timeout = max(30, int(duration * 3) + 10)  # e.g. 60s audio → 190s timeout
-
-        text = self._post(url, files, data, timeout=http_timeout)
+        text = (result.get("text") or "").strip()
         if not text:
             return ""
 
@@ -1550,19 +1751,20 @@ class GroqTranscriber(BaseTranscriber):
         if not text:
             return ""
 
-        # Translation output is always English — skip RTL
-        if task == "translate":
-            return text
-
-        # Detect RTL and prepend RTL mark (same as FasterWhisperTranscriber)
+        # RTL mark: prefer the (forced or winning) language tag; fall back
+        # to script detection if neither is available.
         rtl_langs = {"he", "ar", "fa", "ur", "yi"}
-        is_rtl = language in rtl_langs if language and language != "auto" else any(
-            '\u0590' <= c <= '\u05FF' or
-            '\u0600' <= c <= '\u06FF' or
-            '\uFB1D' <= c <= '\uFDFF' or
-            '\uFE70' <= c <= '\uFEFF'
-            for c in text
-        )
+        lang_tag = forced_lang or result.get("language") or ""
+        if lang_tag:
+            is_rtl = lang_tag in rtl_langs
+        else:
+            is_rtl = any(
+                '\u0590' <= c <= '\u05FF' or
+                '\u0600' <= c <= '\u06FF' or
+                '\uFB1D' <= c <= '\uFDFF' or
+                '\uFE70' <= c <= '\uFEFF'
+                for c in text
+            )
         if is_rtl:
             text = '\u200F' + text
         return text
