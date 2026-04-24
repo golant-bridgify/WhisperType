@@ -3976,9 +3976,40 @@ class WhisperTypeApp:
                         time.sleep(0.05)
                     time.sleep(0.2)  # extra debounce
                 else:
-                    # Hold mode (default): hold to record, release to stop
+                    # Hold mode (default): hold to record, release to stop.
+                    #
+                    # Release detection is DEBOUNCED: keyboard.is_pressed()
+                    # can return False transiently for a single poll while the
+                    # user is still holding the chord. Known triggers:
+                    #   - Another app sending SendInput key events (password
+                    #     managers, AutoHotKey scripts, push-to-talk clients
+                    #     for Zoom/Discord) — the global hook sees these as
+                    #     key-ups and flips the library's internal state.
+                    #   - Window-focus transitions; brief hook misses around
+                    #     the foreground switch.
+                    #   - Chord polling race: `all()` polls ctrl, then space;
+                    #     either can glitch independently, and a long hold
+                    #     gives the glitch many chances per second to fire.
+                    # Without debounce, a 50-second hold cuts off mid-sentence
+                    # on the first such blip. Requiring N consecutive "not
+                    # pressed" polls filters single-tick glitches. 150ms
+                    # (3 × 50ms poll interval) is imperceptible as release
+                    # latency but closes the fragility window.
                     self._start_recording()
-                    while all(keyboard.is_pressed(p) for p in parts):
+                    RELEASE_DEBOUNCE_POLLS = 3
+                    release_streak = 0
+                    while True:
+                        if all(keyboard.is_pressed(p) for p in parts):
+                            if release_streak > 0:
+                                log.info(
+                                    "Hotkey release-detect: filtered %d transient not-pressed poll(s); chord still held",
+                                    release_streak,
+                                )
+                            release_streak = 0
+                        else:
+                            release_streak += 1
+                            if release_streak >= RELEASE_DEBOUNCE_POLLS:
+                                break
                         time.sleep(0.05)
                     self._stop_and_transcribe()
                     # Wait for FULL release and eat any spurious hotkey re-trigger
