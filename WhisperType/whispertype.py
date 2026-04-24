@@ -1537,12 +1537,18 @@ class GroqTranscriber(BaseTranscriber):
                 if self.custom_vocabulary and self.custom_vocabulary.strip():
                     data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
             else:
-                # Auto-detect with heavy Hebrew bias prompt — no forced
-                # language parameter so Whisper freely picks Hebrew or
-                # English from the actual audio. The ~20 Hebrew phrases
-                # in the prompt saturate the tokenizer with Hebrew tokens,
-                # which strongly suppresses false French / Russian / Arabic
-                # detection without hurting English transcription.
+                # Always send language=he. Despite the name, this doesn't
+                # force Hebrew-only output — it tells the decoder "default
+                # to Hebrew when unsure". When the audio is clearly English
+                # the decoder still emits English tokens because the audio
+                # features dominate. What it DOES block is the false
+                # French / Arabic / Russian detections that happen when
+                # Whisper is uncertain (short clips, ambient noise,
+                # technical terms). Prompt-only bias was tried twice and
+                # failed both times — the API has no "whitelist of allowed
+                # languages" parameter, so language=he is the only reliable
+                # approach.
+                data["language"] = "he"
                 bias = self._build_bias_prompt()
                 if bias:
                     data["prompt"] = bias
