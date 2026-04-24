@@ -272,11 +272,51 @@ def mix_audio(audio1, audio2):
     return mixed
 
 
-def trim_trailing_silence(audio_np, sample_rate=16000, threshold_db=-40, tail_ms=150):
+def audio_peak_rms(audio_np, sample_rate=16000, window_ms=300):
+    """Peak RMS over sliding windows (50% overlap), normalised to [0, 1].
+
+    Used for silent-capture detection. Mean RMS over a whole clip
+    under-reports when the user said one short word in an otherwise
+    silent 2s clip (a natural press-to-talk pattern) — the brief speech
+    is diluted by the surrounding silence and averages below the "mic
+    silent" threshold, producing false alarms. Peak RMS looks at the
+    loudest 300ms window and answers the actual question: "was there
+    speech SOMEWHERE in this clip?"
+
+    Accepts int16 or float32 numpy array; always returns a number in the
+    same scale as float32 in [-1, 1].
+    """
+    if len(audio_np) == 0:
+        return 0.0
+    if audio_np.dtype == np.int16:
+        samples = audio_np.astype(np.float32) / 32768.0
+    else:
+        samples = audio_np.astype(np.float32)
+    window_samples = int(window_ms / 1000.0 * sample_rate)
+    if window_samples < 1 or len(samples) < window_samples:
+        return float(np.sqrt(np.mean(samples ** 2) + 1e-12))
+    max_rms = 0.0
+    hop = max(1, window_samples // 2)
+    for i in range(0, len(samples) - window_samples + 1, hop):
+        w = samples[i:i + window_samples]
+        rms = float(np.sqrt(np.mean(w ** 2) + 1e-12))
+        if rms > max_rms:
+            max_rms = rms
+    return max_rms
+
+
+def trim_trailing_silence(audio_np, sample_rate=16000, threshold_db=-45, tail_ms=500):
     """Trim silence from the end of audio to reduce Whisper end-of-clip hallucinations
     like 'thank you' / 'תודה רבה'. Keeps `tail_ms` of trailing buffer.
 
     Expects float32 or int16 numpy array, mono.
+
+    Tuning: threshold_db=-45 (was -40) keeps quiet/whispered tail speech
+    instead of trimming it as silence. tail_ms=500 (was 150) gives
+    Whisper enough silence after the last word to reliably end-cap the
+    transcription; 150ms occasionally caused Whisper to drop the final
+    word or two because the clip ended too abruptly. 500ms is still well
+    under the threshold for hallucinations (which need ~2s+ of silence).
     """
     if len(audio_np) == 0:
         return audio_np
@@ -4591,12 +4631,15 @@ class WhisperTypeApp:
         # seconds even though recording looks normal. User then gets a
         # Whisper hallucination like "Thank you" and wonders why their
         # speech wasn't transcribed.
-        # Heuristic: if the clip is longer than 1.5s but RMS is near zero,
-        # the mic almost certainly didn't capture real audio. Skip
-        # transcription (it'll just hallucinate) and tell the user clearly.
+        # Heuristic: if the clip is longer than 1.5s but peak RMS over a
+        # sliding 300ms window is near zero, the mic almost certainly
+        # didn't capture real audio. Peak (not mean) because a 2s clip
+        # containing a single "ok" dictated quickly with key held a bit
+        # longer has plenty of audible speech but low mean RMS; peak RMS
+        # correctly identifies "there was speech SOMEWHERE in this clip".
         if duration_sec >= 1.5:
-            audio_rms = float(np.sqrt(np.mean(audio ** 2) + 1e-12))
-            if audio_rms < 0.003:  # ~-50dB — effectively silent
+            audio_rms = audio_peak_rms(audio, sample_rate=16000, window_ms=300)
+            if audio_rms < 0.003:  # ~-50dB peak — effectively silent everywhere
                 self._handle_silent_capture(duration_sec, audio_rms)
                 return
 
