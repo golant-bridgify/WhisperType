@@ -3992,23 +3992,36 @@ class WhisperTypeApp:
                     #     gives the glitch many chances per second to fire.
                     # Without debounce, a 50-second hold cuts off mid-sentence
                     # on the first such blip. Requiring N consecutive "not
-                    # pressed" polls filters single-tick glitches. 150ms
-                    # (3 × 50ms poll interval) is imperceptible as release
-                    # latency but closes the fragility window.
+                    # pressed" polls filters glitches. 500ms (10 × 50ms) is
+                    # sized to cover typical Bluetooth / 2.4GHz wireless
+                    # dropouts (empirically 100-400ms), which is the main
+                    # failure mode we've observed. Release latency goes
+                    # from ~150ms (3 polls) to ~500ms (10 polls) — still
+                    # masked by Groq's ~500-800ms transcription time, so
+                    # not perceptible end-to-end. If wireless is really
+                    # unreliable, push this higher; each +1 adds 50ms.
                     self._start_recording()
-                    RELEASE_DEBOUNCE_POLLS = 3
+                    RELEASE_DEBOUNCE_POLLS = 10
                     release_streak = 0
+                    max_streak_recovered = 0  # longest glitch successfully filtered
                     while True:
                         if all(keyboard.is_pressed(p) for p in parts):
                             if release_streak > 0:
+                                if release_streak > max_streak_recovered:
+                                    max_streak_recovered = release_streak
                                 log.info(
-                                    "Hotkey release-detect: filtered %d transient not-pressed poll(s); chord still held",
-                                    release_streak,
+                                    "Hotkey release-detect: filtered %d transient not-pressed poll(s) (%dms); chord still held",
+                                    release_streak, release_streak * 50,
                                 )
                             release_streak = 0
                         else:
                             release_streak += 1
                             if release_streak >= RELEASE_DEBOUNCE_POLLS:
+                                if max_streak_recovered > 0:
+                                    log.info(
+                                        "Hotkey release-detect: release confirmed (longest filtered glitch during this hold: %dms)",
+                                        max_streak_recovered * 50,
+                                    )
                                 break
                         time.sleep(0.05)
                     self._stop_and_transcribe()
