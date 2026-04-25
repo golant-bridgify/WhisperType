@@ -4032,30 +4032,16 @@ class WhisperTypeApp:
                     #     gives the glitch many chances per second to fire.
                     # Without debounce, a 50-second hold cuts off mid-sentence
                     # on the first such blip. Requiring N consecutive "not
-                    # pressed" polls filters glitches.
-                    #
-                    # Two thresholds, with adaptive escalation:
-                    #   BASE = 20 polls (1000ms) — used by default. Catches
-                    #     typical wireless dropouts (Bluetooth resync, USB
-                    #     receiver wobble) which run 100ms-1000ms.
-                    #   AFTER_GLITCH = 40 polls (2000ms) — if we already
-                    #     filtered a glitch DURING this hold, the link is
-                    #     proving unreliable. Stay conservative for the
-                    #     rest of the hold; a wireless wobble is often
-                    #     followed by a longer dropout as the link
-                    #     struggles to stabilise. Worth the latency to
-                    #     not cut a sentence in half.
-                    # Latency cost: 1000ms typical, 2000ms after a glitch.
-                    # Most of the 1000ms is masked by Groq's ~500-800ms
-                    # transcription that fires once we stop, so end-to-end
-                    # paste latency only nudges up. The 2000ms case is
-                    # noticeable, but rare and a strict improvement over
-                    # losing the tail of the user's sentence.
+                    # pressed" polls filters glitches. 500ms (10 × 50ms)
+                    # is the user-chosen ceiling: it catches the brief
+                    # 50-200ms wireless wobbles (which is what we see most
+                    # of the time) without adding perceptible release
+                    # latency. Wireless dropouts longer than 500ms WILL
+                    # slip through and cut the recording — that's the
+                    # accepted trade-off (priority: fast release).
                     self._start_recording()
-                    RELEASE_DEBOUNCE_POLLS_BASE = 20         # 1000ms
-                    RELEASE_DEBOUNCE_POLLS_AFTER_GLITCH = 40  # 2000ms
+                    RELEASE_DEBOUNCE_POLLS = 10
                     release_streak = 0
-                    threshold = RELEASE_DEBOUNCE_POLLS_BASE
                     max_streak_recovered = 0  # longest glitch successfully filtered
                     while True:
                         if all(keyboard.is_pressed(p) for p in parts):
@@ -4063,19 +4049,17 @@ class WhisperTypeApp:
                                 if release_streak > max_streak_recovered:
                                     max_streak_recovered = release_streak
                                 log.info(
-                                    "Hotkey release-detect: filtered %d transient not-pressed poll(s) (%dms); chord still held — escalating threshold to %dms for rest of hold",
+                                    "Hotkey release-detect: filtered %d transient not-pressed poll(s) (%dms); chord still held",
                                     release_streak, release_streak * 50,
-                                    RELEASE_DEBOUNCE_POLLS_AFTER_GLITCH * 50,
                                 )
-                                threshold = RELEASE_DEBOUNCE_POLLS_AFTER_GLITCH
                             release_streak = 0
                         else:
                             release_streak += 1
-                            if release_streak >= threshold:
+                            if release_streak >= RELEASE_DEBOUNCE_POLLS:
                                 if max_streak_recovered > 0:
                                     log.info(
-                                        "Hotkey release-detect: release confirmed (threshold=%dms, longest filtered glitch during hold: %dms)",
-                                        threshold * 50, max_streak_recovered * 50,
+                                        "Hotkey release-detect: release confirmed (longest filtered glitch during this hold: %dms)",
+                                        max_streak_recovered * 50,
                                     )
                                 break
                         time.sleep(0.05)
