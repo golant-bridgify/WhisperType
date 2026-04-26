@@ -5148,6 +5148,12 @@ class WhisperTypeApp:
                  self.config["recording_source"],
                  self.config.get("input_device_index"),
                  self.config.get("loopback_device_index"))
+        # Clear silent-capture state. The next recording uses a different
+        # mic; any prior "silent" hits were against the OLD device, and
+        # are stale evidence — counting them toward the 2-strike auto-
+        # restart threshold causes the app to spuriously self-restart
+        # while the user is in the middle of switching mics.
+        self._reset_silent_state()
 
     def _toggle_loopback_device(self, device_idx):
         """Click handler for a system audio device: toggle if same, switch if different."""
@@ -5176,12 +5182,29 @@ class WhisperTypeApp:
                  self.config["recording_source"],
                  self.config.get("input_device_index"),
                  self.config.get("loopback_device_index"))
+        # See _toggle_input_device above for rationale.
+        self._reset_silent_state()
+
+    def _reset_silent_state(self):
+        """Clear the silent-capture counter and timestamp.
+
+        Called whenever the user changes audio input. The 2-strike
+        auto-restart logic in _handle_silent_capture is meant to detect
+        a stuck PortAudio cache, NOT user-initiated input changes. If
+        the user just switched mics, any previous silent captures were
+        against a different device and shouldn't count.
+        """
+        self._consecutive_silent = 0
+        self._last_silent_time = 0.0
 
     def _set_input_device(self, device_index):
         self.config["input_device_index"] = device_index
         save_config(self.config)
         # Update the current recorder instance so next recording uses it
         self.recorder.input_device_index = device_index
+        # Mic device changed — clear silent counter so the next recording
+        # starts with a clean slate (see _reset_silent_state for why).
+        self._reset_silent_state()
         if device_index is None:
             log.info("Input device set to: System Default")
         else:
