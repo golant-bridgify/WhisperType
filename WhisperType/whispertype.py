@@ -115,9 +115,11 @@ DEFAULT_CONFIG = {
     "translate_mode": False,  # True = translate to English (Whisper task="translate")
     "model_before_translate": None,  # saved model to restore when translate mode is disabled
     "auto_start": False,  # True = start with Windows
-    "transcription_backend": "local",  # "local" or "groq"
+    "transcription_backend": "local",  # "local" / "groq" / "openai"
     "groq_api_key": "",  # Groq API key (from https://console.groq.com/keys)
     "groq_model": "whisper-large-v3-turbo",  # Groq Whisper model
+    "openai_api_key": "",  # OpenAI API key (from https://platform.openai.com/api-keys)
+    "openai_model": "gpt-4o-transcribe",  # OpenAI model: "gpt-4o-transcribe" / "gpt-4o-mini-transcribe"
     "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
     "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
     "groq_he_en_bias": True,  # True = bias Groq language detection to Hebrew/English only (prevents false French/etc. detection)
@@ -1836,6 +1838,294 @@ class GroqTranscriber(BaseTranscriber):
 
 
 # ============================================================
+# OpenAI cloud transcription
+# ============================================================
+class OpenAITranscriber(BaseTranscriber):
+    """Cloud transcription via OpenAI's audio API.
+
+    Same OpenAI-compatible HTTP shape as GroqTranscriber. Supports
+    `gpt-4o-transcribe` (best accuracy, GPT-4o backbone), the cheaper
+    `gpt-4o-mini-transcribe`, and the legacy `whisper-1` (Whisper v2 —
+    a regression vs Groq's v3-turbo, exposed only for completeness).
+
+    Differences from GroqTranscriber:
+      - `gpt-4o-transcribe` and `gpt-4o-mini-transcribe` only return
+        `json` or `text`, NOT `verbose_json`. So we cannot do the
+        log-prob arbitration trick used in Groq's he/en fallback.
+        We rely on the bias prompt + post-hoc Unicode-script check
+        to keep output in {he, en} when bias is on.
+      - `/translations` only supports `whisper-1`, same as Groq's
+        constraint (translations endpoint accepts a fixed model).
+    """
+    TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
+    TRANSLATE_URL = "https://api.openai.com/v1/audio/translations"
+
+    HE_EN_BIAS_PROMPT = (
+        "Bilingual transcription in Hebrew or English only. "
+        "שלום, תודה רבה, איך הולך, מחשב, פגישה. "
+        "Hello, thank you, how are you, meeting, computer, project."
+    )
+
+    # Models that do NOT support response_format=verbose_json:
+    _NO_VERBOSE_JSON_MODELS = {"gpt-4o-transcribe", "gpt-4o-mini-transcribe"}
+
+    def __init__(self, model_size="gpt-4o-transcribe", api_key=""):
+        super().__init__(model_size=model_size, cpu_threads=0)
+        self.api_key = api_key
+        self.he_en_bias = True
+        self.custom_vocabulary = ""
+
+    def _build_bias_prompt(self, include_he_en=True):
+        parts = []
+        if self.custom_vocabulary and self.custom_vocabulary.strip():
+            parts.append(f"Common terms: {self.custom_vocabulary.strip()}.")
+        if include_he_en and self.he_en_bias:
+            parts.append(self.HE_EN_BIAS_PROMPT)
+        return " ".join(parts) if parts else None
+
+    def load_model(self, callback=None):
+        if not self.api_key:
+            if callback:
+                callback("Missing OpenAI API key")
+            raise RuntimeError("OpenAI API key not set — configure via tray menu")
+        self.model = "openai_ready"
+        if callback:
+            callback("OpenAI ready (cloud)")
+
+    def verify_key(self, timeout=10):
+        """Light /models GET to confirm the API key is valid."""
+        if not self.api_key:
+            return False, "No API key"
+        try:
+            import requests
+        except ImportError as e:
+            return False, f"'requests' not installed: {e}"
+        try:
+            log.info("OpenAI verify_key: GET /models (timeout=%s)", timeout)
+            r = requests.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=(5, timeout),
+            )
+            log.info("OpenAI verify_key: HTTP %d", r.status_code)
+            if r.status_code == 200:
+                return True, "Key valid"
+            if r.status_code == 401:
+                return False, "Invalid API key"
+            return False, f"HTTP {r.status_code}: {r.text[:80]}"
+        except requests.exceptions.Timeout:
+            return False, "Network timeout — check internet"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"Cannot reach OpenAI: {type(e).__name__}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _audio_to_wav_bytes(self, audio_np):
+        if audio_np.dtype == np.float32:
+            samples = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+        else:
+            samples = audio_np.astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(samples.tobytes())
+        buf.seek(0)
+        return buf
+
+    def _post(self, url, files, data, timeout=30):
+        import requests
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+        if response.status_code == 401:
+            raise RuntimeError("Invalid OpenAI API key")
+        if response.status_code == 429:
+            raise RuntimeError("OpenAI rate limit exceeded")
+        response.raise_for_status()
+        return response.text.strip()
+
+    def _extract_text(self, raw_response, response_format):
+        """Pull plain text out of /transcriptions response.
+
+        gpt-4o-transcribe returns JSON {"text": "..."}. whisper-1 with
+        response_format=text returns the text directly.
+        """
+        raw = raw_response.strip()
+        if response_format == "text":
+            return raw
+        try:
+            body = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return raw
+        return (body.get("text") or "").strip()
+
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+        if self.model is None:
+            raise RuntimeError("OpenAI transcriber not initialized")
+        if len(audio_np) == 0:
+            return ""
+
+        orig_len = len(audio_np)
+        audio_np = trim_trailing_silence(audio_np, sample_rate=16000)
+        if len(audio_np) < orig_len:
+            log.info("OpenAI: trimmed %d samples of trailing silence", orig_len - len(audio_np))
+
+        duration = len(audio_np) / 16000.0
+        http_timeout = max(30, int(duration * 3) + 10)
+
+        # Translation endpoint: only whisper-1 supports it.
+        if task == "translate":
+            wav_buf = self._audio_to_wav_bytes(audio_np)
+            files = {"file": ("audio.wav", wav_buf, "audio/wav")}
+            data = {"model": "whisper-1", "response_format": "text"}
+            bias = self._build_bias_prompt()
+            if bias:
+                data["prompt"] = bias
+            log.info("OpenAI translate: model=whisper-1 bias=%s vocab=%s",
+                     self.he_en_bias, bool(self.custom_vocabulary))
+            text = self._post(self.TRANSLATE_URL, files, data, timeout=http_timeout)
+            return strip_hallucinated_tail(text) if text else ""
+
+        # Transcription. Pick response format based on model capability.
+        # gpt-4o-* return JSON only; whisper-1 supports text.
+        use_json = self.model_size in self._NO_VERBOSE_JSON_MODELS
+        response_format = "json" if use_json else "text"
+
+        wav_buf = self._audio_to_wav_bytes(audio_np)
+        files = {"file": ("audio.wav", wav_buf, "audio/wav")}
+        data = {"model": self.model_size, "response_format": response_format}
+
+        forced_lang = language if language and language != "auto" else None
+        if forced_lang:
+            data["language"] = forced_lang
+            if self.custom_vocabulary and self.custom_vocabulary.strip():
+                data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
+        else:
+            bias = self._build_bias_prompt()
+            if bias:
+                data["prompt"] = bias
+
+        log.info("OpenAI transcribe: model=%s lang=%s bias=%s vocab=%s",
+                 self.model_size, forced_lang or "auto",
+                 self.he_en_bias, bool(self.custom_vocabulary))
+        raw = self._post(self.TRANSCRIBE_URL, files, data, timeout=http_timeout)
+        text = self._extract_text(raw, response_format)
+        if not text:
+            return ""
+
+        text = strip_hallucinated_tail(text)
+        if not text:
+            return ""
+
+        # Post-hoc language sanity: if bias is on and the output contains
+        # confident non-Hebrew/non-Latin script (Arabic, Cyrillic, Greek,
+        # CJK, etc.), fall back to a forced he/en retry. Skip this if the
+        # user explicitly forced a language (they get what they asked for).
+        if self.he_en_bias and not forced_lang and self._has_unexpected_script(text):
+            log.warning("OpenAI: output contains non-he/non-en script — retrying with language=he")
+            try:
+                retry_text = self._retry_with_forced_language(audio_np, http_timeout)
+                if retry_text:
+                    text = retry_text
+            except Exception as e:
+                log.warning("OpenAI he-retry failed (%s); keeping original", e)
+
+        # RTL marker
+        rtl_langs = {"he", "ar", "fa", "ur", "yi"}
+        if forced_lang:
+            is_rtl = forced_lang in rtl_langs
+        else:
+            is_rtl = any(
+                '֐' <= c <= '׿' or
+                '؀' <= c <= 'ۿ' or
+                'יִ' <= c <= '﷿' or
+                'ﹰ' <= c <= '﻿'
+                for c in text
+            )
+        if is_rtl:
+            text = '‏' + text
+        return text
+
+    @staticmethod
+    def _has_unexpected_script(text):
+        """True if `text` has confident non-Hebrew, non-Latin script.
+
+        Hebrew (U+0590-U+05FF), Latin (basic + extended), digits,
+        whitespace, punctuation are all OK. Arabic, Cyrillic, Greek,
+        CJK, Devanagari, etc. flag a probable language mis-detection.
+        """
+        unexpected = 0
+        for ch in text:
+            cp = ord(ch)
+            # Hebrew block
+            if 0x0590 <= cp <= 0x05FF:
+                continue
+            # Basic Latin + Latin-1 Supplement + Latin Extended-A/B
+            if cp <= 0x024F:
+                continue
+            # Common punctuation, symbols, whitespace
+            if cp <= 0x036F:
+                continue
+            unexpected += 1
+        # Require at least 3 unexpected chars to avoid flagging on a
+        # single emoji or stray symbol.
+        return unexpected >= 3
+
+    def _retry_with_forced_language(self, audio_np, timeout):
+        """Single-call retry forcing language=he.
+
+        Used when post-hoc script detection found probable mis-detection.
+        Hebrew is the higher-prior bet for this user; if the audio was
+        actually English, the bias prompt's English samples and gpt-4o's
+        own language priors usually rescue it.
+        """
+        wav_buf = self._audio_to_wav_bytes(audio_np)
+        files = {"file": ("audio.wav", wav_buf, "audio/wav")}
+        use_json = self.model_size in self._NO_VERBOSE_JSON_MODELS
+        response_format = "json" if use_json else "text"
+        data = {
+            "model": self.model_size,
+            "response_format": response_format,
+            "language": "he",
+        }
+        if self.custom_vocabulary and self.custom_vocabulary.strip():
+            data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
+        raw = self._post(self.TRANSCRIBE_URL, files, data, timeout=timeout)
+        retry = self._extract_text(raw, response_format)
+        return strip_hallucinated_tail(retry) if retry else ""
+
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
+        if self.model is None:
+            raise RuntimeError("OpenAI transcriber not initialized")
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+            if task == "translate":
+                url = self.TRANSLATE_URL
+                data = {"model": "whisper-1", "response_format": "text"}
+                bias = self._build_bias_prompt()
+                if bias:
+                    data["prompt"] = bias
+            else:
+                url = self.TRANSCRIBE_URL
+                use_json = self.model_size in self._NO_VERBOSE_JSON_MODELS
+                response_format = "json" if use_json else "text"
+                data = {"model": self.model_size, "response_format": response_format}
+                if language and language != "auto":
+                    data["language"] = language
+                    if self.custom_vocabulary and self.custom_vocabulary.strip():
+                        data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
+                else:
+                    bias = self._build_bias_prompt()
+                    if bias:
+                        data["prompt"] = bias
+            raw = self._post(url, files, data, timeout=120)
+            if task == "translate":
+                return raw
+            return self._extract_text(raw, response_format)
+
+
+# ============================================================
 # Groq LLM Cleanup — post-process raw Whisper output
 # ============================================================
 class GroqLLMCleaner:
@@ -3475,9 +3765,12 @@ class WhisperTypeApp:
         # biases Whisper toward the user's terms.
         self._local_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
 
-        # Initialize Groq transcriber if backend is groq and API key is set
+        # Initialize Groq transcriber if a Groq API key is set. We
+        # construct it whenever the key exists (not only when groq is
+        # the active backend) so the backend toggle can flip without a
+        # restart.
         self._groq_transcriber = None
-        if self.config.get("transcription_backend") == "groq" and self.config.get("groq_api_key"):
+        if self.config.get("groq_api_key"):
             self._groq_transcriber = GroqTranscriber(
                 model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
                 api_key=self.config["groq_api_key"],
@@ -3485,9 +3778,20 @@ class WhisperTypeApp:
             self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
             self._groq_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
 
-        # LLM cleanup uses the same Groq API key. Initialised whenever a
+        # Initialize OpenAI transcriber if an OpenAI API key is set.
+        self._openai_transcriber = None
+        if self.config.get("openai_api_key"):
+            self._openai_transcriber = OpenAITranscriber(
+                model_size=self.config.get("openai_model", "gpt-4o-transcribe"),
+                api_key=self.config["openai_api_key"],
+            )
+            # OpenAI shares the bias toggle with Groq — same intent.
+            self._openai_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            self._openai_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+
+        # LLM cleanup uses the Groq API key. Initialised whenever a
         # key is present, regardless of which transcription backend is
-        # active — so a user on local Whisper can still get cloud cleanup.
+        # active — so a user on OpenAI/local can still get Groq cleanup.
         self._llm_cleaner = None
         if self.config.get("groq_api_key"):
             self._llm_cleaner = GroqLLMCleaner(
@@ -3496,12 +3800,15 @@ class WhisperTypeApp:
             )
 
         # Pick primary transcriber based on backend setting
-        if self._groq_transcriber is not None:
+        backend = self.config.get("transcription_backend", "local")
+        if backend == "openai" and self._openai_transcriber is not None:
+            self.transcriber = self._openai_transcriber
+        elif backend == "groq" and self._groq_transcriber is not None:
             self.transcriber = self._groq_transcriber
         else:
             self.transcriber = self._local_transcriber
-            if self.config.get("transcription_backend") == "groq":
-                log.warning("Groq backend selected but no API key — falling back to local")
+            if backend in ("groq", "openai"):
+                log.warning("%s backend selected but no API key — falling back to local", backend)
                 self.config["transcription_backend"] = "local"
                 save_config(self.config)
 
@@ -3653,6 +3960,7 @@ class WhisperTypeApp:
                     ),
                     pystray.MenuItem("History", lambda: self._show_history()),
                     pystray.MenuItem("Set Groq API Key...", lambda: self._set_groq_api_key()),
+                    pystray.MenuItem("Set OpenAI API Key...", lambda: self._set_openai_api_key()),
                     pystray.Menu.SEPARATOR,
                     pystray.MenuItem(
                         "Start with Windows",
@@ -3859,20 +4167,26 @@ class WhisperTypeApp:
             model_label = MODELS.get(self.config["model_size"], self.config["model_size"])
             self.overlay.show(f"  🔄  Loading: {model_label}  ", bg_color="#1e64c8")
 
-            groq_is_primary = (
-                self.config.get("transcription_backend") == "groq"
-                and self._groq_transcriber is not None
-            )
-            if groq_is_primary:
-                # Groq is primary: validate it (fast HTTP call), mark ready,
+            backend = self.config.get("transcription_backend")
+            cloud_primary_transcriber = None
+            cloud_primary_label = None
+            if backend == "groq" and self._groq_transcriber is not None:
+                cloud_primary_transcriber = self._groq_transcriber
+                cloud_primary_label = "Groq"
+            elif backend == "openai" and self._openai_transcriber is not None:
+                cloud_primary_transcriber = self._openai_transcriber
+                cloud_primary_label = "OpenAI"
+
+            if cloud_primary_transcriber is not None:
+                # Cloud is primary: validate it (fast HTTP call), mark ready,
                 # and load local in the background as a fallback. Previously
                 # we blocked startup on a ~1.5GB local-model read even when
-                # the user only uses Groq, which kept the tray blue for many
+                # the user only uses cloud, which kept the tray blue for many
                 # seconds on every restart.
-                self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
+                cloud_primary_transcriber.load_model(callback=lambda msg: log.info(msg))
                 self.model_loaded = True
                 self.status_text = "Ready"
-                log.info("Groq ready. Loading local fallback in background...")
+                log.info("%s ready. Loading local fallback in background...", cloud_primary_label)
                 if self.tray_icon:
                     self.tray_icon.icon = self._create_icon("idle")
                     self.tray_icon.title = "WhisperType — Ready"
@@ -3883,17 +4197,15 @@ class WhisperTypeApp:
                         self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
                         log.info("Local fallback loaded.")
                     except Exception as bg_e:
-                        log.warning("Local fallback load failed (Groq-only mode): %s", bg_e)
+                        log.warning("Local fallback load failed (cloud-only mode): %s", bg_e)
                     finally:
-                        # Set the event either way — waiters in the fallback
-                        # path re-check `_local_transcriber.model` themselves.
                         self._local_load_event.set()
 
                 threading.Thread(target=_load_local_bg, daemon=True).start()
                 return
 
-            # Local is primary: load it synchronously. Also validate Groq
-            # (if present) so the cleanup LLM path is ready — cheap HTTP call.
+            # Local is primary: load it synchronously. Also validate any
+            # cloud key so the cleanup LLM / cloud-on-toggle is ready.
             self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
             self._local_load_event.set()
             if self._groq_transcriber is not None:
@@ -3901,6 +4213,11 @@ class WhisperTypeApp:
                     self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
                 except Exception as groq_e:
                     log.warning("Groq validation failed (local-primary mode): %s", groq_e)
+            if self._openai_transcriber is not None:
+                try:
+                    self._openai_transcriber.load_model(callback=lambda msg: log.info(msg))
+                except Exception as openai_e:
+                    log.warning("OpenAI validation failed (local-primary mode): %s", openai_e)
 
             self.model_loaded = True
             self.status_text = "Ready"
@@ -4184,8 +4501,8 @@ class WhisperTypeApp:
             self._streaming_thread.start()
         else:
             self._streaming_thread = None
-            if backend == "groq":
-                log.info("Groq backend: skipping streaming worker (single transcription on stop)")
+            if backend in ("groq", "openai"):
+                log.info("%s backend: skipping streaming worker (single transcription on stop)", backend)
 
         # Start waveform visualization updater
         self._waveform_thread = threading.Thread(
@@ -5286,55 +5603,85 @@ class WhisperTypeApp:
         labels = {"off": "Off", "preview": "Preview", "live_dictation": "Live Dictation"}
         log.info("Streaming mode set to: %s", labels.get(mode, mode))
 
-    # Model menu: (label, model_size, backend, translate)
-    # model_size for Groq is the local fallback model that also determines the language hint.
-    _MENU_MODELS = [
-        ("Hebrew Turbo Local", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False),
-        ("English Distil Local", "distil-large-v3", "local", False),
-        ("General Turbo Local", "large-v3-turbo", "local", False),
-        ("Groq Turbo", "large-v3-turbo", "groq", False),
-        ("Groq Hebrew to English", "large-v3-turbo", "groq", True),
+    # Static base of the Model menu. OpenAI options are appended only when
+    # an OpenAI key is configured (see _build_model_menu).
+    # Tuple shape: (label, model_size, backend, translate, openai_model)
+    # `openai_model` is the openai_model config value to set; "" for non-OpenAI rows.
+    _MENU_MODELS_BASE = [
+        ("Hebrew Turbo Local", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
+        ("English Distil Local", "distil-large-v3", "local", False, ""),
+        ("General Turbo Local", "large-v3-turbo", "local", False, ""),
+        ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
+        ("Groq Hebrew to English", "large-v3-turbo", "groq", True, ""),
+    ]
+
+    _MENU_MODELS_OPENAI = [
+        # (label, model_size for local fallback, backend, translate, openai_model)
+        ("OpenAI gpt-4o-transcribe ⭐ (best)", "large-v3-turbo", "openai", False, "gpt-4o-transcribe"),
+        ("OpenAI gpt-4o-mini-transcribe (fast/cheap)", "large-v3-turbo", "openai", False, "gpt-4o-mini-transcribe"),
     ]
 
     def _build_model_menu(self):
-        """Build the Model menu with 5 options including 'Groq Hebrew to English'."""
+        """Build the Model menu, including OpenAI rows only if a key is set."""
         import pystray
-        return [
-            pystray.MenuItem(
+        rows = list(self._MENU_MODELS_BASE)
+        if (self.config.get("openai_api_key") or "").strip():
+            rows = rows + list(self._MENU_MODELS_OPENAI)
+        items = []
+        for label, model_id, backend, translate, openai_model in rows:
+            items.append(pystray.MenuItem(
                 label,
-                (lambda m, b, t: lambda: self._set_model_backend_translate(m, b, t))(model_id, backend, translate),
-                checked=(lambda m, b, t: lambda item:
+                (lambda m, b, t, om:
+                    lambda: self._set_model_backend_translate(m, b, t, om))
+                    (model_id, backend, translate, openai_model),
+                checked=(lambda m, b, t, om: lambda item:
                          self.config.get("model_size") == m
                          and self.config.get("transcription_backend", "local") == b
-                         and bool(self.config.get("translate_mode", False)) == t)(model_id, backend, translate),
+                         and bool(self.config.get("translate_mode", False)) == t
+                         and (b != "openai"
+                              or self.config.get("openai_model", "gpt-4o-transcribe") == om))
+                         (model_id, backend, translate, openai_model),
                 radio=True,
-            )
-            for label, model_id, backend, translate in self._MENU_MODELS
-        ]
+            ))
+        return items
 
-    def _set_model_backend_translate(self, model, backend, translate):
-        """Set model, backend, and translate mode atomically from the unified Model menu."""
+    def _set_model_backend_translate(self, model, backend, translate, openai_model=""):
+        """Set model, backend, translate mode, and (for OpenAI) the OpenAI model
+        atomically from the unified Model menu."""
         current_model = self.config.get("model_size")
         current_backend = self.config.get("transcription_backend", "local")
         current_translate = bool(self.config.get("translate_mode", False))
-        if current_model == model and current_backend == backend and current_translate == translate:
+        current_openai_model = self.config.get("openai_model", "gpt-4o-transcribe")
+        same_openai = (backend != "openai") or (current_openai_model == openai_model)
+        if (current_model == model and current_backend == backend
+                and current_translate == translate and same_openai):
             return
-        # Switching to Groq: make sure we have an API key first
-        if backend == "groq":
-            api_key = self.config.get("groq_api_key", "").strip()
-            if not api_key:
-                log.warning("Groq selected but no API key — opening key dialog")
-                self.overlay.show_error("Set Groq API key first")
-                self._set_groq_api_key()
-                return
+        # API-key guards
+        if backend == "groq" and not self.config.get("groq_api_key", "").strip():
+            log.warning("Groq selected but no API key — opening key dialog")
+            self.overlay.show_error("Set Groq API key first")
+            self._set_groq_api_key()
+            return
+        if backend == "openai" and not self.config.get("openai_api_key", "").strip():
+            log.warning("OpenAI selected but no API key — opening key dialog")
+            self.overlay.show_error("Set OpenAI API key first")
+            self._set_openai_api_key()
+            return
         # Update translate mode
         if current_translate != translate:
             self.config["translate_mode"] = translate
             save_config(self.config)
             log.info("Translate mode: %s", "ON" if translate else "OFF")
-        # Update model (always, for both fallback and language hint)
+        # Update model_size (always — used for local fallback + language hint)
         if current_model != model:
             self._set_model(model)
+        # If switching OpenAI sub-model, update config and the live transcriber
+        if backend == "openai" and openai_model and current_openai_model != openai_model:
+            self.config["openai_model"] = openai_model
+            save_config(self.config)
+            if self._openai_transcriber is not None:
+                self._openai_transcriber.model_size = openai_model
+            log.info("OpenAI model: %s", openai_model)
         # Then switch backend
         if current_backend != backend:
             self._set_backend(backend)
@@ -5599,7 +5946,9 @@ class WhisperTypeApp:
         save_config(self.config)
         if self._groq_transcriber is not None:
             self._groq_transcriber.he_en_bias = new_value
-        log.info("Groq he/en bias: %s", "ON" if new_value else "OFF")
+        if self._openai_transcriber is not None:
+            self._openai_transcriber.he_en_bias = new_value
+        log.info("he/en bias: %s", "ON" if new_value else "OFF")
 
     # ----- AI Cleanup menu -----
     CLEANUP_MENU_STYLES = [
@@ -5978,6 +6327,11 @@ class WhisperTypeApp:
                         self._groq_transcriber.custom_vocabulary = new_vocab
                     except Exception:
                         pass
+                if self._openai_transcriber:
+                    try:
+                        self._openai_transcriber.custom_vocabulary = new_vocab
+                    except Exception:
+                        pass
                 log.info("Custom vocabulary saved (%d chars)", len(new_vocab))
                 status.config(text=f"Saved ({len(new_vocab)} chars). "
                                    "Active on next recording.", fg="#a6e3a1")
@@ -6018,7 +6372,7 @@ class WhisperTypeApp:
         log.info("Silent mode: %s", "ON" if new_value else "OFF")
 
     def _set_backend(self, backend):
-        """Switch between local and Groq transcription backends."""
+        """Switch between local, Groq, and OpenAI transcription backends."""
         if backend == self.config.get("transcription_backend", "local"):
             return
 
@@ -6029,13 +6383,13 @@ class WhisperTypeApp:
                 self.overlay.show_error("Set Groq API key first")
                 self._set_groq_api_key()
                 return
-            # Create Groq transcriber if not yet created
             if self._groq_transcriber is None:
                 self._groq_transcriber = GroqTranscriber(
                     model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
                     api_key=api_key,
                 )
                 self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+                self._groq_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
                 try:
                     self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
                 except Exception as e:
@@ -6045,10 +6399,33 @@ class WhisperTypeApp:
                     return
             self.transcriber = self._groq_transcriber
             log.info("Transcription backend: Groq Cloud")
+        elif backend == "openai":
+            api_key = self.config.get("openai_api_key", "").strip()
+            if not api_key:
+                log.warning("OpenAI selected but no API key — opening key dialog")
+                self.overlay.show_error("Set OpenAI API key first")
+                self._set_openai_api_key()
+                return
+            if self._openai_transcriber is None:
+                self._openai_transcriber = OpenAITranscriber(
+                    model_size=self.config.get("openai_model", "gpt-4o-transcribe"),
+                    api_key=api_key,
+                )
+                self._openai_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+                self._openai_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+                try:
+                    self._openai_transcriber.load_model(callback=lambda msg: log.info(msg))
+                except Exception as e:
+                    log.error("Failed to init OpenAI: %s", e)
+                    self.overlay.show_error("OpenAI init failed")
+                    self._openai_transcriber = None
+                    return
+            self.transcriber = self._openai_transcriber
+            log.info("Transcription backend: OpenAI Cloud")
         else:
             self.transcriber = self._local_transcriber
             log.info("Transcription backend: Local")
-            # Groq-primary startup loads local lazily, so on switch-to-local
+            # Cloud-primary startup loads local lazily, so on switch-to-local
             # the model may still be None. Kick off a load now so the next
             # press doesn't raise "Model not loaded".
             if self._local_transcriber.model is None and not self._local_transcriber._loading:
@@ -6385,6 +6762,298 @@ class WhisperTypeApp:
             # Focus the entry (on top without -topmost which fights clipboard focus)
             root.after(100, lambda: (root.lift(), entry.focus_force()))
 
+            root.mainloop()
+
+        threading.Thread(target=open_dialog, daemon=True).start()
+
+    def _set_openai_api_key(self):
+        """Open a Tkinter dialog to enter/update the OpenAI API key (with paste + live validation)."""
+        def open_dialog():
+            import tkinter as tk
+
+            root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
+            root.title("OpenAI API Key")
+            root.configure(bg="#1e1e2e")
+            root.resizable(False, False)
+
+            W, H = 560, 340
+            root.update_idletasks()
+            x = (root.winfo_screenwidth() - W) // 2
+            y = (root.winfo_screenheight() - H) // 2
+            root.geometry(f"{W}x{H}+{x}+{y}")
+
+            current = self.config.get("openai_api_key", "")
+            masked = (current[:8] + "..." + current[-4:]) if len(current) > 12 else "(not set)"
+
+            tk.Label(root, text="OpenAI API Key",
+                     font=("Segoe UI", 14, "bold"),
+                     fg="#cdd6f4", bg="#1e1e2e").pack(pady=(15, 5))
+
+            info_text = f"Get one at: https://platform.openai.com/api-keys\nCurrent: {masked}"
+            tk.Label(root, text=info_text,
+                     font=("Segoe UI", 9),
+                     fg="#a6adc8", bg="#1e1e2e", justify="left").pack(pady=(0, 10))
+
+            entry_frame = tk.Frame(root, bg="#1e1e2e")
+            entry_frame.pack(padx=20, pady=5, fill="x")
+
+            entry_var = tk.StringVar()
+            entry = tk.Entry(entry_frame, textvariable=entry_var,
+                             font=("Consolas", 11),
+                             bg="#313244", fg="#cdd6f4",
+                             insertbackground="#cdd6f4",
+                             relief="flat", bd=5, show='*')
+            entry.pack(side="left", fill="x", expand=True, ipady=6)
+
+            shown = {"on": False}
+            def toggle_show():
+                shown["on"] = not shown["on"]
+                entry.config(show='' if shown["on"] else '*')
+                show_btn.config(text=("Hide" if shown["on"] else "Show"))
+            show_btn = tk.Button(entry_frame, text="Show", command=toggle_show,
+                                 font=("Segoe UI", 9), bg="#45475a", fg="#cdd6f4",
+                                 activebackground="#585b70", activeforeground="#cdd6f4",
+                                 relief="flat", bd=0, padx=12, pady=4, cursor="hand2")
+            show_btn.pack(side="left", padx=(8, 0))
+
+            def refresh_length():
+                try:
+                    k = entry.get()
+                    length_label.config(
+                        text=f"Key length: {len(k)} chars" if k else "",
+                        fg="#a6adc8",
+                    )
+                except Exception:
+                    pass
+
+            def read_clipboard_safe():
+                try:
+                    import pyperclip
+                    return pyperclip.paste() or ""
+                except Exception as e:
+                    log.warning("pyperclip.paste failed: %s", e)
+                try:
+                    return root.clipboard_get()
+                except tk.TclError:
+                    return ""
+                except Exception as e:
+                    log.warning("clipboard_get failed: %s", e)
+                    return ""
+
+            def do_paste_replace():
+                try:
+                    clip = read_clipboard_safe()
+                    if clip:
+                        text = clip.strip()
+                        entry.delete(0, "end")
+                        entry.insert(0, text)
+                        entry.icursor("end")
+                        refresh_length()
+                        status_label.config(text=f"Pasted {len(text)} chars from clipboard", fg="#a6e3a1")
+                    else:
+                        status_label.config(text="Clipboard is empty", fg="#f9e2af")
+                except Exception as e:
+                    log.error("Paste failed: %s", e)
+                    try:
+                        status_label.config(text=f"Paste failed: {e}", fg="#f38ba8")
+                    except Exception:
+                        pass
+
+            def do_paste_insert(event=None):
+                try:
+                    clip = read_clipboard_safe()
+                    if clip:
+                        try:
+                            if entry.selection_present():
+                                entry.delete("sel.first", "sel.last")
+                        except tk.TclError:
+                            pass
+                        entry.insert("insert", clip)
+                        refresh_length()
+                except Exception as e:
+                    log.error("Paste insert failed: %s", e)
+                return "break"
+
+            entry.bind("<KeyRelease>", lambda e: refresh_length())
+
+            def do_select_all(event=None):
+                entry.select_range(0, "end")
+                entry.icursor("end")
+                return "break"
+
+            entry.bind("<Control-v>", do_paste_insert)
+            entry.bind("<Control-V>", do_paste_insert)
+            entry.bind("<Shift-Insert>", do_paste_insert)
+            entry.bind("<Control-a>", do_select_all)
+            entry.bind("<Control-A>", do_select_all)
+
+            ctx_menu = tk.Menu(root, tearoff=0)
+            ctx_menu.add_command(label="Paste", command=do_paste_insert)
+            ctx_menu.add_command(label="Select All", command=do_select_all)
+            entry.bind("<Button-3>", lambda e: ctx_menu.tk_popup(e.x_root, e.y_root))
+
+            def make_btn(parent, text, cmd, bg, hover_bg, fg="#1e1e2e"):
+                b = tk.Button(parent, text=text, command=cmd,
+                              font=("Segoe UI", 10, "bold"),
+                              bg=bg, fg=fg,
+                              activebackground=hover_bg, activeforeground=fg,
+                              relief="flat", bd=0, padx=15, pady=6, cursor="hand2")
+                b.bind("<Enter>", lambda e: b.config(bg=hover_bg))
+                b.bind("<Leave>", lambda e: b.config(bg=bg))
+                return b
+
+            paste_btn_frame = tk.Frame(root, bg="#1e1e2e")
+            paste_btn_frame.pack(pady=(8, 0))
+            make_btn(paste_btn_frame, "Paste from Clipboard",
+                     do_paste_replace, "#89b4fa", "#74c7ec").pack()
+
+            length_label = tk.Label(root, text="",
+                                    font=("Segoe UI", 9),
+                                    fg="#a6adc8", bg="#1e1e2e")
+            length_label.pack(pady=(4, 0))
+
+            status_label = tk.Label(root, text="",
+                                    font=("Segoe UI", 9),
+                                    fg="#a6adc8", bg="#1e1e2e")
+            status_label.pack(pady=(6, 0))
+
+            def on_cancel():
+                root.destroy()
+
+            def on_clear():
+                self.config["openai_api_key"] = ""
+                self._openai_transcriber = None
+                if self.config.get("transcription_backend") == "openai":
+                    self.transcriber = self._local_transcriber
+                    self.config["transcription_backend"] = "local"
+                save_config(self.config)
+                log.info("OpenAI API key cleared")
+                status_label.config(text="Key cleared. Backend: Local.", fg="#a6adc8")
+                root.after(800, root.destroy)
+
+            verifying_flag = {"busy": False}
+
+            def on_save_verify():
+                try:
+                    _do_save_verify()
+                except Exception as e:
+                    log.exception("on_save_verify (openai) crashed: %s", e)
+                    try:
+                        status_label.config(text=f"Internal error: {e}", fg="#f38ba8")
+                    except Exception:
+                        pass
+
+            def _do_save_verify():
+                if verifying_flag["busy"]:
+                    return
+                new_key = (entry.get() or entry_var.get()).strip()
+                log.info("OpenAI Save & Verify clicked; key length=%d", len(new_key))
+                if not new_key:
+                    status_label.config(text="Enter a key first (or click Clear Key).", fg="#f9e2af")
+                    return
+
+                status_label.config(text="Verifying with OpenAI (up to 10s)...", fg="#89b4fa")
+                verifying_flag["busy"] = True
+                try:
+                    save_btn.config(state="disabled")
+                    clear_btn.config(state="disabled")
+                except NameError:
+                    pass
+
+                result_state = {"done": False, "ok": None, "msg": None, "openai": None}
+
+                def finish_ui():
+                    if not result_state["done"]:
+                        return
+                    try:
+                        save_btn.config(state="normal")
+                        clear_btn.config(state="normal")
+                        verifying_flag["busy"] = False
+                    except tk.TclError:
+                        return
+
+                    ok = result_state["ok"]
+                    msg = result_state["msg"]
+                    openai = result_state["openai"]
+
+                    if not ok:
+                        log.error("OpenAI key invalid: %s", msg)
+                        status_label.config(text=f"{msg}", fg="#f38ba8")
+                        return
+                    try:
+                        openai.load_model(callback=lambda m: log.info(m))
+                    except Exception as e:
+                        log.error("OpenAI load_model failed: %s", e)
+                    openai.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+                    openai.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+                    self.config["openai_api_key"] = new_key
+                    self._openai_transcriber = openai
+                    self.transcriber = openai
+                    self.config["transcription_backend"] = "openai"
+                    save_config(self.config)
+                    log.info("OpenAI API key saved & activated")
+                    status_label.config(text="Key valid. Switched to OpenAI Cloud.", fg="#a6e3a1")
+                    try:
+                        self.overlay.show_done()
+                    except Exception:
+                        pass
+                    root.after(1000, root.destroy)
+
+                def worker():
+                    try:
+                        openai = OpenAITranscriber(
+                            model_size=self.config.get("openai_model", "gpt-4o-transcribe"),
+                            api_key=new_key,
+                        )
+                        ok, msg = openai.verify_key(timeout=10)
+                    except Exception as e:
+                        log.error("OpenAI worker exception: %s", e)
+                        ok, msg, openai = False, f"Error: {e}", None
+                    result_state["ok"] = ok
+                    result_state["msg"] = msg
+                    result_state["openai"] = openai
+                    result_state["done"] = True
+
+                def poll():
+                    if result_state["done"]:
+                        finish_ui()
+                        return
+                    try:
+                        root.after(200, poll)
+                    except tk.TclError:
+                        pass
+
+                def watchdog():
+                    if not result_state["done"]:
+                        log.warning("OpenAI verify watchdog: worker did not finish in 20s")
+                        result_state["ok"] = False
+                        result_state["msg"] = "Timed out after 20s — check internet/firewall"
+                        result_state["openai"] = None
+                        result_state["done"] = True
+
+                threading.Thread(target=worker, daemon=True).start()
+                root.after(200, poll)
+                root.after(20000, watchdog)
+
+            btn_frame = tk.Frame(root, bg="#1e1e2e")
+            btn_frame.pack(pady=(10, 15))
+
+            save_btn = make_btn(btn_frame, "Save & Verify", on_save_verify,
+                                "#a6e3a1", "#94e2d5")
+            save_btn.pack(side="left", padx=5)
+            clear_btn = make_btn(btn_frame, "Clear Key", on_clear,
+                                 "#fab387", "#f9e2af")
+            clear_btn.pack(side="left", padx=5)
+            cancel_btn = make_btn(btn_frame, "Cancel", on_cancel,
+                                  "#f38ba8", "#eba0ac")
+            cancel_btn.pack(side="left", padx=5)
+
+            root.bind("<Return>", lambda e: on_save_verify())
+            root.bind("<Escape>", lambda e: on_cancel())
+            root.protocol("WM_DELETE_WINDOW", on_cancel)
+
+            root.after(100, lambda: (root.lift(), entry.focus_force()))
             root.mainloop()
 
         threading.Thread(target=open_dialog, daemon=True).start()
