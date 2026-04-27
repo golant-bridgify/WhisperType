@@ -6448,7 +6448,7 @@ class WhisperTypeApp:
             root.resizable(False, False)
 
             # Center the window
-            W, H = 560, 340
+            W, H = 560, 420
             root.update_idletasks()
             x = (root.winfo_screenwidth() - W) // 2
             y = (root.winfo_screenheight() - H) // 2
@@ -6696,6 +6696,11 @@ class WhisperTypeApp:
                     log.info("Groq API key saved & activated (transcribe + cleanup)")
                     status_label.config(text="Key valid. Switched to Groq Cloud.", fg="#a6e3a1")
                     try:
+                        if self.tray_icon:
+                            self.tray_icon.update_menu()
+                    except Exception as e:
+                        log.warning("update_menu after Groq save failed: %s", e)
+                    try:
                         self.overlay.show_done()
                     except Exception:
                         pass
@@ -6744,7 +6749,7 @@ class WhisperTypeApp:
             btn_frame = tk.Frame(root, bg="#1e1e2e")
             btn_frame.pack(pady=(10, 15))
 
-            save_btn = make_btn(btn_frame, "Save & Verify", on_save_verify,
+            save_btn = make_btn(btn_frame, "✓  OK  (Save & Verify)", on_save_verify,
                                 "#a6e3a1", "#94e2d5")
             save_btn.pack(side="left", padx=5)
             clear_btn = make_btn(btn_frame, "Clear Key", on_clear,
@@ -6777,7 +6782,7 @@ class WhisperTypeApp:
             root.configure(bg="#1e1e2e")
             root.resizable(False, False)
 
-            W, H = 560, 340
+            W, H = 560, 420
             root.update_idletasks()
             x = (root.winfo_screenwidth() - W) // 2
             y = (root.winfo_screenheight() - H) // 2
@@ -6930,6 +6935,11 @@ class WhisperTypeApp:
                 save_config(self.config)
                 log.info("OpenAI API key cleared")
                 status_label.config(text="Key cleared. Backend: Local.", fg="#a6adc8")
+                try:
+                    if self.tray_icon:
+                        self.tray_icon.update_menu()
+                except Exception:
+                    pass
                 root.after(800, root.destroy)
 
             verifying_flag = {"busy": False}
@@ -6994,6 +7004,14 @@ class WhisperTypeApp:
                     save_config(self.config)
                     log.info("OpenAI API key saved & activated")
                     status_label.config(text="Key valid. Switched to OpenAI Cloud.", fg="#a6e3a1")
+                    # Force the tray menu to rebuild — pystray caches the menu
+                    # on Windows, so without this the new "OpenAI gpt-4o-..."
+                    # rows in _build_model_menu won't appear until restart.
+                    try:
+                        if self.tray_icon:
+                            self.tray_icon.update_menu()
+                    except Exception as e:
+                        log.warning("update_menu after OpenAI save failed: %s", e)
                     try:
                         self.overlay.show_done()
                     except Exception:
@@ -7039,7 +7057,7 @@ class WhisperTypeApp:
             btn_frame = tk.Frame(root, bg="#1e1e2e")
             btn_frame.pack(pady=(10, 15))
 
-            save_btn = make_btn(btn_frame, "Save & Verify", on_save_verify,
+            save_btn = make_btn(btn_frame, "✓  OK  (Save & Verify)", on_save_verify,
                                 "#a6e3a1", "#94e2d5")
             save_btn.pack(side="left", padx=5)
             clear_btn = make_btn(btn_frame, "Clear Key", on_clear,
