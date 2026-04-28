@@ -1883,6 +1883,35 @@ class OpenAITranscriber(BaseTranscriber):
             parts.append(self.HE_EN_BIAS_PROMPT)
         return " ".join(parts) if parts else None
 
+    # gpt-4o-transcribe is a GPT-4o-based model with a real "model of the
+    # user". Without an explicit instruction it will sometimes translate
+    # Hebrew speech to English (it decides the user "probably wanted English"
+    # for technical content) or summarise instead of transcribing verbatim.
+    # Whisper has no such mind, which is why GroqTranscriber doesn't need
+    # this guard. The instruction is short (well under the 224-token prompt
+    # cap) and stacks under the existing he/en bias and custom vocab.
+    GPT4O_VERBATIM_PROMPT = (
+        "Transcribe the audio verbatim in the language actually spoken. "
+        "Do NOT translate. Do NOT summarise. If Hebrew is spoken, output "
+        "Hebrew. If English is spoken, output English. If both languages "
+        "are mixed in one utterance, preserve each phrase in its original "
+        "language. Output every word the speaker said, including filler "
+        "words and repetitions."
+    )
+
+    def _build_gpt4o_prompt(self, include_he_en=True):
+        """Prompt builder used for the gpt-4o family.
+
+        Always starts with the verbatim/no-translate instruction, then
+        appends custom vocabulary and (if enabled) the he/en bias.
+        """
+        parts = [self.GPT4O_VERBATIM_PROMPT]
+        if self.custom_vocabulary and self.custom_vocabulary.strip():
+            parts.append(f"Common terms: {self.custom_vocabulary.strip()}.")
+        if include_he_en and self.he_en_bias:
+            parts.append(self.HE_EN_BIAS_PROMPT)
+        return " ".join(parts)
+
     def load_model(self, callback=None):
         if not self.api_key:
             if callback:
@@ -2004,8 +2033,8 @@ class OpenAITranscriber(BaseTranscriber):
 
         # Transcription. Pick response format based on model capability.
         # gpt-4o-* return JSON only; whisper-1 supports text.
-        use_json = self.model_size in self._NO_VERBOSE_JSON_MODELS
-        response_format = "json" if use_json else "text"
+        is_gpt4o = self.model_size in self._NO_VERBOSE_JSON_MODELS
+        response_format = "json" if is_gpt4o else "text"
 
         wav_buf = self._audio_to_wav_bytes(audio_np)
         files = {"file": ("audio.wav", wav_buf, "audio/wav")}
@@ -2014,16 +2043,25 @@ class OpenAITranscriber(BaseTranscriber):
         forced_lang = language if language and language != "auto" else None
         if forced_lang:
             data["language"] = forced_lang
-            if self.custom_vocabulary and self.custom_vocabulary.strip():
+            # Even with language pinned, gpt-4o still needs the verbatim
+            # instruction to prevent it summarising or polishing the output.
+            if is_gpt4o:
+                data["prompt"] = self._build_gpt4o_prompt(include_he_en=False)
+            elif self.custom_vocabulary and self.custom_vocabulary.strip():
                 data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
         else:
-            bias = self._build_bias_prompt()
-            if bias:
-                data["prompt"] = bias
+            # Auto-detect language. For gpt-4o use the verbatim+bias prompt;
+            # for whisper-1 use the legacy bias-only prompt.
+            if is_gpt4o:
+                data["prompt"] = self._build_gpt4o_prompt(include_he_en=True)
+            else:
+                bias = self._build_bias_prompt()
+                if bias:
+                    data["prompt"] = bias
 
-        log.info("OpenAI transcribe: model=%s lang=%s bias=%s vocab=%s",
+        log.info("OpenAI transcribe: model=%s lang=%s verbatim_prompt=%s he_en_bias=%s vocab=%s",
                  self.model_size, forced_lang or "auto",
-                 self.he_en_bias, bool(self.custom_vocabulary))
+                 is_gpt4o, self.he_en_bias, bool(self.custom_vocabulary))
         raw = self._post(self.TRANSCRIBE_URL, files, data, timeout=http_timeout)
         text = self._extract_text(raw, response_format)
         if not text:
@@ -2097,14 +2135,16 @@ class OpenAITranscriber(BaseTranscriber):
         """
         wav_buf = self._audio_to_wav_bytes(audio_np)
         files = {"file": ("audio.wav", wav_buf, "audio/wav")}
-        use_json = self.model_size in self._NO_VERBOSE_JSON_MODELS
-        response_format = "json" if use_json else "text"
+        is_gpt4o = self.model_size in self._NO_VERBOSE_JSON_MODELS
+        response_format = "json" if is_gpt4o else "text"
         data = {
             "model": self.model_size,
             "response_format": response_format,
             "language": "he",
         }
-        if self.custom_vocabulary and self.custom_vocabulary.strip():
+        if is_gpt4o:
+            data["prompt"] = self._build_gpt4o_prompt(include_he_en=False)
+        elif self.custom_vocabulary and self.custom_vocabulary.strip():
             data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
         raw = self._post(self.TRANSCRIBE_URL, files, data, timeout=timeout)
         retry = self._extract_text(raw, response_format)
@@ -2123,17 +2163,22 @@ class OpenAITranscriber(BaseTranscriber):
                     data["prompt"] = bias
             else:
                 url = self.TRANSCRIBE_URL
-                use_json = self.model_size in self._NO_VERBOSE_JSON_MODELS
-                response_format = "json" if use_json else "text"
+                is_gpt4o = self.model_size in self._NO_VERBOSE_JSON_MODELS
+                response_format = "json" if is_gpt4o else "text"
                 data = {"model": self.model_size, "response_format": response_format}
                 if language and language != "auto":
                     data["language"] = language
-                    if self.custom_vocabulary and self.custom_vocabulary.strip():
+                    if is_gpt4o:
+                        data["prompt"] = self._build_gpt4o_prompt(include_he_en=False)
+                    elif self.custom_vocabulary and self.custom_vocabulary.strip():
                         data["prompt"] = f"Common terms: {self.custom_vocabulary.strip()}."
                 else:
-                    bias = self._build_bias_prompt()
-                    if bias:
-                        data["prompt"] = bias
+                    if is_gpt4o:
+                        data["prompt"] = self._build_gpt4o_prompt(include_he_en=True)
+                    else:
+                        bias = self._build_bias_prompt()
+                        if bias:
+                            data["prompt"] = bias
             raw = self._post(url, files, data, timeout=120)
             if task == "translate":
                 return raw
