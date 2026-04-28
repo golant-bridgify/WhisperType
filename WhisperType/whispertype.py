@@ -1967,9 +1967,24 @@ class OpenAITranscriber(BaseTranscriber):
             return ""
 
         orig_len = len(audio_np)
-        audio_np = trim_trailing_silence(audio_np, sample_rate=16000)
-        if len(audio_np) < orig_len:
-            log.info("OpenAI: trimmed %d samples of trailing silence", orig_len - len(audio_np))
+        orig_duration = orig_len / 16000.0
+
+        # Whisper-family models hallucinate "Thank you" / "תודה רבה" on silent
+        # tails, so we trim them. gpt-4o-transcribe is markedly less prone to
+        # this — and trim_trailing_silence's -45dB threshold can clip quiet
+        # tail speech (a user trailing off in volume on the last word). Skip
+        # the trim for the gpt-4o family; whisper-1 still gets it.
+        if self.model_size in self._NO_VERBOSE_JSON_MODELS:
+            log.info("OpenAI %s: sending full %.2fs of audio (no trim)",
+                     self.model_size, orig_duration)
+        else:
+            audio_np = trim_trailing_silence(audio_np, sample_rate=16000)
+            new_duration = len(audio_np) / 16000.0
+            if len(audio_np) < orig_len:
+                log.info("OpenAI: trimmed %.2fs of trailing silence (%.2fs -> %.2fs)",
+                         orig_duration - new_duration, orig_duration, new_duration)
+            else:
+                log.info("OpenAI: no trailing silence to trim (%.2fs)", orig_duration)
 
         duration = len(audio_np) / 16000.0
         http_timeout = max(30, int(duration * 3) + 10)
