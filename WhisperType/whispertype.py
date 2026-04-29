@@ -127,7 +127,7 @@ DEFAULT_CONFIG = {
     # words, add punctuation, fix obvious mis-hearings. Costs ~$0.00005 per
     # transcription and ~500-900ms added latency. Set to "off" or "verbatim"
     # to disable. Shares the groq_api_key with GroqTranscriber.
-    "cleanup_style": "casual",  # "off" / "casual" / "proofread" / "email" / "code"
+    "cleanup_style": "off",  # "off" / "casual" / "proofread" / "email" / "code"
     "cleanup_llm_model": "llama-3.3-70b-versatile",  # Groq model for cleanup
     # Custom vocabulary — user-specific terms (programming, names, product
     # names) that Whisper otherwise mis-transcribes. Sent as Whisper's
@@ -1554,6 +1554,18 @@ class GroqTranscriber(BaseTranscriber):
         self.api_key = api_key
         self.he_en_bias = True  # Toggleable: send Hebrew/English bias prompt on auto-detect calls
         self.custom_vocabulary = ""  # User-supplied terms to bias detection
+        # Persistent HTTP connection — saves the ~100-300ms TLS handshake
+        # on every recording after the first. requests.Session reuses the
+        # underlying TCP/TLS connection per host, so api.groq.com gets one
+        # warm pipe across all transcribe + verify calls.
+        self._session = None
+
+    def _ensure_session(self):
+        """Lazy-init a requests.Session for connection reuse."""
+        if self._session is None:
+            import requests
+            self._session = requests.Session()
+        return self._session
 
     def _build_bias_prompt(self, include_he_en=True):
         """Build the `prompt` string sent to Whisper.
@@ -1597,7 +1609,8 @@ class GroqTranscriber(BaseTranscriber):
             return False, f"'requests' not installed: {e}"
         try:
             log.info("verify_key: GET /models (timeout=%s)", timeout)
-            r = requests.get(
+            s = self._ensure_session()
+            r = s.get(
                 "https://api.groq.com/openai/v1/models",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=(5, timeout),  # (connect, read) - more reliable on Windows
@@ -1632,9 +1645,9 @@ class GroqTranscriber(BaseTranscriber):
 
     def _post(self, url, files, data, timeout=30):
         """Send a POST request to Groq, return response text."""
-        import requests
+        s = self._ensure_session()
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        response = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+        response = s.post(url, headers=headers, files=files, data=data, timeout=timeout)
         if response.status_code == 401:
             raise RuntimeError("Invalid Groq API key")
         if response.status_code == 429:
@@ -1652,9 +1665,9 @@ class GroqTranscriber(BaseTranscriber):
         (e.g. someone called us with response_format=text by accident, or
         Groq returned an HTML error page).
         """
-        import requests
+        s = self._ensure_session()
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        response = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+        response = s.post(url, headers=headers, files=files, data=data, timeout=timeout)
         if response.status_code == 401:
             raise RuntimeError("Invalid Groq API key")
         if response.status_code == 429:
@@ -1925,6 +1938,14 @@ class OpenAITranscriber(BaseTranscriber):
         self.api_key = api_key
         self.he_en_bias = True
         self.custom_vocabulary = ""
+        # Persistent HTTP connection — see GroqTranscriber._session.
+        self._session = None
+
+    def _ensure_session(self):
+        if self._session is None:
+            import requests
+            self._session = requests.Session()
+        return self._session
 
     def _build_bias_prompt(self, include_he_en=True):
         parts = []
@@ -1982,7 +2003,8 @@ class OpenAITranscriber(BaseTranscriber):
             return False, f"'requests' not installed: {e}"
         try:
             log.info("OpenAI verify_key: GET /models (timeout=%s)", timeout)
-            r = requests.get(
+            s = self._ensure_session()
+            r = s.get(
                 "https://api.openai.com/v1/models",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=(5, timeout),
@@ -2015,9 +2037,9 @@ class OpenAITranscriber(BaseTranscriber):
         return buf
 
     def _post(self, url, files, data, timeout=30):
-        import requests
+        s = self._ensure_session()
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        response = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+        response = s.post(url, headers=headers, files=files, data=data, timeout=timeout)
         if response.status_code == 401:
             raise RuntimeError("Invalid OpenAI API key")
         if response.status_code == 429:
@@ -2371,6 +2393,15 @@ class GroqLLMCleaner:
     def __init__(self, api_key, model="llama-3.3-70b-versatile"):
         self.api_key = api_key
         self.model = model
+        # Persistent HTTP connection — saves ~100-300ms TLS handshake per
+        # cleanup call. Same pattern as GroqTranscriber._session.
+        self._session = None
+
+    def _ensure_session(self):
+        if self._session is None:
+            import requests
+            self._session = requests.Session()
+        return self._session
 
     def clean(self, text, style="casual", timeout=10, vocabulary=""):
         """Return the cleaned text. On any failure, return the original text.
@@ -2434,7 +2465,8 @@ class GroqLLMCleaner:
 
         try:
             log.info("LLM cleanup (%s): sending %d chars", style, len(payload_text))
-            resp = requests.post(
+            s = self._ensure_session()
+            resp = s.post(
                 self.CHAT_URL,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
@@ -2777,7 +2809,6 @@ class MeetingSession:
         if not cleaner or not cleaner.api_key or not plain_transcript.strip():
             return "", ""
         try:
-            import requests
             system = (
                 "You are a meeting-notes assistant. You will receive a raw "
                 "meeting transcript. Produce TWO sections, in the PRIMARY "
@@ -2792,7 +2823,8 @@ class MeetingSession:
                 "information that was not in the transcript. Respond with "
                 "ONLY these two sections, no preface."
             )
-            resp = requests.post(
+            s = cleaner._ensure_session()
+            resp = s.post(
                 cleaner.CHAT_URL,
                 headers={
                     "Authorization": f"Bearer {cleaner.api_key}",
@@ -3816,13 +3848,15 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
 class WhisperTypeApp:
     def __init__(self):
         self.config = load_config()
-        # Always start with 'casual' cleanup style on every launch.
-        # User can change it mid-session via the tray menu; next restart
-        # it resets to casual so typo-correction is guaranteed on by default.
-        if self.config.get("cleanup_style") != "casual":
-            log.info("Resetting cleanup_style to 'casual' on startup "
+        # Always start with cleanup OFF on every launch. Rationale:
+        # gpt-4o-transcribe (the user's primary backend) already produces
+        # clean, punctuated output, so an extra 300-800ms LLM pass is pure
+        # latency overhead. User can flip it on mid-session for raw Whisper
+        # output that needs polish; next restart it returns to off.
+        if self.config.get("cleanup_style") != "off":
+            log.info("Resetting cleanup_style to 'off' on startup "
                      "(was %r)", self.config.get("cleanup_style"))
-            self.config["cleanup_style"] = "casual"
+            self.config["cleanup_style"] = "off"
             save_config(self.config)
         # Pick the recorder implementation. Subprocess-isolated is the
         # default because it eliminates the stale-PortAudio / WASAPI-handle
