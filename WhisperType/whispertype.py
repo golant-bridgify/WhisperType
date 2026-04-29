@@ -4478,15 +4478,13 @@ class WhisperTypeApp:
                     #     gives the glitch many chances per second to fire.
                     # Without debounce, a 50-second hold cuts off mid-sentence
                     # on the first such blip. Requiring N consecutive "not
-                    # pressed" polls filters glitches. 250ms (5 × 50ms) is
-                    # tuned to the actual glitch durations seen in this
-                    # user's log (50ms and 100ms wireless wobbles); it
-                    # covers them with margin without adding perceptible
-                    # release latency. Dropouts longer than 250ms WILL
-                    # slip through and cut the recording — that's the
-                    # accepted trade-off (priority: fast release).
+                    # pressed" polls filters glitches. 150ms (3 × 50ms) is
+                    # the minimum that still catches single-tick glitches
+                    # (the 50ms case observed in the log); priority is
+                    # fast release. Dropouts longer than 150ms WILL slip
+                    # through and cut the recording — accepted trade-off.
                     self._start_recording()
-                    RELEASE_DEBOUNCE_POLLS = 5
+                    RELEASE_DEBOUNCE_POLLS = 3
                     release_streak = 0
                     max_streak_recovered = 0  # longest glitch successfully filtered
                     while True:
