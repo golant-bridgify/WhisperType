@@ -274,6 +274,40 @@ def mix_audio(audio1, audio2):
     return mixed
 
 
+# Both Groq and OpenAI's /audio/transcriptions enforce a 25 MB request
+# body cap. We round down a hair to leave room for multipart overhead.
+CLOUD_FILE_SIZE_LIMIT_BYTES = 24 * 1024 * 1024  # 24 MB
+
+
+# Mapping from file extension to MIME for cloud audio uploads.
+# Both APIs accept any of: mp3, mp4, m4a, wav, mpeg, mpga, flac, ogg, webm.
+# Hardcoding `audio/mpeg` for everything causes the API to reject `.m4a`
+# because the magic bytes don't match the declared MIME — files reported
+# as "unsupported format" or get a generic 400.
+_AUDIO_MIME_BY_EXT = {
+    ".mp3": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".flac": "audio/flac",
+}
+
+
+def guess_audio_mime(file_path):
+    """Guess MIME type for an audio file from its extension.
+
+    Falls back to `application/octet-stream` (generic binary) which both
+    Groq and OpenAI accept and then sniff for content.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    return _AUDIO_MIME_BY_EXT.get(ext, "application/octet-stream")
+
+
 def audio_peak_rms(audio_np, sample_rate=16000, window_ms=300):
     """Peak RMS over sliding windows (50% overlap), normalised to [0, 1].
 
@@ -1815,8 +1849,25 @@ class GroqTranscriber(BaseTranscriber):
         if self.model is None:
             raise RuntimeError("Groq transcriber not initialized")
 
+        # Guard the 25 MB API cap before we open the file
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            size = -1
+        if size > CLOUD_FILE_SIZE_LIMIT_BYTES:
+            mb = size / (1024 * 1024)
+            raise RuntimeError(
+                f"File is {mb:.1f} MB — Groq's transcription API limits "
+                f"requests to 25 MB. Compress the file or switch to the "
+                f"Local backend (faster-whisper handles any size)."
+            )
+
+        mime = guess_audio_mime(file_path)
+        log.info("Groq transcribe_file: %s mime=%s size=%dKB",
+                 os.path.basename(file_path), mime,
+                 size // 1024 if size >= 0 else -1)
         with open(file_path, "rb") as f:
-            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+            files = {"file": (os.path.basename(file_path), f, mime)}
             if task == "translate":
                 url = self.TRANSLATE_URL
                 data = {"model": "whisper-large-v3", "response_format": "text"}
@@ -2153,8 +2204,26 @@ class OpenAITranscriber(BaseTranscriber):
     def transcribe_file(self, file_path, language=None, task="transcribe"):
         if self.model is None:
             raise RuntimeError("OpenAI transcriber not initialized")
+
+        # Guard the 25 MB API cap before opening the file
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            size = -1
+        if size > CLOUD_FILE_SIZE_LIMIT_BYTES:
+            mb = size / (1024 * 1024)
+            raise RuntimeError(
+                f"File is {mb:.1f} MB — OpenAI's transcription API limits "
+                f"requests to 25 MB. Compress the file or switch to the "
+                f"Local backend (faster-whisper handles any size)."
+            )
+
+        mime = guess_audio_mime(file_path)
+        log.info("OpenAI transcribe_file: %s mime=%s size=%dKB model=%s",
+                 os.path.basename(file_path), mime,
+                 size // 1024 if size >= 0 else -1, self.model_size)
         with open(file_path, "rb") as f:
-            files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+            files = {"file": (os.path.basename(file_path), f, mime)}
             if task == "translate":
                 url = self.TRANSLATE_URL
                 data = {"model": "whisper-1", "response_format": "text"}
@@ -5238,7 +5307,14 @@ class WhisperTypeApp:
                     self.overlay.show_error("No speech detected")
             except Exception as e:
                 log.error("File transcription error: %s", e)
-                self.overlay.show_error("Transcription failed")
+                # Surface the actual error if it's user-actionable (size cap,
+                # missing key, etc.) — those messages are short enough to
+                # show in the overlay and tell the user what to do.
+                msg = str(e)
+                if msg and len(msg) < 200:
+                    self.overlay.show_error(msg)
+                else:
+                    self.overlay.show_error("Transcription failed")
             finally:
                 if self.tray_icon:
                     self.tray_icon.icon = self._create_icon("idle")
