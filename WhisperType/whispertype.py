@@ -4471,6 +4471,10 @@ class WhisperTypeApp:
                             pystray.Menu.SEPARATOR,
                             pystray.MenuItem("File → Hebrew", lambda: self._transcribe_file("he")),
                             pystray.MenuItem("File → English", lambda: self._transcribe_file("en")),
+                            pystray.MenuItem(
+                                "File → with Speaker Labels (AssemblyAI)…",
+                                lambda: self._transcribe_file_diarized(),
+                            ),
                         ),
                     ),
                     pystray.Menu.SEPARATOR,
@@ -5774,6 +5778,118 @@ class WhisperTypeApp:
                     self.tray_icon.title = "WhisperType — Ready"
 
         threading.Thread(target=do_pick_and_transcribe, daemon=True).start()
+
+    def _transcribe_file_diarized(self):
+        """Pick an audio file and transcribe it via AssemblyAI with
+        speaker_labels enabled. Useful for processing a leftover meeting
+        WAV (e.g. from a failed diarized run) or any pre-recorded
+        multi-speaker audio.
+
+        Same flow as the diarized-meeting stop path, just over a
+        user-picked file rather than a freshly captured WAV."""
+        if not self.config.get("assemblyai_api_key", "").strip() or self._assemblyai_transcriber is None:
+            log.warning("Diarized file transcribe requested but no AssemblyAI key")
+            self.overlay.show_error("Set AssemblyAI API key first")
+            self._set_assemblyai_api_key()
+            return
+
+        def do_pick_and_transcribe():
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
+            root.withdraw()
+            root.attributes('-topmost', True)
+            file_path = filedialog.askopenfilename(
+                title="Select audio file for diarized transcription",
+                filetypes=[
+                    ("Audio/Video files", "*.wav *.mp3 *.m4a *.mp4 *.mkv *.avi *.webm *.ogg *.flac *.wma *.mpga *.mpeg"),
+                    ("All files", "*.*"),
+                ],
+                parent=root,
+            )
+            root.destroy()
+            if not file_path:
+                return
+
+            log.info("Diarized file transcribe: %s", file_path)
+            self.overlay.show("  ☁  Uploading to AssemblyAI…  ",
+                               bg_color="#1e64c8", duration=3000)
+            if self.tray_icon:
+                self.tray_icon.icon = self._create_icon("processing")
+
+            try:
+                result = self._assemblyai_transcriber.transcribe_file_sync(
+                    file_path,
+                    language_code=None,    # auto
+                    speaker_labels=True,
+                )
+                # Reuse the meeting markdown formatter for consistency.
+                # We synthesise just enough state for the writer to work.
+                md_path = self._write_diarized_file_markdown(file_path, result)
+                log.info("Diarized file saved: %s", md_path)
+                try:
+                    os.startfile(md_path)
+                except Exception as e:
+                    log.warning("Could not open diarized markdown: %s", e)
+                try:
+                    self.overlay.show("  ✓  Diarized transcript ready  ",
+                                       bg_color="#2d6a4f", duration=4000)
+                except Exception:
+                    pass
+            except Exception as e:
+                log.error("Diarized file transcribe failed: %s", e)
+                msg = str(e)
+                self.overlay.show_error(
+                    msg if msg and len(msg) < 200 else "AssemblyAI failed"
+                )
+            finally:
+                if self.tray_icon:
+                    self.tray_icon.icon = self._create_icon("idle")
+                    self.tray_icon.title = "WhisperType — Ready"
+
+        threading.Thread(target=do_pick_and_transcribe, daemon=True).start()
+
+    def _write_diarized_file_markdown(self, source_path, result):
+        """Format an AssemblyAI result for a user-picked file as markdown,
+        saved next to the source audio file."""
+        import datetime as _dt
+        utterances = result.get("utterances") or []
+        base, _ = os.path.splitext(source_path)
+        out_path = base + "_transcription_diarized.md"
+
+        lines = []
+        lines.append(f"# Diarized transcript — {os.path.basename(source_path)}")
+        lines.append("")
+        lines.append(f"**Generated:** {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"**Source:** {source_path}")
+        lines.append(f"**Engine:** AssemblyAI universal-2 (speaker_labels)")
+        lines.append("")
+        lines.append("## Transcript")
+        lines.append("")
+
+        if not utterances:
+            text = (result.get("text") or "").strip()
+            if any('֐' <= c <= '׿' for c in text):
+                text = '‏' + text
+            lines.append(text or "_[no speech detected]_")
+        else:
+            for u in utterances:
+                speaker = u.get("speaker") or "?"
+                start_ms = float(u.get("start") or 0)
+                ts = _fmt_relative_ts(start_ms / 1000.0)
+                text = (u.get("text") or "").strip()
+                if not text:
+                    continue
+                if any('֐' <= c <= '׿' for c in text):
+                    text = '‏' + text
+                lines.append(f"**[{ts}] Speaker {speaker}:** {text}")
+                lines.append("")
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return out_path
 
     def _get_language(self):
         """Get language based on selected model."""
