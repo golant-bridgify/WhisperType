@@ -6069,69 +6069,54 @@ class WhisperTypeApp:
     def _handle_silent_capture(self, duration_sec, rms):
         """Called when a recording came back silent (RMS below threshold).
 
-        Behaviour:
-        - First silent within a 2-minute window: log + flash error + show
-          overlay (even if silent_mode is on — this is an error the user
-          must see).
-        - Second silent within 2 minutes: PortAudio state is clearly stuck.
-          Trigger an automatic restart of the process, which our empirical
-          testing shows reliably fixes the issue.
+        Two cases, depending on the active recorder:
+
+        1) SubprocessAudioRecorder (the default since session 6).
+           Each recording uses a FRESH Python subprocess with its own
+           PortAudio init, so the stale-WASAPI-handle bug that this
+           handler was originally written for is structurally
+           impossible. We just respawn the worker quietly and return.
+           No overlay, no tray flash, no auto-restart — the user can
+           tell from the live waveform whether their mic was captured
+           (bars moved → audio; bars flat → silent).
+
+        2) In-process AudioRecorder (frozen PyInstaller fallback).
+           The classic flow still applies: the long-running process
+           CAN end up with stuck PortAudio handles. We log, flash, and
+           after 3 consecutive silents auto-restart the process.
         """
         now = time.time()
-        # Reset counter if the last silent was long ago
         if now - self._last_silent_time > 120:
             self._consecutive_silent = 0
         self._consecutive_silent += 1
         self._last_silent_time = now
 
         log.warning(
-            "Silent audio detected (#%d): duration=%.1fs RMS=%.5f. "
-            "Mic likely didn't capture (PortAudio state stale after long idle).",
+            "Silent audio detected (#%d): duration=%.1fs RMS=%.5f.",
             self._consecutive_silent, duration_sec, rms,
         )
 
-        if self._consecutive_silent >= 3:
-            # Three in a row = stale state is persistent. Auto-restart.
-            # Bumped 2 → 3 so a single noisy stretch (mic placement, user
-            # paused mid-sentence, etc.) doesn't trigger a process kill.
-            # SubprocessAudioRecorder respawns the worker on the FIRST
-            # silent already, which usually fixes mic state without a
-            # full restart; this is the fallback for when even that
-            # doesn't help.
-            log.warning("3 consecutive silent captures — auto-restarting to fix "
-                        "stale PortAudio state")
-            self._force_show_error_overlay(
-                "🔄 Audio stack stuck — restarting WhisperType..."
-            )
-            self._flash_error_tray("Auto-restarting to fix audio...", duration_sec=5.0)
-            # Give the user a moment to see the overlay, then restart
-            threading.Thread(
-                target=lambda: (time.sleep(1.5), self._restart_whispertype("silent-audio")),
-                daemon=True,
-            ).start()
-            return
-
-        # First silent — kill + respawn the persistent mic worker so the
-        # next recording gets a fresh PortAudio cache. Cheap (~300ms next
-        # recording) compared to a full app restart. If it still comes
-        # back silent, the consecutive counter will hit 2 and we
-        # hard-restart the whole app above.
+        # Subprocess recorder path — quiet recovery, no UI noise, no restart.
         if isinstance(self.recorder, SubprocessAudioRecorder):
             try:
                 self.recorder.respawn_after_stale()
             except Exception as e:
                 log.warning("Worker respawn failed: %s", e)
+            return
 
-        # Force-show the overlay even in silent_mode — silent failure is
-        # exactly the case silent_mode should NOT hide.
-        self._force_show_error_overlay(
-            "Mic silent — try again (will auto-restart if persists)"
-        )
-        # 2.0s, not 5.0: long enough to register the error visually,
-        # short enough that the user doesn't feel locked out before
-        # retrying. (The hotkey itself was never blocked — only the
-        # tray icon's red-X made the user wait.)
-        self._flash_error_tray("Mic captured silence — try again", duration_sec=2.0)
+        # In-process AudioRecorder path — original behaviour with the
+        # 3-consecutive auto-restart safety net.
+        if self._consecutive_silent >= 3:
+            log.warning("3 consecutive silent captures (in-process recorder) — "
+                        "auto-restarting to fix stale PortAudio state")
+            self._force_show_error_overlay(
+                "🔄 Audio stack stuck — restarting WhisperType..."
+            )
+            self._flash_error_tray("Auto-restarting to fix audio...", duration_sec=5.0)
+            threading.Thread(
+                target=lambda: (time.sleep(1.5), self._restart_whispertype("silent-audio")),
+                daemon=True,
+            ).start()
 
     def _force_show_error_overlay(self, msg):
         """Show an error overlay bypassing silent_mode.
