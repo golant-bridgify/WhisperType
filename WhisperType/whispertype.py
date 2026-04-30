@@ -2764,7 +2764,8 @@ class MeetingSession:
     CHUNK_SECONDS = 45
 
     def __init__(self, app, source=None, input_device_index=None,
-                 loopback_device_index=None, diarize_mode=False):
+                 loopback_device_index=None, diarize_mode=False,
+                 chunk_transcriber=None, chunk_language=None):
         self.app = app
         self.source = source or app.config.get("recording_source", "both")
         self._input_device_index = (
@@ -2791,6 +2792,13 @@ class MeetingSession:
         # stop(), upload to AssemblyAI for speaker-labelled transcription
         # in the background. Result lands as markdown 10-20 min later.
         self.diarize_mode = diarize_mode
+        # Explicit transcriber + language for chunked-mode chunk transcription.
+        # Decoupled from the press-to-talk transcriber so meetings can use a
+        # different backend than daily dictation. Defaults: app's main
+        # transcriber and configured language (preserves old behaviour for
+        # callers that pass nothing).
+        self._chunk_transcriber = chunk_transcriber
+        self._chunk_language = chunk_language
         self._wav_path = None         # WAV file path used in diarize_mode
         self._wav_writer = None       # wave.open writer used in diarize_mode
         self._diarize_job_thread = None
@@ -2982,12 +2990,24 @@ class MeetingSession:
 
         def worker():
             try:
-                text = self.app._transcribe_with_fallback(
-                    audio_np,
-                    language=self.app._get_language(),
-                    beam_size=1,
-                    task="transcribe",
-                )
+                # If a meeting-specific transcriber was passed in, use it
+                # directly so the meeting doesn't follow the press-to-talk
+                # backend choice. Otherwise fall back to the app-wide
+                # transcriber path (preserves the old behaviour).
+                if self._chunk_transcriber is not None:
+                    text = self._chunk_transcriber.transcribe(
+                        audio_np,
+                        language=self._chunk_language,
+                        beam_size=1,
+                        task="transcribe",
+                    )
+                else:
+                    text = self.app._transcribe_with_fallback(
+                        audio_np,
+                        language=self.app._get_language(),
+                        beam_size=1,
+                        task="transcribe",
+                    )
                 text = text or ""
             except Exception as e:
                 log.warning("Meeting chunk #%d transcription failed: %s", idx, e)
@@ -4310,13 +4330,21 @@ class WhisperTypeApp:
             self._openai_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
             self._openai_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
 
-        # Initialize AssemblyAI client if a key is set. Used ONLY by the
-        # diarized meeting flow (Start Meeting with speaker labels).
+        # Initialize AssemblyAI client if a key is set. Used by the
+        # diarized meeting flow + meeting/file transcription if the user
+        # selects "AssemblyAI Universal-2" from the Transcribe → Model menu.
         self._assemblyai_transcriber = None
         if self.config.get("assemblyai_api_key"):
             self._assemblyai_transcriber = AssemblyAITranscriber(
                 api_key=self.config["assemblyai_api_key"],
             )
+
+        # Meeting + file transcribe backend cache. Independent of the
+        # press-to-talk Model menu — the user picks one of these via
+        # Transcribe → Model and it controls all "long form" transcription
+        # (meetings + file uploads) without affecting daily dictation.
+        # Lazily-built; key → (transcriber, language_hint, is_diarized).
+        self._meeting_xcribers = {}
 
         # LLM cleanup uses the Groq API key. Initialised whenever a
         # key is present, regardless of which transcription backend is
@@ -4453,34 +4481,25 @@ class WhisperTypeApp:
                         pystray.Menu(self._build_beep_output_menu),
                     ),
                     pystray.Menu.SEPARATOR,
-                    # Group 4 — Transcribe actions: live (meeting) + file
+                    # Group 4 — Transcribe actions: live (meeting) + file.
+                    # All routes through the Transcribe → Model selector.
                     pystray.MenuItem(
                         "Transcribe",
                         pystray.Menu(
-                            # When NO meeting is active: show two start variants.
                             pystray.MenuItem(
-                                "🎙  Start Meeting (chunked, free/cheap)",
-                                lambda: self._toggle_meeting(diarize_mode=False),
-                                visible=lambda item: not self._is_meeting_active(),
+                                "Model",
+                                pystray.Menu(self._build_meeting_model_menu),
                             ),
+                            pystray.Menu.SEPARATOR,
+                            # Dynamic label: swaps Start ↔ Stop based on session state.
                             pystray.MenuItem(
-                                "🎤  Start Meeting (with speaker labels — AssemblyAI)",
-                                lambda: self._toggle_meeting(diarize_mode=True),
-                                visible=lambda item: not self._is_meeting_active(),
-                            ),
-                            # When a meeting IS active: show the unified Stop.
-                            pystray.MenuItem(
-                                lambda item: "⏹  Stop Meeting",
+                                lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
+                                               else "🎙  Start Meeting (uses selected Model)"),
                                 lambda: self._toggle_meeting(),
-                                visible=lambda item: self._is_meeting_active(),
                             ),
                             pystray.Menu.SEPARATOR,
                             pystray.MenuItem("File → Hebrew", lambda: self._transcribe_file("he")),
                             pystray.MenuItem("File → English", lambda: self._transcribe_file("en")),
-                            pystray.MenuItem(
-                                "File → with Speaker Labels (AssemblyAI)…",
-                                lambda: self._transcribe_file_diarized(),
-                            ),
                         ),
                     ),
                     pystray.Menu.SEPARATOR,
@@ -5741,38 +5760,61 @@ class WhisperTypeApp:
                 return
 
             lang_label = "Hebrew" if language == "he" else "English"
-            log.info("Transcribing file (%s): %s", lang_label, file_path)
-            self.overlay.show(f"  ⏳  Transcribing ({lang_label})...  ", bg_color="#f77f00")
+            # Resolve the meeting model — same selector used by Start
+            # Meeting. This way the user picks ONE model in the Model
+            # submenu and it applies both to live meetings and to file
+            # transcription.
+            model_key = self.config.get("meeting_model", "groq_turbo")
+            transcriber, _model_lang, is_diarized = self._resolve_meeting_model(model_key)
+            if transcriber is None:
+                log.warning("File transcribe blocked: model %r not available", model_key)
+                self.overlay.show_error(f"Meeting model {model_key} unavailable — set its API key")
+                return
+
+            log.info("Transcribing file (%s, model=%s): %s",
+                     lang_label, model_key, file_path)
+            self.overlay.show(f"  ⏳  Transcribing ({lang_label}) via {model_key}…  ",
+                               bg_color="#f77f00")
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("processing")
 
             try:
-                text = self._transcribe_file_with_fallback(
-                    file_path,
-                    language=language,
-                )
-                if text:
-                    # Save to .txt file next to the source file
-                    base, _ = os.path.splitext(file_path)
-                    out_path = base + f"_transcription_{language}.txt"
-                    with open(out_path, "w", encoding="utf-8") as f:
-                        f.write(text)
-
-                    log.info("Transcription saved to: %s (%d chars)", out_path, len(text))
-                    add_history_entry(text, 0, self.config["model_size"], "file", "transcribe")
+                if is_diarized:
+                    # AssemblyAI path: upload + poll, write diarized
+                    # markdown next to the source file.
+                    result = transcriber.transcribe_file_sync(
+                        file_path,
+                        language_code=language,
+                        speaker_labels=True,
+                    )
+                    out_path = self._write_diarized_file_markdown(file_path, result)
+                    text = (result.get("text") or "").strip()
+                    log.info("Diarized file saved: %s (%d chars)", out_path, len(text))
+                    if text:
+                        add_history_entry(text, 0, model_key, "file", "transcribe")
                     self.overlay.show_done(char_count=len(text))
                     self._play_done_beep()
-
-                    # Open the file in the default text editor
-                    os.startfile(out_path)
+                    try:
+                        os.startfile(out_path)
+                    except Exception as e:
+                        log.warning("Could not open diarized markdown: %s", e)
                 else:
-                    log.info("No speech detected in file")
-                    self.overlay.show_error("No speech detected")
+                    text = transcriber.transcribe_file(file_path, language=language)
+                    if text:
+                        base, _ = os.path.splitext(file_path)
+                        out_path = base + f"_transcription_{language}.txt"
+                        with open(out_path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                        log.info("Transcription saved to: %s (%d chars)", out_path, len(text))
+                        add_history_entry(text, 0, model_key, "file", "transcribe")
+                        self.overlay.show_done(char_count=len(text))
+                        self._play_done_beep()
+                        os.startfile(out_path)
+                    else:
+                        log.info("No speech detected in file")
+                        self.overlay.show_error("No speech detected")
             except Exception as e:
                 log.error("File transcription error: %s", e)
-                # Surface the actual error if it's user-actionable (size cap,
-                # missing key, etc.) — those messages are short enough to
-                # show in the overlay and tell the user what to do.
                 msg = str(e)
                 if msg and len(msg) < 200:
                     self.overlay.show_error(msg)
@@ -6070,6 +6112,150 @@ class WhisperTypeApp:
             log.warning("Groq file transcription failed (%s) — falling back to local", e)
             self._wait_for_local_ready()
             return self._local_transcriber.transcribe_file(file_path, **kwargs)
+
+    # ----- Meeting / file transcribe Model selector -----
+    # Each entry: (label_for_menu, key_for_config, requires_one_of_keys)
+    # `requires_one_of_keys` is a list of config-key names that must be
+    # non-empty for the row to be selectable; empty = always available.
+    _MEETING_MODELS = [
+        ("OpenAI gpt-4o-transcribe ⭐ (best)", "openai_gpt4o", ["openai_api_key"]),
+        ("OpenAI gpt-4o-mini-transcribe (fast/cheap)", "openai_gpt4o_mini", ["openai_api_key"]),
+        ("Groq Turbo", "groq_turbo", ["groq_api_key"]),
+        ("Hebrew Turbo Local (free)", "local_hebrew_turbo", []),
+        ("English Distil Local (free)", "local_english_distil", []),
+        ("AssemblyAI Universal-2 (with speaker labels)", "assemblyai_universal_2", ["assemblyai_api_key"]),
+    ]
+
+    def _resolve_meeting_model(self, key=None):
+        """Get (transcriber, language_hint, is_diarized) for the configured
+        meeting model. Caches instances per key. Returns (None, None, False)
+        if the model can't be activated (missing API key, load error, etc.).
+        """
+        if key is None:
+            key = self.config.get("meeting_model", "groq_turbo")
+        cached = self._meeting_xcribers.get(key)
+        if cached is not None:
+            return cached
+        triple = self._build_meeting_transcriber(key)
+        if triple[0] is not None:
+            self._meeting_xcribers[key] = triple
+        return triple
+
+    def _build_meeting_transcriber(self, key):
+        """Create + load the transcriber for a given meeting_model key.
+        Loading happens here so the first meeting/file action takes the hit;
+        cache is populated by _resolve_meeting_model on success.
+        """
+        cb = lambda m: log.info("Meeting transcriber: %s", m)
+
+        if key == "openai_gpt4o" or key == "openai_gpt4o_mini":
+            api_key = self.config.get("openai_api_key", "").strip()
+            if not api_key:
+                log.warning("Meeting model %s requires OpenAI API key", key)
+                return (None, None, False)
+            model_size = ("gpt-4o-transcribe" if key == "openai_gpt4o"
+                           else "gpt-4o-mini-transcribe")
+            t = OpenAITranscriber(model_size=model_size, api_key=api_key)
+            t.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            t.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+            try:
+                t.load_model(callback=cb)
+            except Exception as e:
+                log.error("Meeting model %s load failed: %s", key, e)
+                return (None, None, False)
+            return (t, None, False)
+
+        if key == "groq_turbo":
+            # Reuse the main Groq transcriber if it already exists with the
+            # right model, otherwise build a fresh one. Saves an extra
+            # load_model call on the common case.
+            if (self._groq_transcriber is not None
+                    and self._groq_transcriber.model_size == "whisper-large-v3-turbo"
+                    and self._groq_transcriber.model is not None):
+                return (self._groq_transcriber, None, False)
+            api_key = self.config.get("groq_api_key", "").strip()
+            if not api_key:
+                log.warning("Meeting model groq_turbo requires Groq API key")
+                return (None, None, False)
+            t = GroqTranscriber(model_size="whisper-large-v3-turbo", api_key=api_key)
+            t.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            t.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+            try:
+                t.load_model(callback=cb)
+            except Exception as e:
+                log.error("Meeting model groq_turbo load failed: %s", e)
+                return (None, None, False)
+            return (t, None, False)
+
+        if key == "local_hebrew_turbo" or key == "local_english_distil":
+            model_size = ("ivrit-ai/whisper-large-v3-turbo-ct2"
+                           if key == "local_hebrew_turbo" else "distil-large-v3")
+            language = "he" if key == "local_hebrew_turbo" else "en"
+            # If the main local transcriber already loaded this exact model,
+            # reuse it (saves ~500MB of RAM duplication).
+            if (self._local_transcriber is not None
+                    and self._local_transcriber.model_size == model_size
+                    and self._local_transcriber.model is not None):
+                return (self._local_transcriber, language, False)
+            t = FasterWhisperTranscriber(
+                model_size=model_size,
+                cpu_threads=self.config.get("cpu_threads", 16),
+            )
+            t.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+            try:
+                t.load_model(callback=cb)
+            except Exception as e:
+                log.error("Meeting model %s load failed: %s", key, e)
+                return (None, None, False)
+            return (t, language, False)
+
+        if key == "assemblyai_universal_2":
+            api_key = self.config.get("assemblyai_api_key", "").strip()
+            if not api_key:
+                log.warning("Meeting model assemblyai_universal_2 requires AssemblyAI API key")
+                return (None, None, False)
+            if self._assemblyai_transcriber is None:
+                self._assemblyai_transcriber = AssemblyAITranscriber(api_key=api_key)
+            return (self._assemblyai_transcriber, None, True)
+
+        log.warning("Unknown meeting_model key %r — no-op", key)
+        return (None, None, False)
+
+    def _build_meeting_model_menu(self):
+        """Build the Transcribe → Model submenu. Rows whose required API
+        key is missing render as disabled (greyed-out) so the user can see
+        the option exists and what's needed to enable it."""
+        import pystray
+        items = []
+        for label, key, required in self._MEETING_MODELS:
+            missing = [k for k in required
+                       if not self.config.get(k, "").strip()]
+            display = label
+            if missing:
+                display = f"{label}  — needs {', '.join(missing)}"
+            items.append(pystray.MenuItem(
+                display,
+                (lambda k: lambda: self._set_meeting_model(k))(key),
+                checked=(lambda k: lambda item:
+                         self.config.get("meeting_model", "groq_turbo") == k)(key),
+                radio=True,
+                enabled=(not missing),
+            ))
+        return items
+
+    def _set_meeting_model(self, key):
+        """Persist a new meeting model. Cached transcribers stay until
+        the user actually triggers a meeting / file transcribe."""
+        if key == self.config.get("meeting_model"):
+            return
+        self.config["meeting_model"] = key
+        save_config(self.config)
+        log.info("Meeting model changed to: %s", key)
+        try:
+            if self.tray_icon:
+                self.tray_icon.update_menu()
+        except Exception:
+            pass
 
     def _toggle_translate_mode(self):
         enabling = not self.config.get("translate_mode", False)
@@ -6737,37 +6923,45 @@ class WhisperTypeApp:
         """Thread-safe check — used by the tray menu predicates."""
         return self._active_meeting is not None
 
-    def _toggle_meeting(self, diarize_mode=False):
+    def _toggle_meeting(self):
         """Start a meeting if none active, else stop the current one.
         Invoked from the 'Start/Stop Meeting' tray menu item.
 
-        diarize_mode=True picks the AssemblyAI flow (records full audio,
-        speaker-labelled transcript posted-back later).
+        The transcription model — and whether the meeting is diarized
+        or chunked — is determined by the user's Transcribe → Model
+        selection (config['meeting_model']).
         """
         with self._meeting_lock:
             already_active = self._active_meeting is not None
         if already_active:
             self._stop_meeting()
         else:
-            self._start_meeting(diarize_mode=diarize_mode)
+            self._start_meeting()
 
-    def _start_meeting(self, diarize_mode=False):
-        """Start a long-form meeting capture.
-
-        Blocks the main press-to-talk hotkey until the meeting is stopped,
-        because running two PyAudio streams on the same device
-        simultaneously is unreliable on Windows.
-        """
-        # Diarized mode: enforce the AssemblyAI key first so the user
-        # doesn't lose a meeting recording to a missing key. Open the
-        # key dialog if not configured.
-        if diarize_mode:
-            assembly_key = (self.config.get("assemblyai_api_key") or "").strip()
-            if not assembly_key or self._assemblyai_transcriber is None:
-                log.warning("Diarized meeting requested but no AssemblyAI key")
+    def _start_meeting(self):
+        """Start a long-form meeting capture using the selected meeting
+        model. AssemblyAI Universal-2 → diarized recording. Anything
+        else → chunked transcription with that model."""
+        # Resolve the model first; if it can't be activated (missing API
+        # key, load failure, etc.) fail loud BEFORE we open the recorder.
+        model_key = self.config.get("meeting_model", "groq_turbo")
+        transcriber, language, is_diarized = self._resolve_meeting_model(model_key)
+        if transcriber is None:
+            log.warning("Meeting blocked: model %r not available", model_key)
+            # Map common cases to a clearer message + open the relevant
+            # key dialog so the user can fix it on the spot.
+            if model_key.startswith("openai_") and not self.config.get("openai_api_key", "").strip():
+                self.overlay.show_error("Set OpenAI API key first")
+                self._set_openai_api_key()
+            elif model_key == "groq_turbo" and not self.config.get("groq_api_key", "").strip():
+                self.overlay.show_error("Set Groq API key first")
+                self._set_groq_api_key()
+            elif model_key == "assemblyai_universal_2" and not self.config.get("assemblyai_api_key", "").strip():
                 self.overlay.show_error("Set AssemblyAI API key first")
                 self._set_assemblyai_api_key()
-                return
+            else:
+                self.overlay.show_error(f"Meeting model {model_key} unavailable")
+            return
 
         with self._meeting_lock:
             if self._active_meeting is not None:
@@ -6781,7 +6975,12 @@ class WhisperTypeApp:
                 self.overlay.show_error("Model still loading")
                 return
             try:
-                session = MeetingSession(self, diarize_mode=diarize_mode)
+                session = MeetingSession(
+                    self,
+                    diarize_mode=is_diarized,
+                    chunk_transcriber=(None if is_diarized else transcriber),
+                    chunk_language=language,
+                )
                 session.start()
                 self._active_meeting = session
             except Exception as e:
@@ -6791,14 +6990,14 @@ class WhisperTypeApp:
 
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("meeting")
-            label = ("Meeting recording (diarized)..." if diarize_mode
-                     else "Meeting recording...")
+            label = ("Meeting recording (diarized)..." if is_diarized
+                     else f"Meeting recording ({model_key})...")
             self.tray_icon.title = f"WhisperType — {label}"
         overlay_msg = ("  🎤  Diarized meeting recording — click tray to stop  "
-                       if diarize_mode else
+                       if is_diarized else
                        "  🎙  Meeting recording — click tray to stop  ")
         self.overlay.show(overlay_msg, bg_color="#581C87", duration=2500)
-        log.info("Meeting active%s", " (diarized)" if diarize_mode else "")
+        log.info("Meeting active (model=%s, diarized=%s)", model_key, is_diarized)
 
     def _stop_meeting(self):
         """Stop the in-progress meeting, produce a markdown file with
