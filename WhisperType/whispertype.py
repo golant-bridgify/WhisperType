@@ -5769,30 +5769,26 @@ class WhisperTypeApp:
         labels = {"off": "Off", "preview": "Preview", "live_dictation": "Live Dictation"}
         log.info("Streaming mode set to: %s", labels.get(mode, mode))
 
-    # Static base of the Model menu. OpenAI options are appended only when
-    # an OpenAI key is configured (see _build_model_menu).
+    # Model menu rows in display order (top → bottom).
     # Tuple shape: (label, model_size, backend, translate, openai_model)
     # `openai_model` is the openai_model config value to set; "" for non-OpenAI rows.
-    _MENU_MODELS_BASE = [
+    # Order: OpenAI cloud (best) → Groq cloud → local fallbacks. OpenAI rows
+    # are filtered out by _build_model_menu when no OpenAI API key is set.
+    _MENU_MODELS_ORDERED = [
+        ("OpenAI gpt-4o-transcribe ⭐ (best)", "large-v3-turbo", "openai", False, "gpt-4o-transcribe"),
+        ("OpenAI gpt-4o-mini-transcribe (fast/cheap)", "large-v3-turbo", "openai", False, "gpt-4o-mini-transcribe"),
+        ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
+        ("Groq Hebrew to English", "large-v3-turbo", "groq", True, ""),
         ("Hebrew Turbo Local", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
         ("English Distil Local", "distil-large-v3", "local", False, ""),
         ("General Turbo Local", "large-v3-turbo", "local", False, ""),
-        ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
-        ("Groq Hebrew to English", "large-v3-turbo", "groq", True, ""),
-    ]
-
-    _MENU_MODELS_OPENAI = [
-        # (label, model_size for local fallback, backend, translate, openai_model)
-        ("OpenAI gpt-4o-transcribe ⭐ (best)", "large-v3-turbo", "openai", False, "gpt-4o-transcribe"),
-        ("OpenAI gpt-4o-mini-transcribe (fast/cheap)", "large-v3-turbo", "openai", False, "gpt-4o-mini-transcribe"),
     ]
 
     def _build_model_menu(self):
-        """Build the Model menu, including OpenAI rows only if a key is set."""
+        """Build the Model menu. OpenAI rows are skipped when no key is set."""
         import pystray
-        rows = list(self._MENU_MODELS_BASE)
-        if (self.config.get("openai_api_key") or "").strip():
-            rows = rows + list(self._MENU_MODELS_OPENAI)
+        has_openai = bool((self.config.get("openai_api_key") or "").strip())
+        rows = [r for r in self._MENU_MODELS_ORDERED if r[2] != "openai" or has_openai]
         items = []
         for label, model_id, backend, translate, openai_model in rows:
             items.append(pystray.MenuItem(
