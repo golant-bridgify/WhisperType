@@ -7268,6 +7268,23 @@ class WhisperTypeApp:
             history = list(history)
             history.reverse()  # newest first
 
+            # Per-line bidi normalisation. Goal: Hebrew-bearing lines
+            # render right-aligned, LTR lines (metadata, English) stay
+            # left-aligned. The Unicode bidi algorithm picks paragraph
+            # direction from the first strong character; prefixing a
+            # Hebrew line with U+200F (RTL Mark) forces RTL paragraph
+            # direction so editors that respect bidi (Notepad, VSCode,
+            # Word) render the line at the right margin.
+            RLM = '‏'
+
+            def _is_hebrew(s):
+                return any('֐' <= c <= '׿' for c in s)
+
+            def _bidi_line(s):
+                if _is_hebrew(s):
+                    return s if s.startswith(RLM) else RLM + s
+                return s
+
             out_path = os.path.join(CONFIG_DIR, "history.txt")
             lines = []
             lines.append(f"WhisperType — Transcription History ({len(history)} entries)")
@@ -7299,10 +7316,11 @@ class WhisperTypeApp:
 
                 lines.append("─" * 70)
                 lines.append(f"[{' | '.join(meta)}]")
-                # The text already carries U+200F for Hebrew so editors
-                # that respect it (Notepad, VSCode, most modern ones) will
-                # render Hebrew right-to-left automatically.
-                lines.append(entry.get("text", "").rstrip())
+                # Each line of the entry text is independently classified —
+                # mixed multi-line entries get correct per-line alignment.
+                text_value = entry.get("text", "").rstrip()
+                for tline in text_value.split("\n"):
+                    lines.append(_bidi_line(tline))
                 lines.append("")
 
             with open(out_path, "w", encoding="utf-8") as f:
