@@ -1968,7 +1968,12 @@ class OpenAITranscriber(BaseTranscriber):
         "Hebrew. If English is spoken, output English. If both languages "
         "are mixed in one utterance, preserve each phrase in its original "
         "language. Output every word the speaker said, including filler "
-        "words and repetitions."
+        "words and repetitions. "
+        "CRITICAL: If the audio contains no actual speech — only silence, "
+        "background noise, breathing, mouse clicks, keyboard sounds, fans, "
+        "or static — output an empty string. Do NOT invent words to fill "
+        "the void. An empty transcription is the correct output for an "
+        "audio clip that does not contain speech."
     )
 
     def _build_gpt4o_prompt(self, include_he_en=True):
@@ -5125,22 +5130,25 @@ class WhisperTypeApp:
 
         duration_sec = len(audio) / 16000
 
+        # Peak RMS over a sliding 300ms window — answers "was there speech
+        # SOMEWHERE in this clip?" rather than "what's the average?".
+        # Computed always (cheap), used both for the silent guard below
+        # and the post-transcription hallucination filter further down.
+        audio_rms = audio_peak_rms(audio, sample_rate=16000, window_ms=300)
+        log.info("Audio peak RMS: %.5f over %.1fs", audio_rms, duration_sec)
+
         # Silent-audio detection.
-        # Scenario: user presses hotkey after Windows sleep/wake or long idle.
-        # PyAudio opens the WASAPI stream before the audio driver is fully
-        # re-initialised, so the stream returns silent frames for several
-        # seconds even though recording looks normal. User then gets a
-        # Whisper hallucination like "Thank you" and wonders why their
-        # speech wasn't transcribed.
-        # Heuristic: if the clip is longer than 1.5s but peak RMS over a
-        # sliding 300ms window is near zero, the mic almost certainly
-        # didn't capture real audio. Peak (not mean) because a 2s clip
-        # containing a single "ok" dictated quickly with key held a bit
-        # longer has plenty of audible speech but low mean RMS; peak RMS
-        # correctly identifies "there was speech SOMEWHERE in this clip".
+        # Threshold tuning history:
+        #   0.003 was the original — caught only literally-dead mic.
+        #   Real-world ambient noise (computer fan, light breath, mouse
+        #   clicks) registers 0.003-0.008 and slipped through, which
+        #   gpt-4o-transcribe then "hallucinates" a plausible Hebrew
+        #   phrase from. Bumping to 0.008 (~-42dB) closes that gap;
+        #   normal speech peaks at 0.05-0.3 and quiet whispers around
+        #   0.02-0.05, so the threshold remains comfortably below
+        #   anything intentional.
         if duration_sec >= 1.5:
-            audio_rms = audio_peak_rms(audio, sample_rate=16000, window_ms=300)
-            if audio_rms < 0.003:  # ~-50dB peak — effectively silent everywhere
+            if audio_rms < 0.008:
                 self._handle_silent_capture(duration_sec, audio_rms)
                 return
 
@@ -5233,6 +5241,12 @@ class WhisperTypeApp:
                                 else:
                                     text = combined
 
+                    # Hallucination guard: drop short, slow output produced
+                    # from borderline-noisy audio. Treats it as if
+                    # transcription was empty so the "no speech" branch fires.
+                    if text and self._is_likely_hallucination(text, audio_rms, duration_sec):
+                        text = ""
+
                     # Single paste of complete text
                     if text:
                         # LLM cleanup (removes filler words, fixes punctuation)
@@ -5267,6 +5281,10 @@ class WhisperTypeApp:
                             beam_size=beam,
                             task=self._get_task(),
                         )
+
+                    # Same hallucination guard as the partial path.
+                    if text and self._is_likely_hallucination(text, audio_rms, duration_sec):
+                        text = ""
 
                     if text:
                         # LLM cleanup (see comment in partial-path above)
@@ -6006,6 +6024,42 @@ class WhisperTypeApp:
         if device == "off":
             return
         play_beep(1000, 100, device_index=device)
+
+    def _is_likely_hallucination(self, text, audio_rms, duration_sec):
+        """Heuristic: post-transcription, decide whether the model invented
+        words from near-silent audio.
+
+        Whisper-family models are trained on YouTube + podcast captions
+        and have a strong bias toward producing SOMETHING when handed
+        audio. On a clip with only ambient noise (fans, breath, mouse
+        clicks), gpt-4o-transcribe has been observed to produce short,
+        slow, plausible Hebrew phrases like "למזלי", "כי בשנה", "אפשר
+        להסביר" — none of which the user said.
+
+        Three signals together flag a likely hallucination:
+          - audio_rms in the borderline range (0.008-0.025): above the
+            silent guard but below typical conversational speech (≥ 0.05)
+          - text is short (< 50 chars): real utterances longer than that
+            are almost always intentional
+          - chars/sec < 4: real speech runs 8-15 chars/sec; well-below
+            that on a clip without explicit pauses is suspicious
+        """
+        if not text:
+            return False
+        if duration_sec < 1.5:
+            return False  # too short to judge by char rate
+        cleaned = text.replace('‏', '').replace('‎', '').strip()
+        if not cleaned or len(cleaned) >= 50:
+            return False
+        chars_per_sec = len(cleaned) / max(0.5, duration_sec)
+        if audio_rms < 0.025 and chars_per_sec < 4.0:
+            log.warning(
+                "Likely hallucination: %d chars over %.1fs (%.1f chars/sec), "
+                "audio peak RMS %.5f. Rejecting transcription %r.",
+                len(cleaned), duration_sec, chars_per_sec, audio_rms, cleaned,
+            )
+            return True
+        return False
 
     def _handle_silent_capture(self, duration_sec, rms):
         """Called when a recording came back silent (RMS below threshold).
