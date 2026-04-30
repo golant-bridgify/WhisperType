@@ -2372,26 +2372,32 @@ class AssemblyAITranscriber:
             raise RuntimeError(f"AssemblyAI upload returned no upload_url: {body}")
         return body["upload_url"]
 
-    def submit(self, audio_url, language_code=None, speaker_labels=True):
+    def submit(self, audio_url, language_code=None, speaker_labels=True,
+               speech_model="universal-2"):
         """Submit a transcription job. Returns the transcript id.
 
         language_code=None lets the model auto-handle Hebrew/English
         mixed audio (Universal-2 detects language internally without
         an explicit `language_detection` flag). Pass "he" or "en" to
         force.
+
+        speech_model: AssemblyAI's API now (2025+) requires explicit
+        model selection. Valid values include "universal-2" (stable
+        multilingual default) and "universal-3-pro" (newer, more
+        expensive). We default to universal-2 which supports Hebrew
+        and speaker_labels reliably.
         """
         s = self._ensure_session()
         body = {
             "audio_url": audio_url,
             "speaker_labels": bool(speaker_labels),
+            "speech_model": speech_model,
         }
         if language_code:
             body["language_code"] = language_code
-        # No `language_detection` — the parameter conflicts with the
-        # default Universal model and was returning HTTP 400 in
-        # practice. Universal handles auto-detect internally.
-        log.info("AssemblyAI: submitting transcript (speaker_labels=%s, lang=%s)",
-                 body["speaker_labels"], language_code or "auto")
+        # No `language_detection` — Universal handles it internally.
+        log.info("AssemblyAI: submitting transcript (model=%s speaker_labels=%s lang=%s)",
+                 speech_model, body["speaker_labels"], language_code or "auto")
         r = s.post(
             self.TRANSCRIPT_URL,
             headers={"authorization": self.api_key,
