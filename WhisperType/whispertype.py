@@ -4485,15 +4485,40 @@ class WhisperTypeApp:
                     continue
 
                 if self.config.get("recording_mode") == "toggle":
-                    # Toggle mode: press to start, press again to stop
+                    # Toggle mode: press to start, press again to stop.
+                    #
+                    # Habit fallback: if the user holds the chord by reflex
+                    # (left over from hold-mode muscle memory), we don't
+                    # want recording to keep running until they remember to
+                    # press again. So while waiting for the release, we
+                    # measure how long the chord stayed pressed. If they
+                    # held it ≥ 2.0s, we interpret the release as a stop —
+                    # same behaviour as hold mode for that one session.
+                    # Quick taps (< 2.0s) keep pure toggle semantics.
                     if self.is_recording:
+                        # User pressed again to stop — pure toggle, no hold
+                        # tracking needed since recording is already running.
                         self._stop_and_transcribe()
+                        while any(keyboard.is_pressed(p) for p in parts):
+                            time.sleep(0.05)
+                        time.sleep(0.2)
                     else:
+                        # User pressed to start — track elapsed press time.
                         self._start_recording()
-                    # Wait for key release (debounce) before listening again
-                    while any(keyboard.is_pressed(p) for p in parts):
-                        time.sleep(0.05)
-                    time.sleep(0.2)  # extra debounce
+                        press_start = time.time()
+                        TOGGLE_HOLD_THRESHOLD_SEC = 2.0
+                        while any(keyboard.is_pressed(p) for p in parts):
+                            time.sleep(0.05)
+                        held = time.time() - press_start
+                        if held >= TOGGLE_HOLD_THRESHOLD_SEC:
+                            log.info(
+                                "Toggle mode: chord held %.1fs ≥ %.1fs — "
+                                "treating release as stop (hold-by-habit fallback)",
+                                held, TOGGLE_HOLD_THRESHOLD_SEC,
+                            )
+                            self._stop_and_transcribe()
+                        time.sleep(0.2)  # extra debounce
+                        self._hotkey_event.clear()
                 else:
                     # Hold mode (default): hold to record, release to stop.
                     #
@@ -6037,7 +6062,11 @@ class WhisperTypeApp:
         self._force_show_error_overlay(
             "Mic silent — try again (will auto-restart if persists)"
         )
-        self._flash_error_tray("Mic captured silence — try again", duration_sec=5.0)
+        # 2.0s, not 5.0: long enough to register the error visually,
+        # short enough that the user doesn't feel locked out before
+        # retrying. (The hotkey itself was never blocked — only the
+        # tray icon's red-X made the user wait.)
+        self._flash_error_tray("Mic captured silence — try again", duration_sec=2.0)
 
     def _force_show_error_overlay(self, msg):
         """Show an error overlay bypassing silent_mode.
