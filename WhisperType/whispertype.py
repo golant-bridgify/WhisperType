@@ -2375,8 +2375,10 @@ class AssemblyAITranscriber:
     def submit(self, audio_url, language_code=None, speaker_labels=True):
         """Submit a transcription job. Returns the transcript id.
 
-        language_code=None lets AssemblyAI auto-detect (good for
-        Hebrew/English mixed). Pass "he" or "en" to force.
+        language_code=None lets the model auto-handle Hebrew/English
+        mixed audio (Universal-2 detects language internally without
+        an explicit `language_detection` flag). Pass "he" or "en" to
+        force.
         """
         s = self._ensure_session()
         body = {
@@ -2385,9 +2387,9 @@ class AssemblyAITranscriber:
         }
         if language_code:
             body["language_code"] = language_code
-            body["language_detection"] = False
-        else:
-            body["language_detection"] = True
+        # No `language_detection` — the parameter conflicts with the
+        # default Universal model and was returning HTTP 400 in
+        # practice. Universal handles auto-detect internally.
         log.info("AssemblyAI: submitting transcript (speaker_labels=%s, lang=%s)",
                  body["speaker_labels"], language_code or "auto")
         r = s.post(
@@ -2397,6 +2399,12 @@ class AssemblyAITranscriber:
             json=body,
             timeout=30,
         )
+        if r.status_code >= 400:
+            # Surface the actual error body — AssemblyAI returns helpful
+            # JSON with the rejected field, e.g. {"error": "..."} or
+            # validation details. Plain raise_for_status() throws away
+            # the body which makes 400 root-causing painful.
+            log.error("AssemblyAI submit HTTP %d: %s", r.status_code, r.text[:500])
         r.raise_for_status()
         result = r.json()
         if "id" not in result:
@@ -2755,6 +2763,17 @@ class MeetingSession:
             loopback_device_index if loopback_device_index is not None
             else app.config.get("loopback_device_index")
         )
+        # In diarized mode, the entire point is "who said what" — and
+        # in real meetings the OTHER side is almost always coming
+        # through the system audio (Zoom/Teams/Meet/etc.), not the
+        # mic. If a loopback device is available we force-promote the
+        # source to "both" so AssemblyAI receives both speakers'
+        # audio and can label them. Without this, only the user's
+        # voice reaches the API and only Speaker A is detected.
+        if diarize_mode and LoopbackRecorder.is_available() and self.source != "both":
+            log.info("Diarized meeting: promoting source '%s' → 'both' so the "
+                     "other side of any video call is captured", self.source)
+            self.source = "both"
         # Diarized mode: instead of chunked Groq/OpenAI/local transcription
         # while the meeting runs, just write all audio to one WAV file. On
         # stop(), upload to AssemblyAI for speaker-labelled transcription
@@ -3033,7 +3052,12 @@ class MeetingSession:
                 log.warning("Could not delete meeting WAV %s: %s", self._wav_path, e)
         except Exception as e:
             log.error("Diarized meeting transcription failed: %s", e)
+            log.info("WAV preserved for manual retry: %s", self._wav_path)
             try:
+                # Surface BOTH the failure and the path the user can find
+                # the audio at. Two messages because they're different
+                # audiences (overlay = "something broke", file path =
+                # actionable next step).
                 self.app.overlay.show_error(f"AssemblyAI failed: {str(e)[:80]}")
             except Exception:
                 pass
