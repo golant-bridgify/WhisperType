@@ -126,7 +126,7 @@ DEFAULT_CONFIG = {
     #   "openai_gpt4o" / "openai_gpt4o_mini" / "groq_turbo"
     #   "local_hebrew_turbo" / "local_english_distil"
     #   "assemblyai_universal_2"  (always diarized — speaker labels)
-    "meeting_model": "groq_turbo",
+    "meeting_model": "assemblyai_universal_2",
     "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
     "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
     "groq_he_en_bias": True,  # True = bias Groq language detection to Hebrew/English only (prevents false French/etc. detection)
@@ -4481,28 +4481,6 @@ class WhisperTypeApp:
                         pystray.Menu(self._build_beep_output_menu),
                     ),
                     pystray.Menu.SEPARATOR,
-                    # Group 4 — Transcribe actions: live (meeting) + file.
-                    # All routes through the Transcribe → Model selector.
-                    pystray.MenuItem(
-                        "Transcribe",
-                        pystray.Menu(
-                            pystray.MenuItem(
-                                "Model",
-                                pystray.Menu(self._build_meeting_model_menu),
-                            ),
-                            pystray.Menu.SEPARATOR,
-                            # Dynamic label: swaps Start ↔ Stop based on session state.
-                            pystray.MenuItem(
-                                lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
-                                               else "🎙  Start Meeting (uses selected Model)"),
-                                lambda: self._toggle_meeting(),
-                            ),
-                            pystray.Menu.SEPARATOR,
-                            pystray.MenuItem("File → Hebrew", lambda: self._transcribe_file("he")),
-                            pystray.MenuItem("File → English", lambda: self._transcribe_file("en")),
-                        ),
-                    ),
-                    pystray.Menu.SEPARATOR,
                     # Group 5 — Backend configuration
                     pystray.MenuItem(
                         "Groq-Only Options",
@@ -4537,6 +4515,27 @@ class WhisperTypeApp:
                         lambda item: f"Hotkey: {self.config.get('hotkey', 'ctrl+space')}...",
                         lambda: self._open_hotkey_dialog(),
                     ),
+                ),
+            ),
+            # Top-level Transcribe submenu — meetings + file transcription,
+            # both driven by the Transcribe → Model selector. Sits below
+            # Options as a sibling so it's reachable without diving in.
+            pystray.MenuItem(
+                "Transcribe",
+                pystray.Menu(
+                    pystray.MenuItem(
+                        "Model",
+                        pystray.Menu(self._build_meeting_model_menu),
+                    ),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem(
+                        lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
+                                       else "🎙  Start Meeting (uses selected Model)"),
+                        lambda: self._toggle_meeting(),
+                    ),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("File → Hebrew", lambda: self._transcribe_file("he")),
+                    pystray.MenuItem("File → English", lambda: self._transcribe_file("en")),
                 ),
             ),
             pystray.MenuItem("History", lambda: self._show_history()),
@@ -5764,7 +5763,7 @@ class WhisperTypeApp:
             # Meeting. This way the user picks ONE model in the Model
             # submenu and it applies both to live meetings and to file
             # transcription.
-            model_key = self.config.get("meeting_model", "groq_turbo")
+            model_key = self.config.get("meeting_model", "assemblyai_universal_2")
             transcriber, _model_lang, is_diarized = self._resolve_meeting_model(model_key)
             if transcriber is None:
                 log.warning("File transcribe blocked: model %r not available", model_key)
@@ -6118,12 +6117,12 @@ class WhisperTypeApp:
     # `requires_one_of_keys` is a list of config-key names that must be
     # non-empty for the row to be selectable; empty = always available.
     _MEETING_MODELS = [
-        ("OpenAI gpt-4o-transcribe ⭐ (best)", "openai_gpt4o", ["openai_api_key"]),
+        ("AssemblyAI Universal-2 ⭐ (with speaker labels)", "assemblyai_universal_2", ["assemblyai_api_key"]),
+        ("OpenAI gpt-4o-transcribe (best non-diarized)", "openai_gpt4o", ["openai_api_key"]),
         ("OpenAI gpt-4o-mini-transcribe (fast/cheap)", "openai_gpt4o_mini", ["openai_api_key"]),
         ("Groq Turbo", "groq_turbo", ["groq_api_key"]),
         ("Hebrew Turbo Local (free)", "local_hebrew_turbo", []),
         ("English Distil Local (free)", "local_english_distil", []),
-        ("AssemblyAI Universal-2 (with speaker labels)", "assemblyai_universal_2", ["assemblyai_api_key"]),
     ]
 
     def _resolve_meeting_model(self, key=None):
@@ -6132,7 +6131,7 @@ class WhisperTypeApp:
         if the model can't be activated (missing API key, load error, etc.).
         """
         if key is None:
-            key = self.config.get("meeting_model", "groq_turbo")
+            key = self.config.get("meeting_model", "assemblyai_universal_2")
         cached = self._meeting_xcribers.get(key)
         if cached is not None:
             return cached
@@ -6237,7 +6236,7 @@ class WhisperTypeApp:
                 display,
                 (lambda k: lambda: self._set_meeting_model(k))(key),
                 checked=(lambda k: lambda item:
-                         self.config.get("meeting_model", "groq_turbo") == k)(key),
+                         self.config.get("meeting_model", "assemblyai_universal_2") == k)(key),
                 radio=True,
                 enabled=(not missing),
             ))
@@ -6944,7 +6943,7 @@ class WhisperTypeApp:
         else → chunked transcription with that model."""
         # Resolve the model first; if it can't be activated (missing API
         # key, load failure, etc.) fail loud BEFORE we open the recorder.
-        model_key = self.config.get("meeting_model", "groq_turbo")
+        model_key = self.config.get("meeting_model", "assemblyai_universal_2")
         transcriber, language, is_diarized = self._resolve_meeting_model(model_key)
         if transcriber is None:
             log.warning("Meeting blocked: model %r not available", model_key)
