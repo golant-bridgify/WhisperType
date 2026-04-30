@@ -3155,7 +3155,7 @@ def set_auto_start(enabled):
 # Transcription History
 # ============================================================
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
-MAX_HISTORY = 1000
+MAX_HISTORY = 500
 
 # Serialize read-modify-write of history — add_history_entry can be called
 # from multiple transcription threads (live dictation, streaming, final).
@@ -4094,19 +4094,20 @@ class WhisperTypeApp:
                         pystray.Menu(self._build_beep_output_menu),
                     ),
                     pystray.Menu.SEPARATOR,
-                    # Group 4 — Actions
-                    # Dynamic label: swaps between "Start Meeting" and
-                    # "Stop Meeting" based on whether a session is active.
+                    # Group 4 — Transcribe actions: live (meeting) + file
                     pystray.MenuItem(
-                        lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
-                                       else "🎙  Start Meeting (long recording)"),
-                        lambda: self._toggle_meeting(),
-                    ),
-                    pystray.MenuItem(
-                        "Transcribe File",
+                        "Transcribe",
                         pystray.Menu(
-                            pystray.MenuItem("Hebrew", lambda: self._transcribe_file("he")),
-                            pystray.MenuItem("English", lambda: self._transcribe_file("en")),
+                            # Dynamic label: swaps between "Start Meeting"
+                            # and "Stop Meeting" based on session state.
+                            pystray.MenuItem(
+                                lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
+                                               else "🎙  Start Meeting (long recording)"),
+                                lambda: self._toggle_meeting(),
+                            ),
+                            pystray.Menu.SEPARATOR,
+                            pystray.MenuItem("File → Hebrew", lambda: self._transcribe_file("he")),
+                            pystray.MenuItem("File → English", lambda: self._transcribe_file("en")),
                         ),
                     ),
                     pystray.Menu.SEPARATOR,
