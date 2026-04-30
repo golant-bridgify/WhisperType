@@ -120,6 +120,7 @@ DEFAULT_CONFIG = {
     "groq_model": "whisper-large-v3-turbo",  # Groq Whisper model
     "openai_api_key": "",  # OpenAI API key (from https://platform.openai.com/api-keys)
     "openai_model": "gpt-4o-transcribe",  # OpenAI model: "gpt-4o-transcribe" / "gpt-4o-mini-transcribe"
+    "assemblyai_api_key": "",  # AssemblyAI key (from https://www.assemblyai.com) — used only for the diarized meeting flow
     "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
     "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
     "groq_he_en_bias": True,  # True = bias Groq language detection to Hebrew/English only (prevents false French/etc. detection)
@@ -2282,6 +2283,169 @@ class OpenAITranscriber(BaseTranscriber):
 
 
 # ============================================================
+# AssemblyAI — async transcription with speaker diarization
+# ============================================================
+class AssemblyAITranscriber:
+    """Async transcription via AssemblyAI's REST API. Used ONLY for the
+    meeting "with speaker labels" mode — long audio uploaded after the
+    meeting ends, processed in the cloud (~10-20% of audio duration),
+    returned as utterances tagged Speaker A/B/C/...
+
+    Not used as a press-to-talk transcriber: AssemblyAI's strength is
+    diarization quality on long continuous audio, and its latency is
+    too high (10s+ minimum even for a short clip) for live dictation.
+    """
+    UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
+    TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
+
+    def __init__(self, api_key=""):
+        self.api_key = api_key
+        self._session = None
+
+    def _ensure_session(self):
+        if self._session is None:
+            import requests
+            self._session = requests.Session()
+        return self._session
+
+    def verify_key(self, timeout=10):
+        """Light /transcript GET — listing endpoint requires auth.
+        Returns (ok, message)."""
+        if not self.api_key:
+            return False, "No API key"
+        try:
+            import requests
+        except ImportError as e:
+            return False, f"'requests' not installed: {e}"
+        try:
+            log.info("AssemblyAI verify_key: GET /transcript (timeout=%s)", timeout)
+            s = self._ensure_session()
+            r = s.get(
+                self.TRANSCRIPT_URL,
+                headers={"authorization": self.api_key},
+                params={"limit": 1},
+                timeout=(5, timeout),
+            )
+            log.info("AssemblyAI verify_key: HTTP %d", r.status_code)
+            if r.status_code == 200:
+                return True, "Key valid"
+            if r.status_code == 401:
+                return False, "Invalid API key"
+            return False, f"HTTP {r.status_code}: {r.text[:100]}"
+        except requests.exceptions.Timeout:
+            return False, "Network timeout — check internet"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"Cannot reach AssemblyAI: {type(e).__name__}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def upload_file(self, file_path, chunk_size=5 * 1024 * 1024, timeout=600):
+        """Upload an audio file to AssemblyAI's storage.
+
+        AssemblyAI's /upload accepts arbitrary file size via streaming;
+        we send in 5 MB chunks. Returns the upload_url to pass into
+        the /transcript request.
+        """
+        if not self.api_key:
+            raise RuntimeError("AssemblyAI API key not set")
+        s = self._ensure_session()
+
+        def _read_chunks(path):
+            with open(path, "rb") as f:
+                while True:
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    yield data
+
+        log.info("AssemblyAI: uploading %s (%d bytes)",
+                 os.path.basename(file_path), os.path.getsize(file_path))
+        r = s.post(
+            self.UPLOAD_URL,
+            headers={"authorization": self.api_key},
+            data=_read_chunks(file_path),
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        body = r.json()
+        if "upload_url" not in body:
+            raise RuntimeError(f"AssemblyAI upload returned no upload_url: {body}")
+        return body["upload_url"]
+
+    def submit(self, audio_url, language_code=None, speaker_labels=True):
+        """Submit a transcription job. Returns the transcript id.
+
+        language_code=None lets AssemblyAI auto-detect (good for
+        Hebrew/English mixed). Pass "he" or "en" to force.
+        """
+        s = self._ensure_session()
+        body = {
+            "audio_url": audio_url,
+            "speaker_labels": bool(speaker_labels),
+        }
+        if language_code:
+            body["language_code"] = language_code
+            body["language_detection"] = False
+        else:
+            body["language_detection"] = True
+        log.info("AssemblyAI: submitting transcript (speaker_labels=%s, lang=%s)",
+                 body["speaker_labels"], language_code or "auto")
+        r = s.post(
+            self.TRANSCRIPT_URL,
+            headers={"authorization": self.api_key,
+                     "content-type": "application/json"},
+            json=body,
+            timeout=30,
+        )
+        r.raise_for_status()
+        result = r.json()
+        if "id" not in result:
+            raise RuntimeError(f"AssemblyAI submit returned no id: {result}")
+        return result["id"]
+
+    def poll(self, transcript_id, poll_interval_sec=15.0, max_wait_sec=3600.0):
+        """Poll the transcript endpoint until status is completed or error.
+
+        Default cap of 1 hour matches the longest meeting we'd expect;
+        AssemblyAI typically completes faster than 20% of audio length.
+        """
+        s = self._ensure_session()
+        url = f"{self.TRANSCRIPT_URL}/{transcript_id}"
+        deadline = time.time() + max_wait_sec
+        last_status = None
+        while time.time() < deadline:
+            r = s.get(
+                url,
+                headers={"authorization": self.api_key},
+                timeout=30,
+            )
+            r.raise_for_status()
+            body = r.json()
+            status = body.get("status")
+            if status != last_status:
+                log.info("AssemblyAI: transcript %s status=%s", transcript_id, status)
+                last_status = status
+            if status == "completed":
+                return body
+            if status == "error":
+                raise RuntimeError(f"AssemblyAI transcription error: {body.get('error', '?')}")
+            time.sleep(poll_interval_sec)
+        raise RuntimeError(f"AssemblyAI transcription timed out after {max_wait_sec}s")
+
+    def transcribe_file_sync(self, file_path, language_code=None, speaker_labels=True,
+                              poll_interval_sec=15.0, max_wait_sec=3600.0):
+        """High-level: upload + submit + poll. Returns the completed
+        transcript body (dict with text, utterances, etc.)."""
+        upload_url = self.upload_file(file_path)
+        transcript_id = self.submit(upload_url,
+                                     language_code=language_code,
+                                     speaker_labels=speaker_labels)
+        return self.poll(transcript_id,
+                         poll_interval_sec=poll_interval_sec,
+                         max_wait_sec=max_wait_sec)
+
+
+# ============================================================
 # Groq LLM Cleanup — post-process raw Whisper output
 # ============================================================
 class GroqLLMCleaner:
@@ -2580,7 +2744,7 @@ class MeetingSession:
     CHUNK_SECONDS = 45
 
     def __init__(self, app, source=None, input_device_index=None,
-                 loopback_device_index=None):
+                 loopback_device_index=None, diarize_mode=False):
         self.app = app
         self.source = source or app.config.get("recording_source", "both")
         self._input_device_index = (
@@ -2591,6 +2755,14 @@ class MeetingSession:
             loopback_device_index if loopback_device_index is not None
             else app.config.get("loopback_device_index")
         )
+        # Diarized mode: instead of chunked Groq/OpenAI/local transcription
+        # while the meeting runs, just write all audio to one WAV file. On
+        # stop(), upload to AssemblyAI for speaker-labelled transcription
+        # in the background. Result lands as markdown 10-20 min later.
+        self.diarize_mode = diarize_mode
+        self._wav_path = None         # WAV file path used in diarize_mode
+        self._wav_writer = None       # wave.open writer used in diarize_mode
+        self._diarize_job_thread = None
         self.start_time = None          # float (time.time()) when start() was called
         self.stop_time = None
         # chunks: list of dicts {index, timestamp_rel, text, status}
@@ -2615,17 +2787,35 @@ class MeetingSession:
         self._active = True
         self.start_time = time.time()
         self._stop_event.clear()
+        # Diarized mode opens a single WAV file that the rotation loop
+        # appends to instead of submitting chunks for transcription.
+        if self.diarize_mode:
+            import datetime as _dt
+            stamp = _dt.datetime.fromtimestamp(self.start_time).strftime("%Y-%m-%d_%H-%M")
+            self._wav_path = os.path.join(MEETINGS_DIR, f"{stamp}_meeting_audio.wav")
+            self._wav_writer = wave.open(self._wav_path, "wb")
+            self._wav_writer.setnchannels(1)
+            self._wav_writer.setsampwidth(2)
+            self._wav_writer.setframerate(16000)
+            log.info("Diarized meeting started (source=%s, wav=%s)",
+                     self.source, self._wav_path)
+        else:
+            log.info("Meeting started (source=%s, chunk=%ds)",
+                     self.source, self.CHUNK_SECONDS)
         self._open_recorders()
         self._rotation_thread = threading.Thread(
             target=self._rotation_loop, daemon=True
         )
         self._rotation_thread.start()
-        log.info("Meeting started (source=%s, chunk=%ds)",
-                 self.source, self.CHUNK_SECONDS)
 
     def stop(self, save=True):
         """Stop the meeting. If save=True, writes the markdown file and
-        returns its path. Otherwise returns None."""
+        returns its path. Otherwise returns None.
+
+        In diarize_mode the markdown is NOT written immediately —
+        AssemblyAI processing takes 5-20 minutes. The WAV path is
+        returned right away as a placeholder, and the markdown is
+        written in a background thread when AssemblyAI finishes."""
         if not self._active:
             return None
         self._active = False
@@ -2639,12 +2829,27 @@ class MeetingSession:
         # Transcribe whatever audio was in the current recorder
         self._finalise_current_chunk()
 
+        duration_sec = self.stop_time - self.start_time
+        log.info("Meeting stopped (duration=%.1fs%s)",
+                 duration_sec,
+                 ", diarized" if self.diarize_mode else f", chunks={len(self.chunks)}")
+
+        if self.diarize_mode:
+            # Close the WAV writer, kick off background diarization.
+            if self._wav_writer is not None:
+                try:
+                    self._wav_writer.close()
+                except Exception as e:
+                    log.warning("Closing meeting WAV failed: %s", e)
+                self._wav_writer = None
+            self._diarize_job_thread = threading.Thread(
+                target=self._run_diarize_job, daemon=True
+            )
+            self._diarize_job_thread.start()
+            return self._wav_path
+
         # Wait (bounded) for any in-flight chunk transcriptions
         self._wait_for_pending_jobs(timeout=60.0)
-
-        duration_sec = self.stop_time - self.start_time
-        log.info("Meeting stopped (duration=%.1fs, chunks=%d)",
-                 duration_sec, len(self.chunks))
 
         if save:
             return self._write_output_file(duration_sec)
@@ -2727,8 +2932,12 @@ class MeetingSession:
 
     # ---- chunk transcription ----
     def _submit_chunk(self, audio_np, blocking=False):
-        """Reserve an index (preserves ordering even if Groq responds
-        out-of-order), then transcribe in a background thread."""
+        """In normal mode: reserve an index and transcribe in a thread.
+        In diarize mode: append the chunk's audio to the meeting WAV file
+        — AssemblyAI will process the whole thing on stop()."""
+        if self.diarize_mode:
+            self._append_chunk_to_wav(audio_np)
+            return
         with self._chunks_lock:
             idx = self._next_chunk_index
             self._next_chunk_index += 1
@@ -2767,6 +2976,114 @@ class MeetingSession:
         t.start()
         if blocking:
             t.join(timeout=60.0)
+
+    # ---- diarized-mode helpers ----
+    def _append_chunk_to_wav(self, audio_np):
+        """Append a chunk's audio to the meeting WAV file (diarize mode)."""
+        if self._wav_writer is None:
+            return
+        try:
+            if audio_np.dtype == np.float32:
+                samples = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+            else:
+                samples = audio_np.astype(np.int16)
+            self._wav_writer.writeframes(samples.tobytes())
+        except Exception as e:
+            log.error("Failed to append chunk to meeting WAV: %s", e)
+
+    def _run_diarize_job(self):
+        """Background: upload the meeting WAV → AssemblyAI → markdown.
+        Runs after stop(); the user gets a notification when done."""
+        transcriber = getattr(self.app, "_assemblyai_transcriber", None)
+        if transcriber is None or not getattr(transcriber, "api_key", ""):
+            log.error("Diarized meeting: no AssemblyAI key configured")
+            try:
+                self.app.overlay.show_error("AssemblyAI key not set")
+            except Exception:
+                pass
+            return
+        try:
+            try:
+                self.app.overlay.show("  ☁  Uploading meeting to AssemblyAI…  ",
+                                       bg_color="#1e64c8", duration=3000)
+            except Exception:
+                pass
+
+            result = transcriber.transcribe_file_sync(
+                self._wav_path,
+                language_code=None,      # auto-detect Hebrew/English
+                speaker_labels=True,
+            )
+            md_path = self._write_diarized_markdown(result)
+            log.info("Diarized meeting saved: %s", md_path)
+            try:
+                os.startfile(md_path)
+            except Exception as e:
+                log.warning("Could not open diarized markdown: %s", e)
+            try:
+                self.app.overlay.show("  ✓  Diarized transcript ready  ",
+                                       bg_color="#2d6a4f", duration=4000)
+            except Exception:
+                pass
+            # Clean up the (large) WAV after a successful transcription
+            try:
+                if self._wav_path and os.path.exists(self._wav_path):
+                    os.remove(self._wav_path)
+            except Exception as e:
+                log.warning("Could not delete meeting WAV %s: %s", self._wav_path, e)
+        except Exception as e:
+            log.error("Diarized meeting transcription failed: %s", e)
+            try:
+                self.app.overlay.show_error(f"AssemblyAI failed: {str(e)[:80]}")
+            except Exception:
+                pass
+            # Keep the WAV on failure so the user can retry manually.
+
+    def _write_diarized_markdown(self, result):
+        """Format AssemblyAI result with utterances as markdown.
+
+        AssemblyAI returns `utterances`: a list of {speaker, start, end,
+        text} objects when speaker_labels=true. Speakers are labelled
+        "A", "B", "C"... in order of first speech.
+        """
+        import datetime as _dt
+        utterances = result.get("utterances") or []
+        duration_sec = (self.stop_time - self.start_time) if self.stop_time else 0
+        stamp = _dt.datetime.fromtimestamp(self.start_time).strftime("%Y-%m-%d %H:%M")
+        file_stamp = _dt.datetime.fromtimestamp(self.start_time).strftime("%Y-%m-%d_%H-%M")
+
+        lines = []
+        lines.append(f"# Meeting — {stamp}")
+        lines.append("")
+        lines.append(f"**Duration:** {_fmt_relative_ts(duration_sec)}")
+        lines.append(f"**Source:** {self.source} (diarized via AssemblyAI)")
+        lines.append("")
+        lines.append("## Transcript")
+        lines.append("")
+
+        if not utterances:
+            text = (result.get("text") or "").strip()
+            if any('֐' <= c <= '׿' for c in text):
+                text = '‏' + text
+            lines.append(text or "_[no speech detected]_")
+        else:
+            for u in utterances:
+                speaker = u.get("speaker") or "?"
+                start_ms = float(u.get("start") or 0)
+                ts = _fmt_relative_ts(start_ms / 1000.0)
+                text = (u.get("text") or "").strip()
+                if not text:
+                    continue
+                # Hebrew-bearing line → prepend RLM so editors render RTL
+                if any('֐' <= c <= '׿' for c in text):
+                    text = '‏' + text
+                lines.append(f"**[{ts}] Speaker {speaker}:** {text}")
+                lines.append("")
+
+        out_path = os.path.join(MEETINGS_DIR, f"{file_stamp}_meeting_diarized.md")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return out_path
 
     def _wait_for_pending_jobs(self, timeout=60.0):
         """Block until all chunk transcriptions have finished (or timeout)."""
@@ -3957,6 +4274,14 @@ class WhisperTypeApp:
             self._openai_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
             self._openai_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
 
+        # Initialize AssemblyAI client if a key is set. Used ONLY by the
+        # diarized meeting flow (Start Meeting with speaker labels).
+        self._assemblyai_transcriber = None
+        if self.config.get("assemblyai_api_key"):
+            self._assemblyai_transcriber = AssemblyAITranscriber(
+                api_key=self.config["assemblyai_api_key"],
+            )
+
         # LLM cleanup uses the Groq API key. Initialised whenever a
         # key is present, regardless of which transcription backend is
         # active — so a user on OpenAI/local can still get Groq cleanup.
@@ -4096,12 +4421,22 @@ class WhisperTypeApp:
                     pystray.MenuItem(
                         "Transcribe",
                         pystray.Menu(
-                            # Dynamic label: swaps between "Start Meeting"
-                            # and "Stop Meeting" based on session state.
+                            # When NO meeting is active: show two start variants.
                             pystray.MenuItem(
-                                lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
-                                               else "🎙  Start Meeting (long recording)"),
+                                "🎙  Start Meeting (chunked, free/cheap)",
+                                lambda: self._toggle_meeting(diarize_mode=False),
+                                visible=lambda item: not self._is_meeting_active(),
+                            ),
+                            pystray.MenuItem(
+                                "🎤  Start Meeting (with speaker labels — AssemblyAI)",
+                                lambda: self._toggle_meeting(diarize_mode=True),
+                                visible=lambda item: not self._is_meeting_active(),
+                            ),
+                            # When a meeting IS active: show the unified Stop.
+                            pystray.MenuItem(
+                                lambda item: "⏹  Stop Meeting",
                                 lambda: self._toggle_meeting(),
+                                visible=lambda item: self._is_meeting_active(),
                             ),
                             pystray.Menu.SEPARATOR,
                             pystray.MenuItem("File → Hebrew", lambda: self._transcribe_file("he")),
@@ -4133,6 +4468,7 @@ class WhisperTypeApp:
                         pystray.Menu(
                             pystray.MenuItem("Set Groq API Key...", lambda: self._set_groq_api_key()),
                             pystray.MenuItem("Set OpenAI API Key...", lambda: self._set_openai_api_key()),
+                            pystray.MenuItem("Set AssemblyAI API Key...", lambda: self._set_assemblyai_api_key()),
                         ),
                     ),
                     pystray.Menu.SEPARATOR,
@@ -6249,23 +6585,38 @@ class WhisperTypeApp:
         """Thread-safe check — used by the tray menu predicates."""
         return self._active_meeting is not None
 
-    def _toggle_meeting(self):
+    def _toggle_meeting(self, diarize_mode=False):
         """Start a meeting if none active, else stop the current one.
-        Invoked from the 'Start/Stop Meeting' tray menu item."""
+        Invoked from the 'Start/Stop Meeting' tray menu item.
+
+        diarize_mode=True picks the AssemblyAI flow (records full audio,
+        speaker-labelled transcript posted-back later).
+        """
         with self._meeting_lock:
             already_active = self._active_meeting is not None
         if already_active:
             self._stop_meeting()
         else:
-            self._start_meeting()
+            self._start_meeting(diarize_mode=diarize_mode)
 
-    def _start_meeting(self):
+    def _start_meeting(self, diarize_mode=False):
         """Start a long-form meeting capture.
 
         Blocks the main press-to-talk hotkey until the meeting is stopped,
         because running two PyAudio streams on the same device
         simultaneously is unreliable on Windows.
         """
+        # Diarized mode: enforce the AssemblyAI key first so the user
+        # doesn't lose a meeting recording to a missing key. Open the
+        # key dialog if not configured.
+        if diarize_mode:
+            assembly_key = (self.config.get("assemblyai_api_key") or "").strip()
+            if not assembly_key or self._assemblyai_transcriber is None:
+                log.warning("Diarized meeting requested but no AssemblyAI key")
+                self.overlay.show_error("Set AssemblyAI API key first")
+                self._set_assemblyai_api_key()
+                return
+
         with self._meeting_lock:
             if self._active_meeting is not None:
                 return
@@ -6278,7 +6629,7 @@ class WhisperTypeApp:
                 self.overlay.show_error("Model still loading")
                 return
             try:
-                session = MeetingSession(self)
+                session = MeetingSession(self, diarize_mode=diarize_mode)
                 session.start()
                 self._active_meeting = session
             except Exception as e:
@@ -6288,10 +6639,14 @@ class WhisperTypeApp:
 
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("meeting")
-            self.tray_icon.title = "WhisperType — Meeting recording..."
-        self.overlay.show("  🎙  Meeting recording — click tray to stop  ",
-                          bg_color="#581C87", duration=2500)
-        log.info("Meeting active")
+            label = ("Meeting recording (diarized)..." if diarize_mode
+                     else "Meeting recording...")
+            self.tray_icon.title = f"WhisperType — {label}"
+        overlay_msg = ("  🎤  Diarized meeting recording — click tray to stop  "
+                       if diarize_mode else
+                       "  🎙  Meeting recording — click tray to stop  ")
+        self.overlay.show(overlay_msg, bg_color="#581C87", duration=2500)
+        log.info("Meeting active%s", " (diarized)" if diarize_mode else "")
 
     def _stop_meeting(self):
         """Stop the in-progress meeting, produce a markdown file with
@@ -7307,6 +7662,265 @@ class WhisperTypeApp:
             btn_frame = tk.Frame(root, bg="#1e1e2e")
             btn_frame.pack(pady=(10, 15))
 
+            save_btn = make_btn(btn_frame, "✓  OK  (Save & Verify)", on_save_verify,
+                                "#a6e3a1", "#94e2d5")
+            save_btn.pack(side="left", padx=5)
+            clear_btn = make_btn(btn_frame, "Clear Key", on_clear,
+                                 "#fab387", "#f9e2af")
+            clear_btn.pack(side="left", padx=5)
+            cancel_btn = make_btn(btn_frame, "Cancel", on_cancel,
+                                  "#f38ba8", "#eba0ac")
+            cancel_btn.pack(side="left", padx=5)
+
+            root.bind("<Return>", lambda e: on_save_verify())
+            root.bind("<Escape>", lambda e: on_cancel())
+            root.protocol("WM_DELETE_WINDOW", on_cancel)
+
+            root.after(100, lambda: (root.lift(), entry.focus_force()))
+            root.mainloop()
+
+        threading.Thread(target=open_dialog, daemon=True).start()
+
+    def _set_assemblyai_api_key(self):
+        """Tkinter dialog to enter/update the AssemblyAI API key.
+
+        Used only for diarized meeting transcription. Smaller / simpler
+        than the Groq/OpenAI dialogs because there's no model picker.
+        """
+        def open_dialog():
+            import tkinter as tk
+
+            root = tk.Tk()
+            _apply_dpi_scaling_to_tk(root)
+            root.title("AssemblyAI API Key")
+            root.configure(bg="#1e1e2e")
+            root.resizable(False, False)
+
+            W, H = 580, 420
+            root.update_idletasks()
+            x = (root.winfo_screenwidth() - W) // 2
+            y = (root.winfo_screenheight() - H) // 2
+            root.geometry(f"{W}x{H}+{x}+{y}")
+
+            current = self.config.get("assemblyai_api_key", "")
+            masked = (current[:8] + "..." + current[-4:]) if len(current) > 12 else "(not set)"
+
+            tk.Label(root, text="AssemblyAI API Key",
+                     font=("Segoe UI", 14, "bold"),
+                     fg="#cdd6f4", bg="#1e1e2e").pack(pady=(15, 5))
+
+            info_text = (
+                "Used only for the 'Start Meeting (with speakers)' flow.\n"
+                "Get one at: https://www.assemblyai.com (signup gives free credits).\n"
+                f"Current: {masked}"
+            )
+            tk.Label(root, text=info_text,
+                     font=("Segoe UI", 9),
+                     fg="#a6adc8", bg="#1e1e2e", justify="left").pack(pady=(0, 10))
+
+            entry_frame = tk.Frame(root, bg="#1e1e2e")
+            entry_frame.pack(padx=20, pady=5, fill="x")
+
+            entry_var = tk.StringVar()
+            entry = tk.Entry(entry_frame, textvariable=entry_var,
+                             font=("Consolas", 11),
+                             bg="#313244", fg="#cdd6f4",
+                             insertbackground="#cdd6f4",
+                             relief="flat", bd=5, show='*')
+            entry.pack(side="left", fill="x", expand=True, ipady=6)
+
+            shown = {"on": False}
+            def toggle_show():
+                shown["on"] = not shown["on"]
+                entry.config(show='' if shown["on"] else '*')
+                show_btn.config(text=("Hide" if shown["on"] else "Show"))
+            show_btn = tk.Button(entry_frame, text="Show", command=toggle_show,
+                                 font=("Segoe UI", 9), bg="#45475a", fg="#cdd6f4",
+                                 activebackground="#585b70", activeforeground="#cdd6f4",
+                                 relief="flat", bd=0, padx=12, pady=4, cursor="hand2")
+            show_btn.pack(side="left", padx=(8, 0))
+
+            def refresh_length():
+                try:
+                    k = entry.get()
+                    length_label.config(
+                        text=f"Key length: {len(k)} chars" if k else "",
+                        fg="#a6adc8",
+                    )
+                except Exception:
+                    pass
+
+            def read_clipboard_safe():
+                try:
+                    import pyperclip
+                    return pyperclip.paste() or ""
+                except Exception:
+                    pass
+                try:
+                    return root.clipboard_get()
+                except tk.TclError:
+                    return ""
+                except Exception:
+                    return ""
+
+            def do_paste_replace():
+                clip = read_clipboard_safe()
+                if clip:
+                    text = clip.strip()
+                    entry.delete(0, "end")
+                    entry.insert(0, text)
+                    entry.icursor("end")
+                    refresh_length()
+                    status_label.config(text=f"Pasted {len(text)} chars from clipboard", fg="#a6e3a1")
+                else:
+                    status_label.config(text="Clipboard is empty", fg="#f9e2af")
+
+            def do_paste_insert(event=None):
+                clip = read_clipboard_safe()
+                if clip:
+                    try:
+                        if entry.selection_present():
+                            entry.delete("sel.first", "sel.last")
+                    except tk.TclError:
+                        pass
+                    entry.insert("insert", clip)
+                    refresh_length()
+                return "break"
+
+            entry.bind("<KeyRelease>", lambda e: refresh_length())
+            entry.bind("<Control-v>", do_paste_insert)
+            entry.bind("<Control-V>", do_paste_insert)
+            entry.bind("<Shift-Insert>", do_paste_insert)
+
+            def make_btn(parent, text, cmd, bg, hover_bg, fg="#1e1e2e"):
+                b = tk.Button(parent, text=text, command=cmd,
+                              font=("Segoe UI", 10, "bold"),
+                              bg=bg, fg=fg,
+                              activebackground=hover_bg, activeforeground=fg,
+                              relief="flat", bd=0, padx=15, pady=6, cursor="hand2")
+                b.bind("<Enter>", lambda e: b.config(bg=hover_bg))
+                b.bind("<Leave>", lambda e: b.config(bg=bg))
+                return b
+
+            paste_btn_frame = tk.Frame(root, bg="#1e1e2e")
+            paste_btn_frame.pack(pady=(8, 0))
+            make_btn(paste_btn_frame, "Paste from Clipboard",
+                     do_paste_replace, "#89b4fa", "#74c7ec").pack()
+
+            length_label = tk.Label(root, text="",
+                                    font=("Segoe UI", 9),
+                                    fg="#a6adc8", bg="#1e1e2e")
+            length_label.pack(pady=(4, 0))
+            status_label = tk.Label(root, text="",
+                                    font=("Segoe UI", 9),
+                                    fg="#a6adc8", bg="#1e1e2e")
+            status_label.pack(pady=(6, 0))
+
+            def on_cancel():
+                root.destroy()
+
+            def on_clear():
+                self.config["assemblyai_api_key"] = ""
+                self._assemblyai_transcriber = None
+                save_config(self.config)
+                log.info("AssemblyAI API key cleared")
+                status_label.config(text="Key cleared.", fg="#a6adc8")
+                root.after(800, root.destroy)
+
+            verifying_flag = {"busy": False}
+
+            def on_save_verify():
+                try:
+                    _do_save_verify()
+                except Exception as e:
+                    log.exception("on_save_verify (assemblyai) crashed: %s", e)
+                    try:
+                        status_label.config(text=f"Internal error: {e}", fg="#f38ba8")
+                    except Exception:
+                        pass
+
+            def _do_save_verify():
+                if verifying_flag["busy"]:
+                    return
+                new_key = (entry.get() or entry_var.get()).strip()
+                if not new_key:
+                    status_label.config(text="Enter a key first (or click Clear Key).", fg="#f9e2af")
+                    return
+
+                status_label.config(text="Verifying with AssemblyAI (up to 10s)...", fg="#89b4fa")
+                verifying_flag["busy"] = True
+                try:
+                    save_btn.config(state="disabled")
+                    clear_btn.config(state="disabled")
+                except NameError:
+                    pass
+
+                result_state = {"done": False, "ok": None, "msg": None, "client": None}
+
+                def finish_ui():
+                    if not result_state["done"]:
+                        return
+                    try:
+                        save_btn.config(state="normal")
+                        clear_btn.config(state="normal")
+                        verifying_flag["busy"] = False
+                    except tk.TclError:
+                        return
+
+                    ok = result_state["ok"]
+                    msg = result_state["msg"]
+                    client = result_state["client"]
+
+                    if not ok:
+                        log.error("AssemblyAI key invalid: %s", msg)
+                        status_label.config(text=f"{msg}", fg="#f38ba8")
+                        return
+                    self.config["assemblyai_api_key"] = new_key
+                    self._assemblyai_transcriber = client
+                    save_config(self.config)
+                    log.info("AssemblyAI API key saved & activated")
+                    status_label.config(text="Key valid. Diarized meetings enabled.", fg="#a6e3a1")
+                    try:
+                        if self.tray_icon:
+                            self.tray_icon.update_menu()
+                    except Exception:
+                        pass
+                    root.after(1000, root.destroy)
+
+                def worker():
+                    try:
+                        client = AssemblyAITranscriber(api_key=new_key)
+                        ok, msg = client.verify_key(timeout=10)
+                    except Exception as e:
+                        log.error("AssemblyAI worker exception: %s", e)
+                        ok, msg, client = False, f"Error: {e}", None
+                    result_state["ok"] = ok
+                    result_state["msg"] = msg
+                    result_state["client"] = client
+                    result_state["done"] = True
+
+                def poll():
+                    if result_state["done"]:
+                        finish_ui()
+                        return
+                    try:
+                        root.after(200, poll)
+                    except tk.TclError:
+                        pass
+
+                def watchdog():
+                    if not result_state["done"]:
+                        result_state["ok"] = False
+                        result_state["msg"] = "Timed out after 20s — check internet/firewall"
+                        result_state["client"] = None
+                        result_state["done"] = True
+
+                threading.Thread(target=worker, daemon=True).start()
+                root.after(200, poll)
+                root.after(20000, watchdog)
+
+            btn_frame = tk.Frame(root, bg="#1e1e2e")
+            btn_frame.pack(pady=(10, 15))
             save_btn = make_btn(btn_frame, "✓  OK  (Save & Verify)", on_save_verify,
                                 "#a6e3a1", "#94e2d5")
             save_btn.pack(side="left", padx=5)
