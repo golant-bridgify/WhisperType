@@ -2383,21 +2383,24 @@ class AssemblyAITranscriber:
         """Submit a transcription job. Returns the transcript id.
 
         language_code=None lets the model auto-handle Hebrew/English
-        mixed audio (Universal-2 detects language internally without
-        an explicit `language_detection` flag). Pass "he" or "en" to
-        force.
+        mixed audio. Pass "he" or "en" to force.
 
-        speech_model: AssemblyAI's API now (2025+) requires explicit
-        model selection. Valid values include "universal-2" (stable
-        multilingual default) and "universal-3-pro" (newer, more
-        expensive). We default to universal-2 which supports Hebrew
-        and speaker_labels reliably.
+        speech_model: AssemblyAI requires explicit model selection.
+        Valid values: "universal-2" (stable multilingual, supports
+        Hebrew + speaker_labels) and "universal-3-pro" (newer, EN/ES/
+        DE/FR/IT/PT only — no Hebrew). Default universal-2.
+
+        API parameter rename: AssemblyAI deprecated `speech_model`
+        (singular string) in favour of `speech_models` (plural list)
+        in 2025. Sending the old name now returns HTTP 400 with a
+        deprecation message. We send the plural list form to match
+        the current API contract.
         """
         s = self._ensure_session()
         body = {
             "audio_url": audio_url,
             "speaker_labels": bool(speaker_labels),
-            "speech_model": speech_model,
+            "speech_models": [speech_model],
         }
         if language_code:
             body["language_code"] = language_code
