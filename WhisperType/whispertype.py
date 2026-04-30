@@ -7257,9 +7257,11 @@ class WhisperTypeApp:
 
             root = tk.Tk()
             _apply_dpi_scaling_to_tk(root)
-            root.title("WhisperType - History")
-            root.geometry("700x500")
-            root.attributes('-topmost', True)
+            root.title("WhisperType — History")
+            root.geometry("900x600")
+            root.minsize(600, 400)
+            # NOT topmost — fights with the resize handles on a 150% DPI
+            # display (user's setup) and made the window awkward to resize.
             root.configure(bg="#1e1e2e")
 
             # Header
@@ -7267,6 +7269,9 @@ class WhisperTypeApp:
             header.pack(fill="x", padx=10, pady=(10, 5))
             tk.Label(header, text=f"Transcription History ({len(history)} entries)",
                      font=("Segoe UI", 14, "bold"), fg="#cdd6f4", bg="#1e1e2e").pack(side="left")
+            tk.Label(header,
+                     text="Click an entry to copy. Drag to select part of the text.",
+                     font=("Segoe UI", 9), fg="#6c7086", bg="#1e1e2e").pack(side="right")
 
             # Search
             search_frame = tk.Frame(root, bg="#1e1e2e")
@@ -7291,9 +7296,17 @@ class WhisperTypeApp:
             canvas_window = canvas.create_window((0, 0), window=scrollable, anchor="nw")
             canvas.configure(yscrollcommand=scrollbar.set)
 
-            # Make scrollable frame resize with canvas
+            # Make scrollable frame resize with canvas + re-render so each
+            # entry's tk.Text widget gets recomputed height for the new width.
+            current_canvas_width = {"px": 0}
+
             def on_canvas_configure(event):
                 canvas.itemconfig(canvas_window, width=event.width)
+                # Re-render only when width changed by at least 30px to avoid
+                # render-storms during continuous resize.
+                if abs(event.width - current_canvas_width["px"]) >= 30:
+                    current_canvas_width["px"] = event.width
+                    root.after(50, lambda: render_entries(search_var.get()))
             canvas.bind("<Configure>", on_canvas_configure)
 
             scrollbar.pack(side="right", fill="y")
@@ -7304,8 +7317,31 @@ class WhisperTypeApp:
                 canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
             canvas.bind_all("<MouseWheel>", on_mousewheel)
 
-            def copy_text(text):
+            def copy_text(text, src_widget=None):
                 pyperclip.copy(text)
+                # Brief flash on the source widget (or the header) to confirm
+                if src_widget is not None:
+                    try:
+                        orig = src_widget.cget("bg")
+                        src_widget.configure(bg="#a6e3a1")
+                        src_widget.after(180, lambda: src_widget.configure(bg=orig))
+                    except Exception:
+                        pass
+
+            def has_hebrew(s):
+                return any('֐' <= c <= '׿' for c in s)
+
+            def estimate_text_lines(text, chars_per_line):
+                """Display-line count for text wrapped at chars_per_line."""
+                if not text:
+                    return 1
+                total = 0
+                for line in text.split("\n"):
+                    if not line:
+                        total += 1
+                    else:
+                        total += (len(line) + chars_per_line - 1) // chars_per_line
+                return max(1, total)
 
             def render_entries(filter_text=""):
                 for widget in scrollable.winfo_children():
@@ -7321,12 +7357,17 @@ class WhisperTypeApp:
                              font=("Segoe UI", 11)).pack(pady=20)
                     return
 
+                # Width for tk.Text height estimation. Roughly: canvas width
+                # in pixels / ~7px per Segoe UI 10pt char.
+                canvas_w = current_canvas_width["px"] or 880
+                chars_per_line = max(40, (canvas_w - 80) // 7)
+
                 for entry in filtered:
                     card = tk.Frame(scrollable, bg="#313244", bd=0, highlightthickness=1,
                                     highlightbackground="#45475a")
-                    card.pack(fill="x", pady=2, padx=2)
+                    card.pack(fill="x", pady=3, padx=2)
 
-                    # Top row: timestamp + metadata
+                    # Top row: timestamp (left) | metadata (right) | Copy button (far right)
                     top = tk.Frame(card, bg="#313244")
                     top.pack(fill="x", padx=8, pady=(6, 2))
 
@@ -7338,6 +7379,19 @@ class WhisperTypeApp:
 
                     tk.Label(top, text=time_str, fg="#a6adc8", bg="#313244",
                              font=("Segoe UI", 9)).pack(side="left")
+
+                    text_value = entry.get("text", "")
+
+                    # Copy button — explicit, discoverable
+                    copy_btn = tk.Button(
+                        top, text="📋 Copy",
+                        font=("Segoe UI", 9, "bold"),
+                        bg="#89b4fa", fg="#1e1e2e",
+                        activebackground="#74c7ec", activeforeground="#1e1e2e",
+                        relief="flat", bd=0, padx=10, pady=2, cursor="hand2",
+                        command=lambda t=text_value, c=card: copy_text(t, c),
+                    )
+                    copy_btn.pack(side="right", padx=(8, 0))
 
                     meta_parts = []
                     dur = entry.get("duration", 0)
@@ -7353,16 +7407,45 @@ class WhisperTypeApp:
                         tk.Label(top, text=" | ".join(meta_parts), fg="#6c7086", bg="#313244",
                                  font=("Segoe UI", 9)).pack(side="right")
 
-                    # Text content
-                    text = entry.get("text", "")
-                    display = text[:200] + "..." if len(text) > 200 else text
-                    text_label = tk.Label(card, text=display, fg="#cdd6f4", bg="#313244",
-                                          font=("Segoe UI", 10), anchor="w", justify="left",
-                                          wraplength=620, cursor="hand2")
-                    text_label.pack(fill="x", padx=8, pady=(0, 6))
-                    text_label.bind("<Button-1>", lambda e, t=text: copy_text(t))
-                    text_label.bind("<Enter>", lambda e, w=text_label: w.configure(fg="#f5e0dc"))
-                    text_label.bind("<Leave>", lambda e, w=text_label: w.configure(fg="#cdd6f4"))
+                    # Text content — use tk.Text so user can SELECT and copy
+                    # arbitrary substrings. Read-only via state="disabled".
+                    # Selection still works on Windows in disabled state.
+                    is_rtl = has_hebrew(text_value)
+                    height = estimate_text_lines(text_value, chars_per_line)
+                    height = min(height, 50)  # safety cap; outer canvas scrolls
+
+                    text_widget = tk.Text(
+                        card,
+                        height=height,
+                        wrap="word",
+                        bg="#313244", fg="#cdd6f4",
+                        selectbackground="#585b70", selectforeground="#cdd6f4",
+                        font=("Segoe UI", 11),
+                        relief="flat", bd=0, highlightthickness=0,
+                        padx=8, pady=4,
+                        cursor="xterm",
+                    )
+                    text_widget.pack(fill="x", padx=8, pady=(0, 8))
+                    text_widget.insert("1.0", text_value)
+                    if is_rtl:
+                        # Right-align the visible text. The transcriber already
+                        # prefixes Hebrew with U+200F so visual ordering is RTL;
+                        # this just pushes the start of each line to the right
+                        # margin where Hebrew readers expect it.
+                        text_widget.tag_configure("rtl", justify="right")
+                        text_widget.tag_add("rtl", "1.0", "end")
+                    text_widget.configure(state="disabled")
+
+                    # Click-anywhere-on-card-but-not-the-text fallback to copy.
+                    # The Text widget consumes its own clicks (for selection),
+                    # so we wire copy on the surrounding card frame + the top
+                    # row labels.
+                    def _bind_card_click(widget, t=text_value, c=card):
+                        widget.bind("<Button-1>", lambda e: copy_text(t, c))
+                    _bind_card_click(card)
+                    for child in top.winfo_children():
+                        if isinstance(child, tk.Label):
+                            _bind_card_click(child)
 
             render_entries()
 
