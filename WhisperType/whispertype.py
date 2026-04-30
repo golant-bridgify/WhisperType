@@ -5139,16 +5139,21 @@ class WhisperTypeApp:
 
         # Silent-audio detection.
         # Threshold tuning history:
-        #   0.003 was the original — caught only literally-dead mic.
-        #   Real-world ambient noise (computer fan, light breath, mouse
-        #   clicks) registers 0.003-0.008 and slipped through, which
-        #   gpt-4o-transcribe then "hallucinates" a plausible Hebrew
-        #   phrase from. Bumping to 0.008 (~-42dB) closes that gap;
-        #   normal speech peaks at 0.05-0.3 and quiet whispers around
-        #   0.02-0.05, so the threshold remains comfortably below
-        #   anything intentional.
+        #   0.003 → 0.008: tried to filter ambient-noise hallucinations
+        #     pre-API, but false-positived on real-but-quiet speech
+        #     (observed RMS 0.006-0.007 for real utterances when the
+        #     user spoke a bit far from / quietly into the mic).
+        #   0.008 → 0.003: reverted. Pre-API guard now catches only
+        #     genuinely dead-mic cases (RMS ~0.0001-0.001). The
+        #     hallucination defence lives in two layers AFTER the API
+        #     call instead, which can be more selective:
+        #       (a) gpt-4o verbatim prompt's explicit "output an empty
+        #           string if no speech" clause
+        #       (b) _is_likely_hallucination() — combines low RMS,
+        #           short text, and slow chars/sec to flag invented
+        #           phrases without dropping real quiet speech.
         if duration_sec >= 1.5:
-            if audio_rms < 0.008:
+            if audio_rms < 0.003:
                 self._handle_silent_capture(duration_sec, audio_rms)
                 return
 
@@ -6085,9 +6090,15 @@ class WhisperTypeApp:
             self._consecutive_silent, duration_sec, rms,
         )
 
-        if self._consecutive_silent >= 2:
-            # Two in a row = stale state is persistent. Auto-restart.
-            log.warning("2 consecutive silent captures — auto-restarting to fix "
+        if self._consecutive_silent >= 3:
+            # Three in a row = stale state is persistent. Auto-restart.
+            # Bumped 2 → 3 so a single noisy stretch (mic placement, user
+            # paused mid-sentence, etc.) doesn't trigger a process kill.
+            # SubprocessAudioRecorder respawns the worker on the FIRST
+            # silent already, which usually fixes mic state without a
+            # full restart; this is the fallback for when even that
+            # doesn't help.
+            log.warning("3 consecutive silent captures — auto-restarting to fix "
                         "stale PortAudio state")
             self._force_show_error_overlay(
                 "🔄 Audio stack stuck — restarting WhisperType..."
