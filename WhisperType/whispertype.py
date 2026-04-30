@@ -4063,13 +4063,6 @@ class WhisperTypeApp:
                                     checked=lambda item: self.config.get("recording_mode") == "toggle",
                                     radio=True),
                     pystray.Menu.SEPARATOR,
-                    pystray.MenuItem(
-                        # Dynamic label shows current hotkey so the user
-                        # can see at a glance what's currently bound
-                        lambda item: f"Hotkey: {self.config.get('hotkey', 'ctrl+space')}...",
-                        lambda: self._open_hotkey_dialog(),
-                    ),
-                    pystray.Menu.SEPARATOR,
                     # Group 2 — Paste / output behaviour
                     pystray.MenuItem("Auto-Paste (Ctrl+V)", lambda: self._set_paste_mode("auto_paste"),
                                     checked=lambda item: self.config["paste_mode"] == "auto_paste",
@@ -4136,6 +4129,13 @@ class WhisperTypeApp:
                             pystray.MenuItem("Set Groq API Key...", lambda: self._set_groq_api_key()),
                             pystray.MenuItem("Set OpenAI API Key...", lambda: self._set_openai_api_key()),
                         ),
+                    ),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem(
+                        # Dynamic label shows current hotkey so the user
+                        # can see at a glance what's currently bound
+                        lambda item: f"Hotkey: {self.config.get('hotkey', 'ctrl+space')}...",
+                        lambda: self._open_hotkey_dialog(),
                     ),
                 ),
             ),
