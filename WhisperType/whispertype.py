@@ -121,6 +121,12 @@ DEFAULT_CONFIG = {
     "openai_api_key": "",  # OpenAI API key (from https://platform.openai.com/api-keys)
     "openai_model": "gpt-4o-transcribe",  # OpenAI model: "gpt-4o-transcribe" / "gpt-4o-mini-transcribe"
     "assemblyai_api_key": "",  # AssemblyAI key (from https://www.assemblyai.com) — used only for the diarized meeting flow
+    # Backend used by Meetings + File-transcribe (independent of the
+    # main press-to-talk Model selection). One of:
+    #   "openai_gpt4o" / "openai_gpt4o_mini" / "groq_turbo"
+    #   "local_hebrew_turbo" / "local_english_distil"
+    #   "assemblyai_universal_2"  (always diarized — speaker labels)
+    "meeting_model": "groq_turbo",
     "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
     "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
     "groq_he_en_bias": True,  # True = bias Groq language detection to Hebrew/English only (prevents false French/etc. detection)
@@ -7141,11 +7147,21 @@ class WhisperTypeApp:
                 )
                 self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
                 self._groq_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+            # Idempotently ensure load_model() has been called. The
+            # instance can exist with model=None when:
+            #   - it was constructed in __init__ but _load_model hadn't
+            #     reached it yet (race during startup), OR
+            #   - load_model raised earlier (network blip, key dialog
+            #     finish_ui swallowed the exception, etc.).
+            # Without this re-check, the menu shows "Groq Cloud" but
+            # transcribe() raises "transcriber not initialized" on the
+            # next recording.
+            if self._groq_transcriber.model is None:
                 try:
                     self._groq_transcriber.load_model(callback=lambda msg: log.info(msg))
                 except Exception as e:
                     log.error("Failed to init Groq: %s", e)
-                    self.overlay.show_error("Groq init failed")
+                    self.overlay.show_error(f"Groq init failed: {str(e)[:80]}")
                     self._groq_transcriber = None
                     return
             self.transcriber = self._groq_transcriber
@@ -7164,11 +7180,16 @@ class WhisperTypeApp:
                 )
                 self._openai_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
                 self._openai_transcriber.custom_vocabulary = self.config.get("custom_vocabulary", "") or ""
+            # Same idempotent load_model guard as the Groq branch above —
+            # see the long comment there. This is the bug the user hit
+            # when the menu reported "OpenAI Cloud" but transcribe()
+            # raised "OpenAI transcriber not initialized".
+            if self._openai_transcriber.model is None:
                 try:
                     self._openai_transcriber.load_model(callback=lambda msg: log.info(msg))
                 except Exception as e:
                     log.error("Failed to init OpenAI: %s", e)
-                    self.overlay.show_error("OpenAI init failed")
+                    self.overlay.show_error(f"OpenAI init failed: {str(e)[:80]}")
                     self._openai_transcriber = None
                     return
             self.transcriber = self._openai_transcriber
