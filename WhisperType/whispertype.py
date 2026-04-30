@@ -4077,19 +4077,6 @@ class WhisperTypeApp:
                         checked=lambda item: bool(self.config.get("silent_mode", False)),
                     ),
                     pystray.MenuItem(
-                        "Bias Groq to Hebrew/English",
-                        lambda: self._toggle_he_en_bias(),
-                        checked=lambda item: bool(self.config.get("groq_he_en_bias", True)),
-                    ),
-                    pystray.MenuItem(
-                        "AI Cleanup (Groq)",
-                        pystray.Menu(self._build_cleanup_menu),
-                    ),
-                    pystray.MenuItem(
-                        "Custom Vocabulary...",
-                        lambda: self._open_vocabulary_dialog(),
-                    ),
-                    pystray.MenuItem(
                         # Dynamic label shows current hotkey so the user
                         # can see at a glance what's currently bound
                         lambda item: f"Hotkey: {self.config.get('hotkey', 'ctrl+space')}...",
@@ -4122,22 +4109,31 @@ class WhisperTypeApp:
                         ),
                     ),
                     pystray.MenuItem("History", lambda: self._show_history()),
-                    pystray.MenuItem("Set Groq API Key...", lambda: self._set_groq_api_key()),
-                    pystray.MenuItem("Set OpenAI API Key...", lambda: self._set_openai_api_key()),
                     pystray.Menu.SEPARATOR,
                     pystray.MenuItem(
-                        "Start with Windows",
-                        lambda: self._toggle_auto_start(),
-                        checked=lambda item: is_auto_start_enabled(),
+                        "Groq-Only Options",
+                        pystray.Menu(
+                            pystray.MenuItem(
+                                "Bias Groq to Hebrew/English",
+                                lambda: self._toggle_he_en_bias(),
+                                checked=lambda item: bool(self.config.get("groq_he_en_bias", True)),
+                            ),
+                            pystray.MenuItem(
+                                "AI Cleanup (Groq)",
+                                pystray.Menu(self._build_cleanup_menu),
+                            ),
+                            pystray.MenuItem(
+                                "Custom Vocabulary...",
+                                lambda: self._open_vocabulary_dialog(),
+                            ),
+                        ),
                     ),
-                    pystray.Menu.SEPARATOR,
-                    # Manual audio-stack fix: restarting a long-running
-                    # WhisperType instance (>8h idle) fixes stale PortAudio
-                    # state that causes silent captures. Auto-triggered
-                    # after 2 consecutive silent captures too.
                     pystray.MenuItem(
-                        "🔄  Restart WhisperType",
-                        lambda: self._restart_whispertype("manual"),
+                        "API Keys",
+                        pystray.Menu(
+                            pystray.MenuItem("Set Groq API Key...", lambda: self._set_groq_api_key()),
+                            pystray.MenuItem("Set OpenAI API Key...", lambda: self._set_openai_api_key()),
+                        ),
                     ),
                 ),
             ),
