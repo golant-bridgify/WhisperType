@@ -4057,6 +4057,7 @@ class WhisperTypeApp:
             pystray.MenuItem(
                 "Options",
                 pystray.Menu(
+                    # Group 1 — Recording (how you record)
                     pystray.MenuItem("Hold to Record", lambda: self._set_recording_mode("hold"),
                                     checked=lambda item: self.config.get("recording_mode", "hold") == "hold",
                                     radio=True),
@@ -4064,30 +4065,38 @@ class WhisperTypeApp:
                                     checked=lambda item: self.config.get("recording_mode") == "toggle",
                                     radio=True),
                     pystray.Menu.SEPARATOR,
-                    pystray.MenuItem("Auto-Paste (Ctrl+V)", lambda: self._set_paste_mode("auto_paste"),
-                                    checked=lambda item: self.config["paste_mode"] == "auto_paste",
-                                    radio=True),
-                    pystray.MenuItem("Clipboard Only", lambda: self._set_paste_mode("clipboard_only"),
-                                    checked=lambda item: self.config["paste_mode"] == "clipboard_only",
-                                    radio=True),
-                    pystray.Menu.SEPARATOR,
-                    pystray.MenuItem(
-                        "Invisible Mode",
-                        lambda: self._toggle_silent_mode(),
-                        checked=lambda item: bool(self.config.get("silent_mode", False)),
-                    ),
                     pystray.MenuItem(
                         # Dynamic label shows current hotkey so the user
                         # can see at a glance what's currently bound
                         lambda item: f"Hotkey: {self.config.get('hotkey', 'ctrl+space')}...",
                         lambda: self._open_hotkey_dialog(),
                     ),
+                    pystray.Menu.SEPARATOR,
+                    # Group 2 — Paste / output behaviour
+                    pystray.MenuItem("Auto-Paste (Ctrl+V)", lambda: self._set_paste_mode("auto_paste"),
+                                    checked=lambda item: self.config["paste_mode"] == "auto_paste",
+                                    radio=True),
+                    pystray.MenuItem("Clipboard Only", lambda: self._set_paste_mode("clipboard_only"),
+                                    checked=lambda item: self.config["paste_mode"] == "clipboard_only",
+                                    radio=True),
                     pystray.MenuItem(
                         "Restore Clipboard After Paste",
                         lambda: self._toggle_clipboard_auto_restore(),
                         checked=lambda item: bool(self.config.get("clipboard_auto_restore", True)),
                     ),
                     pystray.Menu.SEPARATOR,
+                    # Group 3 — Feedback (visual + audio)
+                    pystray.MenuItem(
+                        "Invisible Mode",
+                        lambda: self._toggle_silent_mode(),
+                        checked=lambda item: bool(self.config.get("silent_mode", False)),
+                    ),
+                    pystray.MenuItem(
+                        "Beep Output",
+                        pystray.Menu(self._build_beep_output_menu),
+                    ),
+                    pystray.Menu.SEPARATOR,
+                    # Group 4 — Actions
                     # Dynamic label: swaps between "Start Meeting" and
                     # "Stop Meeting" based on whether a session is active.
                     pystray.MenuItem(
@@ -4095,12 +4104,6 @@ class WhisperTypeApp:
                                        else "🎙  Start Meeting (long recording)"),
                         lambda: self._toggle_meeting(),
                     ),
-                    pystray.Menu.SEPARATOR,
-                    pystray.MenuItem(
-                        "Beep Output",
-                        pystray.Menu(self._build_beep_output_menu),
-                    ),
-                    pystray.Menu.SEPARATOR,
                     pystray.MenuItem(
                         "Transcribe File",
                         pystray.Menu(
@@ -4110,6 +4113,7 @@ class WhisperTypeApp:
                     ),
                     pystray.MenuItem("History", lambda: self._show_history()),
                     pystray.Menu.SEPARATOR,
+                    # Group 5 — Backend configuration
                     pystray.MenuItem(
                         "Groq-Only Options",
                         pystray.Menu(
