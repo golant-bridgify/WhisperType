@@ -5138,24 +5138,22 @@ class WhisperTypeApp:
         log.info("Audio peak RMS: %.5f over %.1fs", audio_rms, duration_sec)
 
         # Silent-audio detection.
+        #
         # Threshold tuning history:
-        #   0.003 → 0.008: tried to filter ambient-noise hallucinations
-        #     pre-API, but false-positived on real-but-quiet speech
-        #     (observed RMS 0.006-0.007 for real utterances when the
-        #     user spoke a bit far from / quietly into the mic).
-        #   0.008 → 0.003: reverted. Pre-API guard now catches only
-        #     genuinely dead-mic cases (RMS ~0.0001-0.001). The
-        #     hallucination defence lives in two layers AFTER the API
-        #     call instead, which can be more selective:
-        #       (a) gpt-4o verbatim prompt's explicit "output an empty
-        #           string if no speech" clause
-        #       (b) _is_likely_hallucination() — combines low RMS,
-        #           short text, and slow chars/sec to flag invented
-        #           phrases without dropping real quiet speech.
-        if duration_sec >= 1.5:
-            if audio_rms < 0.003:
-                self._handle_silent_capture(duration_sec, audio_rms)
-                return
+        #   0.003 with a `duration_sec >= 1.5` gate: too lenient. Most
+        #     hallucinations come from SHORT presses (< 1.5s) where the
+        #     gate skipped the check entirely. Even when checked, RMS
+        #     values like 0.00345 and 0.00320 slipped through the
+        #     0.003 floor, and gpt-4o invented words like "וואלה",
+        #     "מעניין", "He is a good friend." from those silent clips.
+        #   0.005 + no duration gate (current): real speech peaks well
+        #     above 0.005 in any 300ms window — even quiet whispers
+        #     into a close mic register 0.01-0.05. So catching < 0.005
+        #     hits hallucination-territory silence without dropping
+        #     legitimate quiet speech.
+        if audio_rms < 0.005:
+            self._handle_silent_capture(duration_sec, audio_rms)
+            return
 
         # Short recordings: skip streaming partial, do single fast transcription
         if duration_sec < 5:
@@ -5272,9 +5270,14 @@ class WhisperTypeApp:
                             error_shown = True
                     else:
                         log.info("No speech detected (likely silent audio or hallucination)")
-                        self.overlay.show_error("No speech detected")
-                        self._flash_error_tray("No speech detected — check mic")
-                        error_shown = True
+                        # Quiet rejection under SubprocessAudioRecorder — the
+                        # user has the live waveform as their signal and asked
+                        # not to be alerted on every empty press. Keep the
+                        # in-process recorder feedback for the legacy path.
+                        if not isinstance(self.recorder, SubprocessAudioRecorder):
+                            self.overlay.show_error("No speech detected")
+                            self._flash_error_tray("No speech detected — check mic")
+                            error_shown = True
                 else:
                     # --- NO PARTIAL: full transcription (short recording or streaming=off) ---
                     # Use beam_size=1 for short audio (<5s) for speed
@@ -5309,9 +5312,14 @@ class WhisperTypeApp:
                             error_shown = True
                     else:
                         log.info("No speech detected (likely silent audio or hallucination)")
-                        self.overlay.show_error("No speech detected")
-                        self._flash_error_tray("No speech detected — check mic")
-                        error_shown = True
+                        # Quiet rejection under SubprocessAudioRecorder — the
+                        # user has the live waveform as their signal and asked
+                        # not to be alerted on every empty press. Keep the
+                        # in-process recorder feedback for the legacy path.
+                        if not isinstance(self.recorder, SubprocessAudioRecorder):
+                            self.overlay.show_error("No speech detected")
+                            self._flash_error_tray("No speech detected — check mic")
+                            error_shown = True
             except Exception as e:
                 log.error("Transcription error: %s", e)
                 self.overlay.show_error("Transcription failed")
