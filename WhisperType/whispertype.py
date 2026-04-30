@@ -4871,12 +4871,19 @@ class WhisperTypeApp:
                     time.sleep(0.1)
                     continue
 
-                # Block press-to-talk while a meeting is recording. Two
-                # PyAudio streams on the same mic device is unreliable on
-                # Windows, and semantically it doesn't make sense — the
-                # meeting already captures everything you're saying.
-                if self._is_meeting_active():
-                    log.info("Hotkey ignored — meeting is recording")
+                # Press-to-talk during an active meeting:
+                # - With SubprocessAudioRecorder (default), the press-to-talk
+                #   recording lives in a separate Python subprocess that
+                #   opens the mic via WASAPI shared mode, independent of the
+                #   meeting's in-process streams. They coexist fine and the
+                #   user can dictate notes / Slack messages / etc. while the
+                #   meeting transcribes in the background.
+                # - With the legacy in-process AudioRecorder (frozen
+                #   PyInstaller), two PyAudio streams in the same process
+                #   ARE unreliable — keep the block.
+                if self._is_meeting_active() and not isinstance(
+                        self.recorder, SubprocessAudioRecorder):
+                    log.info("Hotkey ignored — meeting is recording (in-process recorder)")
                     try:
                         self.overlay.show_error("Meeting active — click tray to stop")
                     except Exception:
