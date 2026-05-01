@@ -6793,6 +6793,22 @@ class WhisperTypeApp:
                 self.recorder.respawn_after_stale()
             except Exception as e:
                 log.warning("Worker respawn failed: %s", e)
+            # Reset the tray icon and overlay back to idle. _stop_and_transcribe
+            # set them to "processing" / "Transcribing..." before calling us;
+            # without this the icon stays stuck on amber and the tooltip on
+            # "WhisperType — Transcribing..." until the next recording
+            # explicitly clobbers them. (User reported the tray as "stuck on
+            # TRANSCRIBING" after a silent capture — this is why.)
+            try:
+                self.overlay.hide()
+            except Exception:
+                pass
+            if self.tray_icon:
+                try:
+                    self.tray_icon.icon = self._create_icon("idle")
+                    self.tray_icon.title = "WhisperType — Ready"
+                except Exception:
+                    pass
             return
 
         # In-process AudioRecorder path — original behaviour with the
