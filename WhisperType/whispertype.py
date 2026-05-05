@@ -902,46 +902,85 @@ class SubprocessAudioRecorder:
         self.is_recording = False
         self.audio_data = []   # compat stub — always empty for subprocess
         self.latest_levels = [0.0] * WAVEFORM_NUM_BARS
+
+        # Active worker — bound at start() from the warm pool. Between
+        # recordings these are None / cleared; while a recording is in
+        # flight they refer to the specific subprocess holding the mic.
         self._proc = None
         self._wav_path = None
         self._reader_thread = None
-        self._worker_hello = threading.Event()   # set when worker prints HELLO
-        self._worker_done = threading.Event()    # set when worker prints DONE
-        self._worker_lock = threading.Lock()     # guards spawn/kill
-        self._spawn_worker()
+        self._worker_hello = threading.Event()
+        self._worker_done = threading.Event()
+        self._worker_lock = threading.Lock()     # guards active proc swap
 
-    def _spawn_worker(self):
-        """Spawn the persistent worker. Idempotent — no-op if already alive."""
+        # Warm pool: at most ONE pre-spawned worker subprocess that has
+        # already imported pyaudio and printed HELLO. The pool is
+        # refilled at the END of start() — i.e. WHILE the user is
+        # actively recording — so by the time they release and press
+        # again, the next worker is hot. Without this, the next start()
+        # would block 300-800ms on a slower laptop waiting for HELLO
+        # from a worker that only began spawning after STOP/DONE.
+        self._warm_pool = queue.Queue(maxsize=1)
+        self._refill_pool_async()  # initial fill so first press is fast
+
+    # -- worker spawn / pool plumbing ----------------------------------
+
+    def _spawn_one_worker(self):
+        """Synchronously spawn one worker subprocess and wait for HELLO.
+        Returns dict {proc, hello, done, reader} or None on failure."""
         import subprocess
-        with self._worker_lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return
-            interp = find_python_interpreter()
-            if interp is None:
-                return  # frozen mode — caller falls back to AudioRecorder
-            self._worker_hello.clear()
-            self._worker_done.clear()
-            try:
-                self._proc = subprocess.Popen(
-                    [interp, "-c", _MIC_SUBPROCESS_SCRIPT],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    creationflags=0x08000000,  # CREATE_NO_WINDOW
-                    bufsize=0,
-                )
-            except Exception as e:
-                log.error("SubprocessAudioRecorder: worker spawn failed: %s", e)
-                self._proc = None
-                return
-            self._reader_thread = threading.Thread(
-                target=self._read_output, daemon=True)
-            self._reader_thread.start()
+        interp = find_python_interpreter()
+        if interp is None:
+            return None  # frozen mode — caller falls back to AudioRecorder
+        hello = threading.Event()
+        done = threading.Event()
+        try:
+            proc = subprocess.Popen(
+                [interp, "-c", _MIC_SUBPROCESS_SCRIPT],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+                bufsize=0,
+            )
+        except Exception as e:
+            log.error("SubprocessAudioRecorder: worker spawn failed: %s", e)
+            return None
+        reader = threading.Thread(
+            target=self._read_output_for, args=(proc, hello, done), daemon=True,
+        )
+        reader.start()
+        if not hello.wait(timeout=5.0):
+            log.warning("Worker HELLO timeout 5s — killing")
+            try: proc.kill()
+            except Exception: pass
+            return None
+        return {"proc": proc, "hello": hello, "done": done, "reader": reader}
 
-    def _read_output(self):
-        """Parse the worker's stdout: HELLO / READY / DONE keywords plus
-        RMS-level lines. Each message is one line."""
-        proc = self._proc
+    def _refill_pool_async(self):
+        """Kick off a background spawn that fills the warm pool. If a
+        worker already arrives in the pool first (e.g. an earlier task
+        hadn't finished), the duplicate is killed cleanly."""
+        def task():
+            worker = self._spawn_one_worker()
+            if worker is None:
+                return
+            try:
+                self._warm_pool.put_nowait(worker)
+            except queue.Full:
+                # Pool already filled — discard the duplicate.
+                try: worker["proc"].kill()
+                except Exception: pass
+        threading.Thread(target=task, daemon=True).start()
+
+    def _read_output_for(self, proc, hello_event, done_event):
+        """Parse one worker's stdout: HELLO / READY / DONE keywords plus
+        RMS-level lines. Each message is one line.
+
+        A worker only emits waveform lines AFTER receiving START. Until
+        then it just prints HELLO and idles, so a warm-pool worker's
+        reader thread is mostly silent and won't fight the active
+        recorder for self.latest_levels."""
         if not proc or not proc.stdout:
             return
         try:
@@ -950,11 +989,11 @@ class SubprocessAudioRecorder:
                 if not line:
                     continue
                 if line == 'HELLO':
-                    self._worker_hello.set()
+                    hello_event.set()
                 elif line == 'READY':
                     pass  # recording stream opened — informational
                 elif line == 'DONE':
-                    self._worker_done.set()
+                    done_event.set()
                 else:
                     parts = line.split()
                     if len(parts) == WAVEFORM_NUM_BARS:
@@ -965,18 +1004,49 @@ class SubprocessAudioRecorder:
         except Exception:
             pass
 
-    def _ensure_worker_alive(self, timeout=5.0):
-        """Spawn the worker if needed and wait for its HELLO signal."""
-        if self._proc is None or self._proc.poll() is not None:
-            self._spawn_worker()
-        if self._proc is None:
-            return False
-        return self._worker_hello.wait(timeout=timeout)
+    def _take_warm_or_spawn(self, timeout=5.0):
+        """Return a worker dict — preferring the warm pool. Falls back
+        to a synchronous spawn if the pool is empty."""
+        # Fast path: pool already populated.
+        try:
+            worker = self._warm_pool.get_nowait()
+            return worker
+        except queue.Empty:
+            pass
+        # Slow path: pool refill is in flight; wait briefly for it.
+        t0 = time.time()
+        try:
+            worker = self._warm_pool.get(timeout=timeout)
+            wait_ms = (time.time() - t0) * 1000
+            log.info(
+                "Worker acquired from warm pool after %.0fms wait "
+                "(pre-spawn didn't quite beat the user's next press)",
+                wait_ms,
+            )
+            return worker
+        except queue.Empty:
+            log.warning("Warm pool empty after %.1fs — spawning synchronously", timeout)
+            return self._spawn_one_worker()
+
+    # -- back-compat shim for old internal callers ---------------------
+    def _spawn_worker(self):
+        """Back-compat wrapper. New code calls _refill_pool_async."""
+        self._refill_pool_async()
+
+    # -- recording API -------------------------------------------------
 
     def start(self):
         import tempfile
-        if not self._ensure_worker_alive():
+
+        worker = self._take_warm_or_spawn()
+        if worker is None:
             raise RuntimeError("Subprocess worker not available")
+
+        with self._worker_lock:
+            self._proc = worker["proc"]
+            self._worker_hello = worker["hello"]
+            self._worker_done = worker["done"]
+            self._reader_thread = worker["reader"]
 
         fd, self._wav_path = tempfile.mkstemp(suffix=".wav", prefix="wt_mic_")
         os.close(fd)
@@ -992,18 +1062,29 @@ class SubprocessAudioRecorder:
             self._proc.stdin.flush()
             self.is_recording = True
         except (BrokenPipeError, OSError) as e:
-            log.warning("Worker stdin write failed (%s) — respawning and retrying", e)
-            self._kill_worker()
-            if not self._ensure_worker_alive():
-                try:
-                    os.remove(self._wav_path)
-                except Exception:
-                    pass
+            log.warning("Worker stdin write failed (%s) — taking another and retrying", e)
+            self._kill_active()
+            worker = self._take_warm_or_spawn()
+            if worker is None:
+                try: os.remove(self._wav_path)
+                except Exception: pass
                 self._wav_path = None
-                raise RuntimeError("Worker unavailable after respawn")
+                raise RuntimeError("Worker unavailable after retry")
+            with self._worker_lock:
+                self._proc = worker["proc"]
+                self._worker_hello = worker["hello"]
+                self._worker_done = worker["done"]
+                self._reader_thread = worker["reader"]
             self._proc.stdin.write(cmd)
             self._proc.stdin.flush()
             self.is_recording = True
+
+        # Pre-spawn the next worker NOW, while the current recording is
+        # still in flight. Even a 1-second clip gives the next subprocess
+        # plenty of time to import pyaudio and print HELLO before the
+        # user presses again. This is the structural fix for the
+        # next-press latency on slower machines.
+        self._refill_pool_async()
 
     def stop(self) -> np.ndarray:
         if not self.is_recording:
@@ -1022,27 +1103,26 @@ class SubprocessAudioRecorder:
 
         # Wait for the worker to finalise the WAV and signal DONE.
         if not self._worker_done.wait(timeout=8.0):
-            log.warning("Worker DONE not received in 8s — killing for respawn")
-            self._kill_worker()
+            log.warning("Worker DONE not received in 8s — killing")
+            self._kill_active()
             wav_path = self._wav_path
             self._wav_path = None
             if wav_path:
                 try: os.remove(wav_path)
                 except Exception: pass
-            # Pre-spawn next worker in background so the user's next
-            # press is still fast.
-            threading.Thread(target=self._spawn_worker, daemon=True).start()
+            # The warm pool was already seeded during start(); top it up
+            # again in case that one was consumed in a retry path.
+            self._refill_pool_async()
             return np.array([], dtype=np.float32)
         self._worker_done.clear()
 
-        # Worker exits itself after DONE. Clear our handle and pre-spawn
-        # a replacement NOW so it'll be hot when the user presses again.
-        # Critical: this is what lets Windows drop the mic privacy
-        # indicator between recordings.
+        # Worker exits itself after DONE — drop our reference. The
+        # replacement worker is ALREADY in the warm pool (seeded during
+        # start()), so we don't spawn here. Letting the worker exit is
+        # what lets Windows drop the mic privacy indicator between
+        # recordings — keeping it alive holds the WASAPI session.
         with self._worker_lock:
             self._proc = None
-            self._worker_hello.clear()
-        threading.Thread(target=self._spawn_worker, daemon=True).start()
 
         wav_path = self._wav_path
         self._wav_path = None
@@ -1063,14 +1143,13 @@ class SubprocessAudioRecorder:
             return np.array([], dtype=np.float32)
         return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-    def _kill_worker(self):
-        """Force-kill the worker. Next start() will respawn with a fresh
-        PortAudio cache — this is the recovery path for silent-capture."""
+    # -- lifecycle helpers ---------------------------------------------
+
+    def _kill_active(self):
+        """Force-kill the active worker only. Does NOT touch the warm pool."""
         with self._worker_lock:
             proc = self._proc
             self._proc = None
-            self._worker_hello.clear()
-            self._worker_done.clear()
             if proc is None:
                 return
             try:
@@ -1084,20 +1163,46 @@ class SubprocessAudioRecorder:
             except Exception:
                 pass
 
+    def _drain_pool(self):
+        """Kill any pre-spawned worker(s) sitting in the warm pool."""
+        while True:
+            try:
+                worker = self._warm_pool.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if worker["proc"].stdin:
+                    worker["proc"].stdin.close()
+            except Exception:
+                pass
+            try:
+                worker["proc"].kill()
+                worker["proc"].wait(timeout=1.0)
+            except Exception:
+                pass
+
+    def _kill_worker(self):
+        """Nuke active worker AND drain the warm pool. Used by silent-
+        capture recovery — both subprocesses share the same stale
+        PortAudio cache so both must go."""
+        self._kill_active()
+        self._drain_pool()
+
     def respawn_after_stale(self):
         """Called by the parent app when a silent capture suggests the
-        worker's PortAudio cache has gone stale. Next start() respawns."""
-        log.info("SubprocessAudioRecorder: respawning worker after stale capture")
+        worker's PortAudio cache has gone stale. Drops both active
+        worker and warm pool, then refills from scratch."""
+        log.info("SubprocessAudioRecorder: respawning after stale capture")
         self._kill_worker()
-        self._spawn_worker()
+        self._refill_pool_async()
 
     def shutdown(self):
-        """Send QUIT and let the worker exit cleanly. For app shutdown."""
+        """Send QUIT and let workers exit cleanly. For app shutdown."""
+        # Active worker
         with self._worker_lock:
             proc = self._proc
-            if proc is None or proc.poll() is not None:
-                self._proc = None
-                return
+            self._proc = None
+        if proc is not None and proc.poll() is None:
             try:
                 proc.stdin.write(b"QUIT\n")
                 proc.stdin.flush()
@@ -1108,7 +1213,23 @@ class SubprocessAudioRecorder:
             except Exception:
                 try: proc.kill()
                 except Exception: pass
-            self._proc = None
+        # Warm pool
+        while True:
+            try:
+                w = self._warm_pool.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if w["proc"].stdin:
+                    w["proc"].stdin.write(b"QUIT\n")
+                    w["proc"].stdin.flush()
+                    w["proc"].stdin.close()
+            except Exception:
+                pass
+            try: w["proc"].wait(timeout=1.0)
+            except Exception:
+                try: w["proc"].kill()
+                except Exception: pass
 
 
 # ============================================================
@@ -3766,7 +3887,12 @@ class OverlayNotification:
         except Exception:
             pass
         if self._root:
-            self._root.after(50, self._check_queue)
+            # 10ms (100Hz) instead of 50ms (20Hz). The drain itself is
+            # near-instant when the queue is empty, so a faster poll
+            # costs almost nothing in CPU but cuts the worst-case
+            # delay between show_recording() and the waveform
+            # appearing from ~50ms to ~10ms.
+            self._root.after(10, self._check_queue)
 
     def _make_click_through(self):
         """Add WS_EX_TRANSPARENT so mouse events pass through the overlay.
@@ -4707,7 +4833,19 @@ class WhisperTypeApp:
             log.warning("Shell not ready after %ss — tray icon may not appear", timeout_sec)
 
     def _create_icon(self, state="idle"):
-        """Create a simple icon using PIL."""
+        """Return a tray icon for the given state.
+
+        PIL drawing for a 64x64 icon costs 5-15ms per call. The icon
+        contents are pure functions of the state string, so we cache
+        each rendered Image after first use. On every press the tray
+        update becomes a dict lookup rather than a full re-render."""
+        cache = getattr(self, '_icon_cache', None)
+        if cache is None:
+            cache = {}
+            self._icon_cache = cache
+        cached = cache.get(state)
+        if cached is not None:
+            return cached
         from PIL import Image, ImageDraw, ImageFont
         size = 64
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -4767,6 +4905,7 @@ class WhisperTypeApp:
             draw.rounded_rectangle([18, 14, 46, 18], radius=2, fill=(255, 255, 255))
             draw.rounded_rectangle([18, 46, 46, 50], radius=2, fill=(255, 255, 255))
 
+        cache[state] = img
         return img
 
     def _load_model(self):
