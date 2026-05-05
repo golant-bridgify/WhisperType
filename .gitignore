@@ -40,5 +40,8 @@ Desktop.ini
 WhisperType/WhisperType.exe
 WhisperType.exe
 
+# Inno Setup installer output (large; built artifact, not source)
+WhisperType/installer_output/
+
 # Claude
 .claude/
