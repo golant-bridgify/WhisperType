@@ -3140,8 +3140,9 @@ class MeetingSession:
                 lines.append("")
 
         out_path = os.path.join(MEETINGS_DIR, f"{file_stamp}_meeting_diarized.md")
+        content = _wrap_rtl_if_hebrew("\n".join(lines))
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+            f.write(content)
         return out_path
 
     def _wait_for_pending_jobs(self, timeout=60.0):
@@ -3168,8 +3169,16 @@ class MeetingSession:
                 continue
             if not c["text"]:
                 continue
+            # Strip embedded RLM/LRM markers, then re-add a single RLM at
+            # the start when the line is Hebrew. Forces RTL paragraph
+            # direction in bidi-aware editors (VS Code, Word) for plain
+            # text fallback; the outer <div dir="rtl"> wrapper handles
+            # HTML-rendering markdown viewers.
+            clean = c["text"].replace('\u200F', '').replace('\u200E', '').strip()
+            if any('\u0590' <= ch <= '\u05FF' for ch in clean):
+                clean = '\u200F' + clean
             lines.append(f"### {_fmt_relative_ts(c['timestamp_rel'])}")
-            lines.append(c["text"].replace('\u200F', '').replace('\u200E', '').strip())
+            lines.append(clean)
             lines.append("")
         return "\n".join(lines).strip()
 
@@ -3280,6 +3289,7 @@ class MeetingSession:
         sections.append("")
         sections.append(transcript_md or "_(no transcript)_")
         content = "\n".join(sections)
+        content = _wrap_rtl_if_hebrew(content)
 
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -3295,6 +3305,43 @@ def _fmt_relative_ts(seconds):
     if h:
         return f"{h:d}:{m:02d}:{s:02d}"
     return f"{m:d}:{s:02d}"
+
+
+def _is_mostly_hebrew(text):
+    """True if the text contains more Hebrew letters than Latin letters.
+
+    Used to decide whether a meeting markdown file should be wrapped in
+    a <div dir="rtl"> so HTML-aware markdown viewers (GitHub, Obsidian,
+    VS Code preview, Typora, Word) right-align the whole document
+    instead of left-aligning headings and bold speaker labels that
+    happen to start with LTR characters like `**[` or `###`.
+    """
+    if not text:
+        return False
+    hebrew = sum(1 for c in text if '֐' <= c <= '׿')
+    latin = sum(1 for c in text if 'a' <= c.lower() <= 'z')
+    return hebrew > latin
+
+
+def _wrap_rtl_if_hebrew(content):
+    """Wrap markdown content in a dir=rtl block if it's mostly Hebrew.
+
+    Two-layer RTL signal so the file looks right-aligned regardless of
+    how it's opened:
+      - <div dir="rtl">: HTML-aware markdown viewers right-align the
+        full document (including ###  headings and **labels** that
+        would otherwise force LTR paragraph direction).
+      - Per-line RLM markers (added by callers): bidi-aware plain text
+        editors (VS Code, Word, Notepad++) flip paragraph direction
+        per-line for Hebrew content even when HTML isn't rendered.
+    """
+    if not _is_mostly_hebrew(content):
+        return content
+    return (
+        '<div dir="rtl" style="text-align: right;">\n\n'
+        + content
+        + '\n\n</div>\n'
+    )
 
 
 def _validate_hotkey(hotkey_str):
@@ -5944,8 +5991,9 @@ class WhisperTypeApp:
                 lines.append(f"**[{ts}] Speaker {speaker}:** {text}")
                 lines.append("")
 
+        content = _wrap_rtl_if_hebrew("\n".join(lines))
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+            f.write(content)
         return out_path
 
     def _get_language(self):
