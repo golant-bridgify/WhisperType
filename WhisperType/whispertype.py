@@ -176,19 +176,17 @@ DEFAULT_CONFIG = {
 }
 
 
-def list_input_devices():
-    """Return a list of (index, name) tuples for available input devices.
-
-    Filters to a single host API (the default one on Windows, typically MME)
-    to avoid the same physical device appearing multiple times.
-    Further deduplicates by name as a safety net.
-    """
+def _list_input_devices_inproc():
+    """In-process input device enumeration. Used as a frozen-mode
+    fallback and for the very first read before the watchdog has
+    populated the cache. May return stale data on Windows because
+    PortAudio's MME backend caches the device list at process level
+    — that's exactly what _enumerate_devices_via_subprocess() avoids."""
     devices = []
     try:
         import pyaudio
         pa = pyaudio.PyAudio()
         try:
-            # Prefer the default host API so each device appears only once
             try:
                 default_host_api = pa.get_default_host_api_info().get("index")
             except Exception:
@@ -199,14 +197,11 @@ def list_input_devices():
                 info = pa.get_device_info_by_index(i)
                 if int(info.get("maxInputChannels", 0)) <= 0:
                     continue
-                # Filter by default host API when available
                 if default_host_api is not None and info.get("hostApi") != default_host_api:
                     continue
                 name = str(info.get("name", f"Device {i}")).strip()
-                # Skip generic/virtual aggregators that aren't real devices
                 if name.lower() in ("microsoft sound mapper - input", "primary sound capture driver"):
                     continue
-                # Deduplicate by name
                 if name in seen_names:
                     continue
                 seen_names.add(name)
@@ -218,11 +213,9 @@ def list_input_devices():
     return devices
 
 
-def list_loopback_devices():
-    """Return a list of (device_index, name) for available WASAPI loopback output devices.
-
-    Each entry represents an output device whose audio can be captured via loopback.
-    """
+def _list_loopback_devices_inproc():
+    """In-process loopback device enumeration. See _list_input_devices_inproc
+    for why this is fallback-only on Windows."""
     devices = []
     try:
         import pyaudiowpatch as pyaudio
@@ -231,7 +224,6 @@ def list_loopback_devices():
             seen_names = set()
             for loopback in pa.get_loopback_device_info_generator():
                 name = str(loopback.get("name", "")).strip()
-                # Remove "[Loopback]" suffix for cleaner display
                 clean_name = name.replace("[Loopback]", "").strip()
                 if not clean_name:
                     continue
@@ -246,6 +238,30 @@ def list_loopback_devices():
     except Exception as e:
         log.error("Failed to list loopback devices: %s", e)
     return devices
+
+
+def list_input_devices():
+    """Cached input device list. Always reflects the most recent device
+    state on Windows because the device watchdog refreshes the cache via
+    a fresh subprocess (see _enumerate_devices_via_subprocess)."""
+    with _device_cache_lock:
+        if _device_cache["ready"]:
+            return list(_device_cache["mic"])
+    # First call before any watchdog refresh — populate now via the
+    # subprocess so even a freshly-launched app sees current devices.
+    _refresh_device_cache()
+    with _device_cache_lock:
+        return list(_device_cache["mic"])
+
+
+def list_loopback_devices():
+    """Cached loopback device list. See list_input_devices."""
+    with _device_cache_lock:
+        if _device_cache["ready"]:
+            return list(_device_cache["loop"])
+    _refresh_device_cache()
+    with _device_cache_lock:
+        return list(_device_cache["loop"])
 
 
 def resample_audio(audio, orig_rate, target_rate):
@@ -612,6 +628,144 @@ def find_python_interpreter():
         if os.path.exists(cand):
             return cand
     return sys.executable
+
+
+# ============================================================
+# Audio device enumeration with hot-plug detection
+# ============================================================
+# PortAudio's MME backend on Windows caches the device list at the
+# process level — reinitialising the PyAudio instance does NOT
+# re-enumerate, so plugging a USB mic in or out is invisible to a
+# long-running process. The fix: enumerate in a FRESH Python
+# subprocess (same trick as SubprocessAudioRecorder uses for
+# recording). A background watchdog thread refreshes the cache every
+# few seconds and forces the tray menu to rebuild when something
+# changes — no app restart needed.
+
+_DEVICE_ENUM_SCRIPT = (
+    "import json, sys\n"
+    "mic, loop, out = [], [], []\n"
+    "try:\n"
+    "    try:\n"
+    "        import pyaudiowpatch as pa_mod\n"
+    "        has_loopback = True\n"
+    "    except ImportError:\n"
+    "        import pyaudio as pa_mod\n"
+    "        has_loopback = False\n"
+    "    pa = pa_mod.PyAudio()\n"
+    "    try:\n"
+    "        default_host = pa.get_default_host_api_info().get('index')\n"
+    "        seen_mic, seen_loop, seen_out = set(), set(), set()\n"
+    "        for i in range(pa.get_device_count()):\n"
+    "            info = pa.get_device_info_by_index(i)\n"
+    "            if info.get('hostApi') != default_host:\n"
+    "                continue\n"
+    "            name = str(info.get('name', '')).strip()\n"
+    "            if not name:\n"
+    "                continue\n"
+    "            low = name.lower()\n"
+    "            if int(info.get('maxInputChannels', 0)) > 0:\n"
+    "                if low not in ('microsoft sound mapper - input', 'primary sound capture driver') and name not in seen_mic:\n"
+    "                    seen_mic.add(name)\n"
+    "                    mic.append([i, name])\n"
+    "            if int(info.get('maxOutputChannels', 0)) > 0:\n"
+    "                if name not in seen_out:\n"
+    "                    seen_out.add(name)\n"
+    "                    out.append([i, name])\n"
+    "        if has_loopback:\n"
+    "            for lb in pa.get_loopback_device_info_generator():\n"
+    "                name = str(lb.get('name', '')).strip().replace('[Loopback]', '').strip()\n"
+    "                if name and name not in seen_loop:\n"
+    "                    seen_loop.add(name)\n"
+    "                    loop.append([int(lb['index']), name])\n"
+    "    finally:\n"
+    "        pa.terminate()\n"
+    "except Exception as e:\n"
+    "    sys.stderr.write('enum failed: ' + str(e) + chr(10))\n"
+    "sys.stdout.write(json.dumps({'mic': mic, 'loop': loop, 'out': out}))\n"
+    "sys.stdout.flush()\n"
+)
+
+_device_cache_lock = threading.Lock()
+_device_cache = {"mic": [], "loop": [], "out": [], "ready": False}
+
+
+def _enumerate_devices_via_subprocess():
+    """Run enumeration in a fresh Python subprocess.
+
+    Returns dict {mic: [(idx,name)], loop: [...], out: [...]} or None
+    on failure. The fresh-process trick is what makes hot-plug
+    detection work — a long-running process keeps its stale PortAudio
+    cache, but a subprocess Pa_Initialize sees the current device tree.
+    """
+    import subprocess
+    interp = find_python_interpreter()
+    if interp is None:
+        return None
+    try:
+        result = subprocess.run(
+            [interp, "-c", _DEVICE_ENUM_SCRIPT],
+            capture_output=True,
+            timeout=10,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+    except Exception as e:
+        log.warning("Device enum subprocess failed to spawn: %s", e)
+        return None
+    if result.returncode != 0:
+        log.warning("Device enum subprocess returned %d: %s",
+                    result.returncode,
+                    result.stderr.decode("utf-8", errors="replace")[:200])
+        return None
+    try:
+        import json
+        raw = result.stdout.decode("utf-8", errors="replace").strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return {
+            "mic": [tuple(d) for d in data.get("mic", [])],
+            "loop": [tuple(d) for d in data.get("loop", [])],
+            "out": [tuple(d) for d in data.get("out", [])],
+        }
+    except Exception as e:
+        log.warning("Device enum parse failed: %s", e)
+        return None
+
+
+def _refresh_device_cache():
+    """Re-enumerate devices and update the cache. Returns True if the
+    list (by device name) changed since the last refresh."""
+    data = _enumerate_devices_via_subprocess()
+    if data is None:
+        # Frozen-mode fallback: in-process enumeration (may be stale on
+        # Windows due to PortAudio's MME cache, but at least returns
+        # something on first call).
+        data = {
+            "mic": _list_input_devices_inproc(),
+            "loop": _list_loopback_devices_inproc(),
+            "out": _list_output_devices_inproc(),
+        }
+    with _device_cache_lock:
+        old_names = (
+            tuple(n for _, n in _device_cache["mic"]),
+            tuple(n for _, n in _device_cache["loop"]),
+            tuple(n for _, n in _device_cache["out"]),
+        )
+        new_names = (
+            tuple(n for _, n in data["mic"]),
+            tuple(n for _, n in data["loop"]),
+            tuple(n for _, n in data["out"]),
+        )
+        _device_cache["mic"] = data["mic"]
+        _device_cache["loop"] = data["loop"]
+        _device_cache["out"] = data["out"]
+        was_ready = _device_cache["ready"]
+        _device_cache["ready"] = True
+    # Suppress the "changed" signal on the very first fill so we don't
+    # churn the tray menu just because we transitioned from empty cache
+    # to actual data at startup.
+    return was_ready and old_names != new_names
 
 
 def get_system_idle_seconds():
@@ -4239,11 +4393,9 @@ def _ensure_beep_wav():
     return path
 
 
-def list_output_devices():
-    """Return [(index, name), ...] for available output devices on the default host API.
-
-    Filters dupes and non-output devices. Used by the Beep Output submenu.
-    """
+def _list_output_devices_inproc():
+    """In-process output device enumeration. Fallback path — see
+    _list_input_devices_inproc for caveats."""
     import pyaudio
     pa = pyaudio.PyAudio()
     devices = []
@@ -4264,6 +4416,18 @@ def list_output_devices():
     finally:
         pa.terminate()
     return devices
+
+
+def list_output_devices():
+    """Cached output device list. Used by the Beep Output submenu.
+    Refreshed by the device watchdog so plug/unplug is reflected
+    without an app restart."""
+    with _device_cache_lock:
+        if _device_cache["ready"]:
+            return list(_device_cache["out"])
+    _refresh_device_cache()
+    with _device_cache_lock:
+        return list(_device_cache["out"])
 
 
 def play_beep(freq=800, duration_ms=150, device_index=None):
@@ -4770,6 +4934,13 @@ class WhisperTypeApp:
                 threading.Thread(target=self._display_wake_watchdog, daemon=True).start()
                 log.info("Display-wake watchdog running (threshold: %.0f min idle)",
                          wake_threshold)
+
+        # Audio device hot-plug detection. Runs regardless of recorder type
+        # because PortAudio's MME device-list cache is process-wide — the
+        # SubprocessAudioRecorder's per-recording subprocess fixes silent
+        # captures but doesn't help the tray menu reflect plugged-in devices.
+        threading.Thread(target=self._device_watchdog, daemon=True).start()
+        log.info("Device watchdog running (5s polling for hot-plug detection)")
 
         # Wait for Windows Explorer / taskbar to be ready before showing the tray
         # icon. Fixes the case where auto-start launches WhisperType before the
@@ -5416,6 +5587,133 @@ class WhisperTypeApp:
                 return  # this thread dies with the process
             except Exception as e:
                 log.error("Idle watchdog error: %s", e)
+
+    def _device_watchdog(self):
+        """Background thread that detects audio device hot-plug events.
+
+        Why this exists: on Windows, PortAudio's MME backend caches the
+        device list at process level. Plugging/unplugging a USB mic is
+        invisible to a long-running app — the user has to restart the
+        process to see new devices. Module-level _refresh_device_cache
+        sidesteps this by enumerating in a fresh subprocess.
+
+        Loop:
+          - Every CHECK_INTERVAL_SEC, call _refresh_device_cache.
+          - If the (mic, loopback, output) name lists changed:
+              * Map config[input_device_index] / loopback_device_index by
+                NAME to the new index (USB indices shift when other
+                devices come/go).
+              * If the user's selected device disappeared, fall back to
+                System Default and flash an overlay.
+              * Tell pystray to rebuild the menu so the next right-click
+                shows the new entries.
+
+        Cost: ~250ms subprocess every 5s = ~5% baseline CPU on a slower
+        laptop. Acceptable for the UX win of zero-restart hot-plug.
+        """
+        CHECK_INTERVAL_SEC = 5.0
+        # Snapshot the previous list so we can map old indices → names
+        # (config stores the index; we need the name to find it again
+        # after re-enumeration).
+        prev_mic = list(_device_cache["mic"])
+        prev_loop = list(_device_cache["loop"])
+        while True:
+            time.sleep(CHECK_INTERVAL_SEC)
+            try:
+                changed = _refresh_device_cache()
+                if not changed:
+                    # Still update prev_* so we have current name mapping
+                    # for the next change detection.
+                    with _device_cache_lock:
+                        prev_mic = list(_device_cache["mic"])
+                        prev_loop = list(_device_cache["loop"])
+                    continue
+
+                with _device_cache_lock:
+                    new_mic = list(_device_cache["mic"])
+                    new_loop = list(_device_cache["loop"])
+                old_names_mic = ", ".join(n for _, n in prev_mic)
+                new_names_mic = ", ".join(n for _, n in new_mic)
+                log.info("Audio devices changed:")
+                log.info("  mic before: %s", old_names_mic or "(none)")
+                log.info("  mic after:  %s", new_names_mic or "(none)")
+
+                # ---- mic: handle index shift / disappearance ----
+                cur_mic_idx = self.config.get("input_device_index")
+                if cur_mic_idx is not None:
+                    prev_mic_by_idx = dict(prev_mic)
+                    cur_name = prev_mic_by_idx.get(cur_mic_idx)
+                    if cur_name is not None:
+                        new_mic_by_name = {n: i for i, n in new_mic}
+                        if cur_name in new_mic_by_name:
+                            new_idx = new_mic_by_name[cur_name]
+                            if new_idx != cur_mic_idx:
+                                log.info(
+                                    "Mic '%s' index shifted: %d → %d",
+                                    cur_name, cur_mic_idx, new_idx,
+                                )
+                                self.config["input_device_index"] = new_idx
+                                save_config(self.config)
+                                try:
+                                    self.recorder.input_device_index = new_idx
+                                except Exception:
+                                    pass
+                        else:
+                            # Selected mic is gone — fall back to default
+                            log.info(
+                                "Mic '%s' disconnected — reverting to System Default",
+                                cur_name,
+                            )
+                            self.config["input_device_index"] = None
+                            save_config(self.config)
+                            try:
+                                self.recorder.input_device_index = None
+                            except Exception:
+                                pass
+                            self._reset_silent_state()
+                            try:
+                                self.overlay.show(
+                                    f"  🎙  Mic disconnected — using default  ",
+                                    bg_color="#d08770", duration=2500,
+                                )
+                            except Exception:
+                                pass
+
+                # ---- loopback: same shift / disappearance handling ----
+                cur_loop_idx = self.config.get("loopback_device_index")
+                if cur_loop_idx is not None:
+                    prev_loop_by_idx = dict(prev_loop)
+                    cur_name = prev_loop_by_idx.get(cur_loop_idx)
+                    if cur_name is not None:
+                        new_loop_by_name = {n: i for i, n in new_loop}
+                        if cur_name in new_loop_by_name:
+                            new_idx = new_loop_by_name[cur_name]
+                            if new_idx != cur_loop_idx:
+                                log.info(
+                                    "Loopback '%s' index shifted: %d → %d",
+                                    cur_name, cur_loop_idx, new_idx,
+                                )
+                                self.config["loopback_device_index"] = new_idx
+                                save_config(self.config)
+                        else:
+                            log.info(
+                                "Loopback '%s' disconnected — reverting",
+                                cur_name,
+                            )
+                            self.config["loopback_device_index"] = None
+                            save_config(self.config)
+
+                # ---- force pystray to rebuild menus ----
+                try:
+                    if self.tray_icon:
+                        self.tray_icon.update_menu()
+                except Exception as e:
+                    log.warning("update_menu after device change failed: %s", e)
+
+                prev_mic = new_mic
+                prev_loop = new_loop
+            except Exception as e:
+                log.error("Device watchdog error: %s", e)
 
     def _recording_watchdog(self, generation):
         """Stop runaway recordings. Runs once per recording session.
