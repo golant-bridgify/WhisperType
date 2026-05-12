@@ -473,6 +473,36 @@ def t_cleaner_vocab_fixes_mistranscription():
 _test("cleaner: vocab corrects 'בגד פושע' → 'git push'", t_cleaner_vocab_fixes_mistranscription)
 
 
+def t_cleaner_email_no_em_dashes():
+    """The email style enforces Golan's writing rules. Em dashes (U+2014)
+    must never appear in the cleaned output. Run three sample inputs that
+    would naturally tempt an LLM into using one."""
+    cl = _cleaner()
+    samples = [
+        "I want to ship the feature this week however we need to test it "
+        "first before we roll it out to all partner brands",
+        "The meeting with the loyalty program went really well however "
+        "I still have concerns about the integration timeline for the "
+        "Merchant API",
+        "Bridgify is a B2B2C platform we supply travel inventory to "
+        "partner brands who then offer cashback and gift cards to "
+        "their end users",
+    ]
+    failures = []
+    for raw in samples:
+        out = cl.clean(raw, style="email")
+        if "—" in out:
+            failures.append(out)
+    assert not failures, (
+        "em dash (U+2014) leaked into email cleanup output:\n"
+        + "\n".join(repr(f) for f in failures)
+    )
+
+
+_test("cleaner: email style produces no em dashes across 3 samples",
+      t_cleaner_email_no_em_dashes)
+
+
 # ============================================================
 # 7. MeetingSession end-to-end
 # ============================================================
