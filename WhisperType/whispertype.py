@@ -142,7 +142,7 @@ DEFAULT_CONFIG = {
     # cleanup system prompt so mis-heard terms get corrected after the fact.
     # Example: 'git, push, pull, commit, React, Kubernetes, Naor, Jabra'
     # stops 'git push' from being transcribed as 'בגד פושע'.
-    "custom_vocabulary": "",
+    "custom_vocabulary": "Bridgify, B2B2C, Merchant API, white-label, partner brand, cashback, gift cards, Next.js, Django, Postgres, Azure, Lametayel, Tiuli, Gal, Mila, Emma, Dylan, Golan",
     # Clipboard auto-restore: after pasting transcribed text, put back
     # whatever was in the clipboard before the paste (~2s delay). Stops
     # WhisperType from silently clobbering the user's 'copy' whenever they
