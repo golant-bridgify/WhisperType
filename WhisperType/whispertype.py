@@ -99,7 +99,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 DEFAULT_CONFIG = {
     "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
     "language": "auto",  # "auto", "he", "en", etc.
-    "hotkey": "ctrl+space",
+    "hotkey": "ctrl+alt+space",
     "beam_size": 3,
     "start_minimized": True,
     "paste_mode": "auto_paste",  # "auto_paste" or "clipboard_only"

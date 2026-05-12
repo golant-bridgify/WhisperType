@@ -12,7 +12,7 @@ Built as a SuperWhisper alternative for Windows, with Hebrew+English mixed-speec
 
 ### The core flow (~1 second)
 ```
-1. Press Ctrl+Space           →  Tray icon turns RED
+1. Press Ctrl+Alt+Space       →  Tray icon turns RED
 2. Talk                       →  Mic (+ system audio) captured
 3. Release                    →  Tray turns AMBER (transcribing)
 4. Cleaned text pastes        →  Into your focused window
@@ -70,11 +70,11 @@ First run downloads the Whisper model (~1.6GB for the default turbo). Cached aft
 
 | Action | How |
 |--------|-----|
-| **Record & transcribe** | Hold `Ctrl+Space`, talk, release |
+| **Record & transcribe** | Hold `Ctrl+Alt+Space`, talk, release |
 | **Undo last paste** | `Ctrl+Alt+Z` |
 | **Start meeting** | Right-click tray → `🎙  Start Meeting` |
 | **Stop meeting** | Right-click tray → `⏹  Stop Meeting` |
-| **Change hotkey** | Tray → Options → `Hotkey: ctrl+space...` |
+| **Change hotkey** | Tray → Options → `Hotkey: ctrl+alt+space...` |
 | **Pick AI cleanup style** | Tray → Options → AI Cleanup (Groq) |
 | **Edit custom vocabulary** | Tray → Options → Custom Vocabulary... |
 | **View transcription history** | Tray → Options → History |
@@ -153,7 +153,7 @@ These are:
 Long-form continuous capture:
 
 1. Tray → `🎙  Start Meeting (long recording)` — recording starts with "both" source (mic + system audio)
-2. The icon turns 🟣 purple. The main Ctrl+Space hotkey is blocked while active (you don't need it — the meeting captures everything).
+2. The icon turns 🟣 purple. The main Ctrl+Alt+Space hotkey is blocked while active (you don't need it — the meeting captures everything).
 3. Talk / hold the meeting as long as you want. Audio is chunked every 45 seconds and transcribed in the background. Memory stays bounded regardless of meeting length.
 4. Tray → `⏹  Stop Meeting`
 5. Wait ~10-30 seconds for the final chunk + LLM summary
@@ -202,7 +202,7 @@ Key settings you might want to tweak:
 ```json
 {
   "model_size": "large-v3-turbo",
-  "hotkey": "ctrl+space",
+  "hotkey": "ctrl+alt+space",
   "cleanup_style": "casual",
   "custom_vocabulary": "git, push, Kubernetes, ...",
   "recording_source": "both",

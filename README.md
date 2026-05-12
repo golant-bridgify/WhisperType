@@ -25,7 +25,7 @@ Most dictation tools are either expensive subscriptions (SuperWhisper, Wispr Flo
 
 | | |
 |---|---|
-| **Push-to-talk** | Hold `Ctrl+Space` to record, release to transcribe and paste |
+| **Push-to-talk** | Hold `Ctrl+Alt+Space` to record, release to transcribe and paste |
 | **Toggle mode** | Or click once to start, click again to stop |
 | **Local transcription** | `faster-whisper` on CPU (int8 quantized for speed) |
 | **Cloud transcription** | Optional Groq Cloud backend — 5–10x faster |
@@ -78,7 +78,7 @@ python build.py
 
 | Action | How |
 |---|---|
-| **Record** | Hold `Ctrl + Space` (or configure any hotkey in `config.json`) |
+| **Record** | Hold `Ctrl + Alt + Space` (or configure any hotkey in `config.json`) |
 | **Stop & paste** | Release the key |
 | **Switch model** | Tray icon → Model |
 | **Switch source** | Tray icon → Recording Source (mic / system audio / both) |
@@ -121,7 +121,7 @@ Settings live in `%APPDATA%\WhisperType\config.json`. Most options are controlle
 ```json
 {
   "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
-  "hotkey": "ctrl+space",
+  "hotkey": "ctrl+alt+space",
   "beam_size": 3,
   "paste_mode": "auto_paste",
   "play_sound": true,
