@@ -101,7 +101,7 @@ def t_config_roundtrip():
     w.CONFIG_FILE = cfg_path
     try:
         cfg = w.load_config()  # empty file → defaults
-        assert cfg["hotkey"] == "ctrl+space", cfg["hotkey"]
+        assert cfg["hotkey"] == "ctrl+alt+space", cfg["hotkey"]
         assert "cleanup_style" in cfg
         assert "custom_vocabulary" in cfg
         assert "clipboard_auto_restore" in cfg
@@ -151,7 +151,7 @@ def t_config_corrupt():
     w.CONFIG_FILE = cfg_path
     try:
         cfg = w.load_config()
-        assert cfg["hotkey"] == "ctrl+space", "should fall back to defaults"
+        assert cfg["hotkey"] == "ctrl+alt+space", "should fall back to defaults"
     finally:
         w.CONFIG_DIR = original_dir
         w.CONFIG_FILE = original_file
