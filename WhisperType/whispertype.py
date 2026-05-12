@@ -134,7 +134,7 @@ DEFAULT_CONFIG = {
     # words, add punctuation, fix obvious mis-hearings. Costs ~$0.00005 per
     # transcription and ~500-900ms added latency. Set to "off" or "verbatim"
     # to disable. Shares the groq_api_key with GroqTranscriber.
-    "cleanup_style": "off",  # "off" / "casual" / "proofread" / "email" / "code"
+    "cleanup_style": "email",  # "off" / "casual" / "proofread" / "email" / "whatsapp" / "code"
     "cleanup_llm_model": "llama-3.3-70b-versatile",  # Groq model for cleanup
     # Custom vocabulary — user-specific terms (programming, names, product
     # names) that Whisper otherwise mis-transcribes. Sent as Whisper's
@@ -4600,16 +4600,8 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
 class WhisperTypeApp:
     def __init__(self):
         self.config = load_config()
-        # Always start with cleanup OFF on every launch. Rationale:
-        # gpt-4o-transcribe (the user's primary backend) already produces
-        # clean, punctuated output, so an extra 300-800ms LLM pass is pure
-        # latency overhead. User can flip it on mid-session for raw Whisper
-        # output that needs polish; next restart it returns to off.
-        if self.config.get("cleanup_style") != "off":
-            log.info("Resetting cleanup_style to 'off' on startup "
-                     "(was %r)", self.config.get("cleanup_style"))
-            self.config["cleanup_style"] = "off"
-            save_config(self.config)
+        # cleanup_style persists across launches. The user's last selection
+        # in the tray menu is honoured on the next start.
         # Pick the recorder implementation. Subprocess-isolated is the
         # default because it eliminates the stale-PortAudio / WASAPI-handle
         # bug structurally. Falls back to in-process if:
