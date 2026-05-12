@@ -143,6 +143,11 @@ DEFAULT_CONFIG = {
     # Example: 'git, push, pull, commit, React, Kubernetes, Naor, Jabra'
     # stops 'git push' from being transcribed as 'בגד פושע'.
     "custom_vocabulary": "Bridgify, B2B2C, Merchant API, white-label, partner brand, cashback, gift cards, Next.js, Django, Postgres, Azure, Lametayel, Tiuli, Gal, Mila, Emma, Dylan, Golan",
+    # User-editable overrides for the built-in cleanup prompts. Maps
+    # style name to a replacement prompt string. Edited via the AI
+    # Cleanup tab in the Settings window. A missing key falls back to
+    # the built-in STYLE_PROMPTS entry.
+    "cleanup_prompts_override": {},
     # Clipboard auto-restore: after pasting transcribed text, put back
     # whatever was in the clipboard before the paste (~2s delay). Stops
     # WhisperType from silently clobbering the user's 'copy' whenever they
@@ -2890,9 +2895,14 @@ class GroqLLMCleaner:
         ),
     }
 
-    def __init__(self, api_key, model="llama-3.3-70b-versatile"):
+    def __init__(self, api_key, model="llama-3.3-70b-versatile",
+                 prompt_overrides=None):
         self.api_key = api_key
         self.model = model
+        # Per-style prompt overrides edited via the Settings window's
+        # AI Cleanup tab. Maps style name to a replacement system prompt.
+        # An empty/missing key falls back to STYLE_PROMPTS.
+        self.prompt_overrides = dict(prompt_overrides or {})
         # Persistent HTTP connection — saves ~100-300ms TLS handshake per
         # cleanup call. Same pattern as GroqTranscriber._session.
         self._session = None
@@ -2916,7 +2926,9 @@ class GroqLLMCleaner:
             return text
         if style in ("off", "verbatim") or not self.api_key:
             return text
-        style_rules = self.STYLE_PROMPTS.get(style)
+        # Honour user overrides first, then fall back to the built-in prompt
+        overrides = getattr(self, "prompt_overrides", None) or {}
+        style_rules = overrides.get(style) or self.STYLE_PROMPTS.get(style)
         if not style_rules:
             return text
 
@@ -4595,6 +4607,772 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
 
 
 # ============================================================
+# Settings Window (tabbed)
+# ============================================================
+class SettingsWindow:
+    """Tabbed settings window using ttk.Notebook.
+
+    Spawned in a daemon thread from WhisperTypeApp._open_settings_window().
+    Reads and writes config through the existing atomic save_config() helper.
+    Where possible, edits take effect immediately. Hotkey, API key, and
+    vocabulary edits delegate to the existing dialogs which already handle
+    masking, paste, validation, and live verification against the API.
+    """
+
+    FORK_URL = "https://github.com/golant-bridgify/WhisperType"
+    UPSTREAM_URL = "https://github.com/Danaor/WhisperType"
+    APP_VERSION = "1.0-golan"
+
+    # Catppuccin Mocha, matches existing dialogs
+    BG = "#1e1e2e"
+    INPUT_BG = "#313244"
+    SELECTED_BG = "#45475a"
+    SUBDUED = "#a6adc8"
+    TEXT = "#cdd6f4"
+    ACCENT = "#89b4fa"
+    ACCENT_HOVER = "#74c7ec"
+    OK_GREEN = "#a6e3a1"
+    OK_HOVER = "#94e2d5"
+    WARN = "#fab387"
+    WARN_HOVER = "#f9e2af"
+    ERR = "#f38ba8"
+    ERR_HOVER = "#eba0ac"
+
+    def __init__(self, app):
+        self.app = app
+        self._root = None
+        self._status_label = None
+        self._hk_label = None
+        self._vocab_textbox = None
+        self._cleanup_prompt_textbox = None
+        self._cleanup_style_var = None
+
+    def show(self):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self._root = tk.Tk()
+        _apply_dpi_scaling_to_tk(self._root)
+        self._root.title("WhisperType Settings")
+        self._root.configure(bg=self.BG)
+
+        W, H = 780, 660
+        x = (self._root.winfo_screenwidth() - W) // 2
+        y = (self._root.winfo_screenheight() - H) // 2
+        self._root.geometry(f"{W}x{H}+{x}+{y}")
+
+        style = ttk.Style(self._root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("TNotebook", background=self.BG, borderwidth=0)
+        style.configure("TNotebook.Tab",
+                        background=self.INPUT_BG, foreground=self.TEXT,
+                        padding=[12, 6], font=("Segoe UI", 10), borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", self.SELECTED_BG)],
+                  foreground=[("selected", self.TEXT)])
+        style.configure("TFrame", background=self.BG)
+        style.configure("TLabel", background=self.BG, foreground=self.TEXT)
+        style.configure("TCombobox",
+                        fieldbackground=self.INPUT_BG, background=self.INPUT_BG,
+                        foreground=self.TEXT, arrowcolor=self.TEXT)
+        self._root.option_add("*TCombobox*Listbox.background", self.INPUT_BG)
+        self._root.option_add("*TCombobox*Listbox.foreground", self.TEXT)
+        self._root.option_add("*TCombobox*Listbox.selectBackground", self.SELECTED_BG)
+
+        notebook = ttk.Notebook(self._root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+
+        notebook.add(self._build_general_tab(notebook), text="General")
+        notebook.add(self._build_models_tab(notebook), text="Models")
+        notebook.add(self._build_api_keys_tab(notebook), text="API Keys")
+        notebook.add(self._build_cleanup_tab(notebook), text="AI Cleanup")
+        notebook.add(self._build_vocabulary_tab(notebook), text="Vocabulary")
+        notebook.add(self._build_snippets_tab(notebook), text="Snippets")
+        notebook.add(self._build_audio_tab(notebook), text="Audio")
+        notebook.add(self._build_about_tab(notebook), text="About")
+
+        bottom = tk.Frame(self._root, bg=self.BG)
+        bottom.pack(fill="x", padx=10, pady=(0, 8))
+        self._status_label = tk.Label(bottom, text="",
+                                       font=("Segoe UI", 9),
+                                       fg=self.SUBDUED, bg=self.BG, anchor="w")
+        self._status_label.pack(side="left", fill="x", expand=True)
+        self._make_btn(bottom, "Close", self._root.destroy,
+                       self.OK_GREEN, self.OK_HOVER).pack(side="right", padx=(8, 0))
+
+        # Periodic refresh so values changed via the tray menu while the
+        # Settings window is open stay in sync (hotkey label is the main one).
+        def _periodic_refresh():
+            try:
+                if self._hk_label is not None:
+                    self._hk_label.config(
+                        text=self.app.config.get("hotkey", "ctrl+alt+space"))
+            except tk.TclError:
+                return
+            self._root.after(2000, _periodic_refresh)
+
+        self._root.bind("<Escape>", lambda e: self._root.destroy())
+        self._root.protocol("WM_DELETE_WINDOW", self._root.destroy)
+        self._root.after(100, lambda: self._root.lift())
+        self._root.after(2000, _periodic_refresh)
+        self._root.mainloop()
+
+    # ----- shared widgets -----
+
+    def _make_btn(self, parent, text, cmd, bg=None, hover_bg=None, fg=None):
+        import tkinter as tk
+        bg = bg or self.ACCENT
+        hover_bg = hover_bg or self.ACCENT_HOVER
+        fg = fg or self.BG
+        b = tk.Button(parent, text=text, command=cmd,
+                      font=("Segoe UI", 10, "bold"),
+                      bg=bg, fg=fg,
+                      activebackground=hover_bg, activeforeground=fg,
+                      relief="flat", bd=0, padx=12, pady=5, cursor="hand2")
+        b.bind("<Enter>", lambda e: b.config(bg=hover_bg))
+        b.bind("<Leave>", lambda e: b.config(bg=bg))
+        return b
+
+    def _section_label(self, parent, text):
+        import tkinter as tk
+        return tk.Label(parent, text=text,
+                        font=("Segoe UI", 11, "bold"),
+                        fg=self.ACCENT, bg=self.BG, anchor="w")
+
+    def _hint(self, parent, text):
+        import tkinter as tk
+        return tk.Label(parent, text=text,
+                        font=("Segoe UI", 9),
+                        fg=self.SUBDUED, bg=self.BG, anchor="w",
+                        justify="left", wraplength=720)
+
+    def _radio(self, parent, label, var, value, command=None):
+        import tkinter as tk
+        return tk.Radiobutton(parent, text=label, variable=var, value=value,
+                              command=command,
+                              bg=self.BG, fg=self.TEXT,
+                              selectcolor=self.INPUT_BG,
+                              activebackground=self.BG,
+                              activeforeground=self.TEXT,
+                              font=("Segoe UI", 10), anchor="w")
+
+    def _checkbox(self, parent, label, var, command=None):
+        import tkinter as tk
+        return tk.Checkbutton(parent, text=label, variable=var,
+                              command=command,
+                              bg=self.BG, fg=self.TEXT,
+                              selectcolor=self.INPUT_BG,
+                              activebackground=self.BG,
+                              activeforeground=self.TEXT,
+                              font=("Segoe UI", 10), anchor="w")
+
+    def _notice(self, text, level="ok"):
+        if self._status_label is None:
+            return
+        color = {"ok": self.OK_GREEN, "warn": self.WARN, "err": self.ERR}.get(
+            level, self.SUBDUED)
+        try:
+            self._status_label.config(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _save(self):
+        save_config(self.app.config)
+
+    # ----- Tab 1: General -----
+
+    def _build_general_tab(self, parent):
+        import tkinter as tk
+        frame = tk.Frame(parent, bg=self.BG)
+
+        self._section_label(frame, "Press-to-talk hotkey").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        hk_row = tk.Frame(frame, bg=self.BG)
+        hk_row.pack(fill="x", padx=14, pady=(0, 4))
+        current_hk = self.app.config.get("hotkey", "ctrl+alt+space")
+        self._hk_label = tk.Label(hk_row, text=current_hk,
+                                   font=("Consolas", 11),
+                                   bg=self.INPUT_BG, fg=self.TEXT,
+                                   relief="flat", padx=10, pady=6, anchor="w")
+        self._hk_label.pack(side="left", fill="x", expand=True)
+        self._make_btn(hk_row, "Change...",
+                       lambda: self.app._open_hotkey_dialog()).pack(
+            side="left", padx=(8, 0))
+        self._hint(frame,
+            "Hold this combination to record. Changes re-register the "
+            "global hook live, no app restart needed.").pack(
+            anchor="w", padx=14, pady=(2, 14))
+
+        self._section_label(frame, "Recording mode").pack(
+            anchor="w", padx=14, pady=(2, 4))
+        rec_var = tk.StringVar(value=self.app.config.get("recording_mode", "hold"))
+        def on_rec_change():
+            self.app.config["recording_mode"] = rec_var.get()
+            self._save()
+            self._notice(f"Recording mode: {rec_var.get()}", "ok")
+        self._radio(frame, "Hold to record  (push and release)",
+                    rec_var, "hold", on_rec_change).pack(anchor="w", padx=22)
+        self._radio(frame, "Toggle  (press to start, press again to stop)",
+                    rec_var, "toggle", on_rec_change).pack(
+            anchor="w", padx=22, pady=(0, 12))
+
+        self._section_label(frame, "Paste mode").pack(
+            anchor="w", padx=14, pady=(2, 4))
+        paste_var = tk.StringVar(
+            value=self.app.config.get("paste_mode", "auto_paste"))
+        def on_paste_change():
+            self.app.config["paste_mode"] = paste_var.get()
+            self._save()
+            self._notice(f"Paste mode: {paste_var.get()}", "ok")
+        self._radio(frame, "Auto-paste  (Ctrl+V into the focused window)",
+                    paste_var, "auto_paste", on_paste_change).pack(
+            anchor="w", padx=22)
+        self._radio(frame, "Clipboard only  (leave the text on the clipboard)",
+                    paste_var, "clipboard_only", on_paste_change).pack(
+            anchor="w", padx=22, pady=(0, 12))
+
+        self._section_label(frame, "Clipboard").pack(
+            anchor="w", padx=14, pady=(2, 4))
+        restore_var = tk.BooleanVar(
+            value=bool(self.app.config.get("clipboard_auto_restore", True)))
+        def on_restore_change():
+            self.app.config["clipboard_auto_restore"] = bool(restore_var.get())
+            self._save()
+            self._notice(
+                f"Restore clipboard after paste: "
+                f"{'ON' if restore_var.get() else 'OFF'}", "ok")
+        self._checkbox(frame,
+            "Restore the previous clipboard content after a paste (about 2s delay)",
+            restore_var, on_restore_change).pack(anchor="w", padx=22)
+
+        return frame
+
+    # ----- Tab 2: Models -----
+
+    def _build_models_tab(self, parent):
+        import tkinter as tk
+        from tkinter import ttk
+        frame = tk.Frame(parent, bg=self.BG)
+
+        self._section_label(frame, "Press-to-talk model").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        self._hint(frame,
+            "Used for short dictations. OpenAI rows appear only when "
+            "an OpenAI API key is set (see API Keys tab).").pack(
+            anchor="w", padx=14, pady=(0, 6))
+
+        ptt_rows = WhisperTypeApp._MENU_MODELS_ORDERED
+        has_openai = bool((self.app.config.get("openai_api_key") or "").strip())
+        ptt_visible = [r for r in ptt_rows if r[2] != "openai" or has_openai]
+        ptt_labels = [r[0] for r in ptt_visible]
+        cur_model = self.app.config.get("model_size")
+        cur_backend = self.app.config.get("transcription_backend", "local")
+        cur_translate = bool(self.app.config.get("translate_mode", False))
+        cur_openai_model = self.app.config.get("openai_model", "gpt-4o-transcribe")
+        cur_label = ""
+        for label, m, b, t, om in ptt_visible:
+            if (m == cur_model and b == cur_backend and t == cur_translate
+                    and (b != "openai" or om == cur_openai_model)):
+                cur_label = label
+                break
+        ptt_var = tk.StringVar(
+            value=cur_label or (ptt_labels[0] if ptt_labels else ""))
+        ptt_dd = ttk.Combobox(frame, textvariable=ptt_var, values=ptt_labels,
+                              state="readonly", font=("Segoe UI", 10))
+        ptt_dd.pack(fill="x", padx=14, pady=(0, 10))
+        def on_ptt_change(event=None):
+            label = ptt_var.get()
+            for l, m, b, t, om in ptt_visible:
+                if l == label:
+                    self.app._set_model_backend_translate(m, b, t, om)
+                    self._notice(f"Press-to-talk model: {label}", "ok")
+                    return
+        ptt_dd.bind("<<ComboboxSelected>>", on_ptt_change)
+
+        self._section_label(frame, "Meeting and file model").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        self._hint(frame,
+            "Used for Start Meeting and Transcribe File. Rows that need "
+            "an API key show what's missing.").pack(
+            anchor="w", padx=14, pady=(0, 6))
+        mm_rows = WhisperTypeApp._MEETING_MODELS
+        mm_labels = []
+        mm_keys = []
+        for label, key, required in mm_rows:
+            missing = [k for k in required
+                       if not self.app.config.get(k, "").strip()]
+            display = label if not missing else f"{label}  (needs {', '.join(missing)})"
+            mm_labels.append(display)
+            mm_keys.append(key)
+        cur_mm_key = self.app.config.get("meeting_model", "assemblyai_universal_2")
+        cur_mm_idx = mm_keys.index(cur_mm_key) if cur_mm_key in mm_keys else 0
+        mm_var = tk.StringVar(value=mm_labels[cur_mm_idx])
+        mm_dd = ttk.Combobox(frame, textvariable=mm_var, values=mm_labels,
+                             state="readonly", font=("Segoe UI", 10))
+        mm_dd.pack(fill="x", padx=14, pady=(0, 10))
+        def on_mm_change(event=None):
+            label = mm_var.get()
+            for l, k in zip(mm_labels, mm_keys):
+                if l == label:
+                    self.app._set_meeting_model(k)
+                    self._notice(f"Meeting model: {label}", "ok")
+                    return
+        mm_dd.bind("<<ComboboxSelected>>", on_mm_change)
+
+        self._section_label(frame, "Translation").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        translate_var = tk.BooleanVar(
+            value=bool(self.app.config.get("translate_mode", False)))
+        def on_translate_change():
+            current = bool(self.app.config.get("translate_mode", False))
+            if current != bool(translate_var.get()):
+                self.app._toggle_translate_mode()
+                self._notice(
+                    f"Translate to English: "
+                    f"{'ON' if translate_var.get() else 'OFF'}", "ok")
+        self._checkbox(frame,
+            "Translate non-English speech to English  (uses Whisper's translate task)",
+            translate_var, on_translate_change).pack(anchor="w", padx=22)
+
+        return frame
+
+    # ----- Tab 3: API Keys -----
+
+    def _build_api_keys_tab(self, parent):
+        import tkinter as tk
+        frame = tk.Frame(parent, bg=self.BG)
+
+        def _mask(key):
+            if not key:
+                return "(not set)"
+            return key[:8] + "..." + key[-4:] if len(key) > 14 else key[:4] + "..."
+
+        keys = [
+            ("Groq",       "groq_api_key",       self.app._set_groq_api_key,
+             "console.groq.com/keys"),
+            ("OpenAI",     "openai_api_key",     self.app._set_openai_api_key,
+             "platform.openai.com/api-keys"),
+            ("AssemblyAI", "assemblyai_api_key", self.app._set_assemblyai_api_key,
+             "assemblyai.com"),
+        ]
+
+        labels_to_refresh = []
+        for name, cfg_key, opener, source in keys:
+            self._section_label(frame, f"{name} API key").pack(
+                anchor="w", padx=14, pady=(14, 4))
+            row = tk.Frame(frame, bg=self.BG)
+            row.pack(fill="x", padx=14)
+            lbl = tk.Label(row, text=_mask(self.app.config.get(cfg_key, "")),
+                           font=("Consolas", 11),
+                           bg=self.INPUT_BG, fg=self.TEXT,
+                           relief="flat", padx=10, pady=6, anchor="w")
+            lbl.pack(side="left", fill="x", expand=True)
+            labels_to_refresh.append((cfg_key, lbl))
+            self._make_btn(row, "Set / Verify...", opener).pack(
+                side="left", padx=(8, 0))
+            self._hint(frame, f"Get one at: https://{source}").pack(
+                anchor="w", padx=14, pady=(0, 4))
+
+        self._hint(frame,
+            "The Set/Verify dialog includes a masked input, Show toggle, "
+            "Save & Verify against the live API, and a Clear option.").pack(
+            anchor="w", padx=14, pady=(14, 6))
+
+        def poll_refresh():
+            for cfg_key, lbl in labels_to_refresh:
+                try:
+                    lbl.config(text=_mask(self.app.config.get(cfg_key, "")))
+                except tk.TclError:
+                    return
+            try:
+                self._root.after(1500, poll_refresh)
+            except tk.TclError:
+                pass
+
+        try:
+            self._root.after(1500, poll_refresh)
+        except Exception:
+            pass
+
+        return frame
+
+    # ----- Tab 4: AI Cleanup -----
+
+    def _build_cleanup_tab(self, parent):
+        import tkinter as tk
+        from tkinter import ttk
+        frame = tk.Frame(parent, bg=self.BG)
+
+        self._section_label(frame, "Cleanup style").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        self._hint(frame,
+            "Style applied to every transcription before paste. "
+            "Off bypasses the LLM round-trip entirely.").pack(
+            anchor="w", padx=14, pady=(0, 6))
+
+        styles = ["off"] + list(GroqLLMCleaner.STYLE_PROMPTS.keys())
+        cur = self.app.config.get("cleanup_style", "email")
+        self._cleanup_style_var = tk.StringVar(
+            value=cur if cur in styles else "off")
+        dd = ttk.Combobox(frame, textvariable=self._cleanup_style_var,
+                          values=styles, state="readonly",
+                          font=("Segoe UI", 10))
+        dd.pack(fill="x", padx=14, pady=(0, 10))
+
+        def on_style_change(event=None):
+            new_style = self._cleanup_style_var.get()
+            self.app._set_cleanup_style(new_style)
+            self._load_prompt_for_current_style()
+            self._notice(f"Cleanup style: {new_style}", "ok")
+        dd.bind("<<ComboboxSelected>>", on_style_change)
+
+        self._section_label(frame,
+            "System prompt for the selected style").pack(
+            anchor="w", padx=14, pady=(10, 4))
+        self._hint(frame,
+            "Edit, then Save override to persist. Reset returns to the "
+            "built-in prompt shipped with this fork. Edits apply to the "
+            "next cleanup call, no restart needed.").pack(
+            anchor="w", padx=14, pady=(0, 6))
+
+        text_frame = tk.Frame(frame, bg=self.BG)
+        text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        self._cleanup_prompt_textbox = tk.Text(text_frame,
+            font=("Consolas", 10), bg=self.INPUT_BG, fg=self.TEXT,
+            insertbackground=self.TEXT, relief="flat", bd=5, wrap="word",
+            height=14)
+        self._cleanup_prompt_textbox.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(text_frame,
+                              command=self._cleanup_prompt_textbox.yview)
+        scroll.pack(side="right", fill="y")
+        self._cleanup_prompt_textbox.config(yscrollcommand=scroll.set)
+
+        self._load_prompt_for_current_style()
+
+        btn_row = tk.Frame(frame, bg=self.BG)
+        btn_row.pack(fill="x", padx=14, pady=(0, 10))
+        self._make_btn(btn_row, "Save override",
+                       self._save_cleanup_prompt,
+                       self.OK_GREEN, self.OK_HOVER).pack(side="left")
+        self._make_btn(btn_row, "Reset to built-in",
+                       self._reset_cleanup_prompt,
+                       self.WARN, self.WARN_HOVER).pack(
+            side="left", padx=(8, 0))
+
+        return frame
+
+    def _load_prompt_for_current_style(self):
+        if not self._cleanup_style_var or not self._cleanup_prompt_textbox:
+            return
+        style = self._cleanup_style_var.get()
+        if not style or style == "off":
+            text = ("(The 'off' style does not run a cleanup. Pick another "
+                    "style to view or edit its prompt.)")
+            editable = False
+        else:
+            overrides = self.app.config.get("cleanup_prompts_override", {}) or {}
+            text = overrides.get(
+                style, GroqLLMCleaner.STYLE_PROMPTS.get(style, ""))
+            editable = True
+        try:
+            self._cleanup_prompt_textbox.config(state="normal")
+            self._cleanup_prompt_textbox.delete("1.0", "end")
+            self._cleanup_prompt_textbox.insert("1.0", text)
+            if not editable:
+                self._cleanup_prompt_textbox.config(state="disabled")
+        except Exception:
+            pass
+
+    def _save_cleanup_prompt(self):
+        if not self._cleanup_style_var or not self._cleanup_prompt_textbox:
+            return
+        style = self._cleanup_style_var.get()
+        if not style or style == "off":
+            self._notice("Pick a non-off style to save.", "warn")
+            return
+        prompt = self._cleanup_prompt_textbox.get("1.0", "end-1c")
+        overrides = dict(self.app.config.get("cleanup_prompts_override", {}) or {})
+        overrides[style] = prompt
+        self.app.config["cleanup_prompts_override"] = overrides
+        self._save()
+        try:
+            if self.app._llm_cleaner is not None:
+                self.app._llm_cleaner.prompt_overrides = overrides
+        except Exception:
+            pass
+        self._notice(f"Saved override for '{style}'.", "ok")
+
+    def _reset_cleanup_prompt(self):
+        if not self._cleanup_style_var:
+            return
+        style = self._cleanup_style_var.get()
+        if not style or style == "off":
+            return
+        overrides = dict(self.app.config.get("cleanup_prompts_override", {}) or {})
+        if style in overrides:
+            del overrides[style]
+        self.app.config["cleanup_prompts_override"] = overrides
+        self._save()
+        try:
+            if self.app._llm_cleaner is not None:
+                self.app._llm_cleaner.prompt_overrides = overrides
+        except Exception:
+            pass
+        self._load_prompt_for_current_style()
+        self._notice(f"Reset '{style}' to built-in prompt.", "ok")
+
+    # ----- Tab 5: Vocabulary -----
+
+    def _build_vocabulary_tab(self, parent):
+        import tkinter as tk
+        from tkinter import filedialog
+        frame = tk.Frame(parent, bg=self.BG)
+
+        self._section_label(frame, "Custom vocabulary").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        self._hint(frame,
+            "Terms Whisper should recognise (programming terms, product "
+            "names, people). One per line OR comma-separated. Stored in "
+            "config.json as a single comma-joined string.").pack(
+            anchor="w", padx=14, pady=(0, 6))
+
+        text_frame = tk.Frame(frame, bg=self.BG)
+        text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        self._vocab_textbox = tk.Text(text_frame,
+            font=("Consolas", 11), bg=self.INPUT_BG, fg=self.TEXT,
+            insertbackground=self.TEXT, relief="flat", bd=5, wrap="word",
+            height=18)
+        self._vocab_textbox.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(text_frame, command=self._vocab_textbox.yview)
+        scroll.pack(side="right", fill="y")
+        self._vocab_textbox.config(yscrollcommand=scroll.set)
+
+        current = self.app.config.get("custom_vocabulary", "") or ""
+        per_line = "\n".join(t.strip() for t in current.split(",") if t.strip())
+        self._vocab_textbox.insert("1.0", per_line)
+
+        def normalise():
+            raw = self._vocab_textbox.get("1.0", "end-1c")
+            terms = []
+            for line in raw.splitlines():
+                for term in line.split(","):
+                    t = term.strip()
+                    if t:
+                        terms.append(t)
+            return ", ".join(terms)
+
+        def on_save():
+            self.app.config["custom_vocabulary"] = normalise()
+            self._save()
+            for t_attr in ("_local_transcriber", "_groq_transcriber",
+                           "_openai_transcriber"):
+                t = getattr(self.app, t_attr, None)
+                if t is not None and hasattr(t, "custom_vocabulary"):
+                    try:
+                        t.custom_vocabulary = self.app.config["custom_vocabulary"]
+                    except Exception:
+                        pass
+            self._notice("Vocabulary saved.", "ok")
+
+        def on_import():
+            path = filedialog.askopenfilename(
+                title="Import vocabulary",
+                filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception as e:
+                self._notice(f"Import failed: {e}", "err")
+                return
+            self._vocab_textbox.delete("1.0", "end")
+            self._vocab_textbox.insert("1.0", content)
+            self._notice(f"Imported from {os.path.basename(path)}", "ok")
+
+        def on_export():
+            path = filedialog.asksaveasfilename(
+                title="Export vocabulary",
+                defaultextension=".txt",
+                filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(normalise().replace(", ", "\n"))
+            except Exception as e:
+                self._notice(f"Export failed: {e}", "err")
+                return
+            self._notice(f"Exported to {os.path.basename(path)}", "ok")
+
+        btn_row = tk.Frame(frame, bg=self.BG)
+        btn_row.pack(fill="x", padx=14, pady=(0, 10))
+        self._make_btn(btn_row, "Save",
+                       on_save, self.OK_GREEN, self.OK_HOVER).pack(side="left")
+        self._make_btn(btn_row, "Import...", on_import).pack(
+            side="left", padx=(8, 0))
+        self._make_btn(btn_row, "Export...", on_export).pack(
+            side="left", padx=(8, 0))
+
+        return frame
+
+    # ----- Tab 6: Snippets (placeholder) -----
+
+    def _build_snippets_tab(self, parent):
+        import tkinter as tk
+        frame = tk.Frame(parent, bg=self.BG)
+        self._section_label(frame, "Snippets").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        tk.Label(frame,
+            text=("Coming soon.\n\n"
+                  "Snippets will let you define short trigger phrases that "
+                  "expand to longer text on dictation. For example, saying "
+                  "'sig' to insert your full email signature. The feature "
+                  "is not implemented in the current build, and this tab "
+                  "will gain a Trigger and Expansion two-column editor "
+                  "when it is."),
+            font=("Segoe UI", 10),
+            fg=self.SUBDUED, bg=self.BG, justify="left",
+            wraplength=720, anchor="w").pack(
+            anchor="w", padx=14, pady=(0, 10), fill="both")
+        return frame
+
+    # ----- Tab 7: Audio -----
+
+    def _build_audio_tab(self, parent):
+        import tkinter as tk
+        from tkinter import ttk
+        frame = tk.Frame(parent, bg=self.BG)
+
+        self._section_label(frame, "Input device").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        self._hint(frame,
+            "Microphone used for press-to-talk recording. The watchdog "
+            "refreshes the list automatically when devices are plugged "
+            "or unplugged.").pack(anchor="w", padx=14, pady=(0, 6))
+        try:
+            devices = list_input_devices()
+        except Exception:
+            devices = []
+        dev_labels = ["System default"] + [f"{idx}: {name}"
+                                           for idx, name in devices]
+        dev_indices = [None] + [idx for idx, _ in devices]
+        cur_idx = self.app.config.get("input_device_index", None)
+        try:
+            cur_pos = dev_indices.index(cur_idx) if cur_idx in dev_indices else 0
+        except Exception:
+            cur_pos = 0
+        dev_var = tk.StringVar(value=dev_labels[cur_pos] if dev_labels else "")
+        dev_dd = ttk.Combobox(frame, textvariable=dev_var,
+                              values=dev_labels, state="readonly",
+                              font=("Segoe UI", 10))
+        dev_dd.pack(fill="x", padx=14, pady=(0, 10))
+        def on_dev_change(event=None):
+            try:
+                idx = dev_indices[dev_labels.index(dev_var.get())]
+            except ValueError:
+                return
+            self.app.config["input_device_index"] = idx
+            self._save()
+            self._notice(f"Input device: {dev_var.get()}", "ok")
+        dev_dd.bind("<<ComboboxSelected>>", on_dev_change)
+
+        self._section_label(frame, "Recording source").pack(
+            anchor="w", padx=14, pady=(10, 4))
+        src_var = tk.StringVar(
+            value=self.app.config.get("recording_source", "microphone"))
+        def on_src_change():
+            self.app.config["recording_source"] = src_var.get()
+            self._save()
+            self._notice(f"Recording source: {src_var.get()}", "ok")
+        for label, val in [
+            ("Microphone only", "microphone"),
+            ("System audio only  (WASAPI loopback)", "stereo_mix"),
+            ("Microphone + system audio  (both)", "both"),
+        ]:
+            self._radio(frame, label, src_var, val, on_src_change).pack(
+                anchor="w", padx=22)
+
+        self._section_label(frame, "Audio feedback").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        beep_var = tk.BooleanVar(
+            value=bool(self.app.config.get("play_sound", True)))
+        def on_beep_change():
+            self.app.config["play_sound"] = bool(beep_var.get())
+            self._save()
+            self._notice(
+                f"Beep on start/stop: {'ON' if beep_var.get() else 'OFF'}", "ok")
+        self._checkbox(frame,
+            "Play a short beep on record start and stop",
+            beep_var, on_beep_change).pack(anchor="w", padx=22)
+
+        return frame
+
+    # ----- Tab 8: About -----
+
+    def _build_about_tab(self, parent):
+        import tkinter as tk
+        frame = tk.Frame(parent, bg=self.BG)
+
+        self._section_label(frame, "WhisperType").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        tk.Label(frame,
+            text=f"Personal fork  •  Version {self.APP_VERSION}",
+            font=("Segoe UI", 10),
+            fg=self.TEXT, bg=self.BG).pack(anchor="w", padx=14)
+
+        def info_row(label, value):
+            row = tk.Frame(frame, bg=self.BG)
+            row.pack(fill="x", padx=14, pady=(8, 2))
+            tk.Label(row, text=label,
+                     font=("Segoe UI", 10, "bold"),
+                     fg=self.SUBDUED, bg=self.BG,
+                     width=14, anchor="w").pack(side="left")
+            entry = tk.Entry(row,
+                             font=("Consolas", 10),
+                             bg=self.INPUT_BG, fg=self.TEXT,
+                             insertbackground=self.TEXT,
+                             relief="flat", bd=4,
+                             readonlybackground=self.INPUT_BG)
+            entry.insert(0, value)
+            entry.config(state="readonly")
+            entry.pack(side="left", fill="x", expand=True)
+            return row
+
+        info_row("Fork:", self.FORK_URL)
+        info_row("Upstream:", self.UPSTREAM_URL)
+        info_row("Config:", CONFIG_FILE)
+        log_file = os.path.join(CONFIG_DIR, "whispertype.log")
+        info_row("Log:", log_file)
+
+        btn_row = tk.Frame(frame, bg=self.BG)
+        btn_row.pack(fill="x", padx=14, pady=(10, 4))
+        def open_folder():
+            try:
+                os.startfile(CONFIG_DIR)
+            except Exception as e:
+                self._notice(f"Could not open folder: {e}", "err")
+        self._make_btn(btn_row, "Open WhisperType folder",
+                       open_folder).pack(side="left")
+
+        self._section_label(frame, "License").pack(
+            anchor="w", padx=14, pady=(20, 4))
+        tk.Label(frame,
+            text=("MIT License. See LICENSE in the repository root. "
+                  "Upstream copyright remains with the original author "
+                  "(Danaor)."),
+            font=("Segoe UI", 9),
+            fg=self.SUBDUED, bg=self.BG,
+            wraplength=720, anchor="w", justify="left").pack(
+            anchor="w", padx=14)
+
+        return frame
+
+
+# ============================================================
 # System Tray Application
 # ============================================================
 class WhisperTypeApp:
@@ -4720,6 +5498,7 @@ class WhisperTypeApp:
             self._llm_cleaner = GroqLLMCleaner(
                 api_key=self.config["groq_api_key"],
                 model=self.config.get("cleanup_llm_model", "llama-3.3-70b-versatile"),
+                prompt_overrides=self.config.get("cleanup_prompts_override", {}),
             )
 
         # Pick primary transcriber based on backend setting
@@ -4810,6 +5589,10 @@ class WhisperTypeApp:
             pystray.MenuItem(
                 "Model",
                 pystray.Menu(self._build_model_menu),
+            ),
+            pystray.MenuItem(
+                "Settings...",
+                lambda: self._open_settings_window(),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
@@ -7573,6 +8356,22 @@ class WhisperTypeApp:
 
         threading.Thread(target=finalise, daemon=True).start()
 
+    def _open_settings_window(self):
+        """Open the tabbed Settings window in a daemon thread.
+
+        Reuses the existing dialogs for hotkey, API keys, and the
+        underlying vocabulary path so the Settings UI does not duplicate
+        battle-tested logic. Daemon thread keeps the pystray main loop
+        responsive while the window is open.
+        """
+        def runner():
+            try:
+                win = SettingsWindow(self)
+                win.show()
+            except Exception as e:
+                log.exception("SettingsWindow crashed: %s", e)
+        threading.Thread(target=runner, daemon=True).start()
+
     def _open_hotkey_dialog(self):
         """Dialog to change the main press-to-talk hotkey.
 
@@ -8200,6 +8999,7 @@ class WhisperTypeApp:
                     self._llm_cleaner = GroqLLMCleaner(
                         api_key=new_key,
                         model=self.config.get("cleanup_llm_model", "llama-3.3-70b-versatile"),
+                        prompt_overrides=self.config.get("cleanup_prompts_override", {}),
                     )
                     log.info("Groq API key saved & activated (transcribe + cleanup)")
                     status_label.config(text="Key valid. Switched to Groq Cloud.", fg="#a6e3a1")
