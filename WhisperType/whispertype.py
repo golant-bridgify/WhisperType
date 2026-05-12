@@ -148,6 +148,11 @@ DEFAULT_CONFIG = {
     # Cleanup tab in the Settings window. A missing key falls back to
     # the built-in STYLE_PROMPTS entry.
     "cleanup_prompts_override": {},
+    # Top commit SHA on Danaor/WhisperType master that the user has
+    # explicitly marked as seen via Settings, About, Check for upstream
+    # updates. Empty string means "never checked"; the first check will
+    # show all returned commits as if they were new.
+    "last_seen_upstream_sha": "",
     # Clipboard auto-restore: after pasting transcribed text, put back
     # whatever was in the clipboard before the paste (~2s delay). Stops
     # WhisperType from silently clobbering the user's 'copy' whenever they
@@ -5313,6 +5318,163 @@ class SettingsWindow:
 
     # ----- Tab 8: About -----
 
+    # ----- Update check (queries Danaor/WhisperType via GitHub API) -----
+
+    def _after_main(self, fn):
+        """Schedule fn on the Tk main thread of the settings window."""
+        if self._root is None:
+            return
+        try:
+            self._root.after(0, fn)
+        except Exception:
+            pass
+
+    def _check_for_updates(self):
+        """Query GitHub for upstream commits, compare to last_seen_upstream_sha.
+
+        Runs the HTTP call off the Tk thread to keep the UI responsive.
+        Anonymous GitHub API: 60 requests per hour per IP, no auth needed
+        for public repos. Rate-limit responses surface as a status notice.
+        """
+        import threading
+        self._notice("Checking Danaor/WhisperType for new commits...", "ok")
+
+        def worker():
+            try:
+                import requests
+                url = ("https://api.github.com/repos/Danaor/WhisperType/"
+                       "commits?per_page=10")
+                resp = requests.get(url, timeout=10, headers={
+                    "User-Agent": "WhisperType-Golan",
+                    "Accept": "application/vnd.github+json",
+                })
+            except Exception as e:
+                self._after_main(
+                    lambda: self._notice(f"Update check failed: {e}", "err"))
+                return
+            if resp.status_code == 403:
+                self._after_main(lambda: self._notice(
+                    "GitHub rate limit hit (60/hour, anonymous). Try later.",
+                    "warn"))
+                return
+            if resp.status_code != 200:
+                self._after_main(lambda: self._notice(
+                    f"Update check failed: HTTP {resp.status_code}", "err"))
+                return
+            try:
+                commits = resp.json()
+            except Exception as e:
+                self._after_main(lambda: self._notice(
+                    f"Could not parse response: {e}", "err"))
+                return
+            if not commits:
+                self._after_main(lambda: self._notice(
+                    "No commits returned by GitHub.", "warn"))
+                return
+
+            top_sha = commits[0].get("sha", "") or ""
+            last_seen = self.app.config.get("last_seen_upstream_sha", "") or ""
+
+            if last_seen and top_sha == last_seen:
+                self._after_main(
+                    lambda: self._notice("Up to date with upstream.", "ok"))
+                return
+
+            # Slice the list to commits newer than last_seen.
+            # If last_seen is empty (first check), show all returned commits.
+            new_commits = []
+            for c in commits:
+                if c.get("sha", "") == last_seen:
+                    break
+                new_commits.append(c)
+
+            real_update = bool(last_seen)
+            self._after_main(
+                lambda: self._show_updates_popup(
+                    new_commits or commits, real_update))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_updates_popup(self, commits, real_update):
+        """Modal-ish Toplevel listing upstream commits with Mark/Browser/Close."""
+        import tkinter as tk
+        import webbrowser
+
+        win = tk.Toplevel(self._root)
+        _apply_dpi_scaling_to_tk(win)
+        win.title("Upstream commits  -  Danaor/WhisperType")
+        win.configure(bg=self.BG)
+
+        W, H = 720, 500
+        x = (win.winfo_screenwidth() - W) // 2
+        y = (win.winfo_screenheight() - H) // 2
+        win.geometry(f"{W}x{H}+{x}+{y}")
+
+        header = ("New upstream commits since your last 'Mark as seen':"
+                  if real_update
+                  else "Latest upstream commits (first check on this install):")
+        tk.Label(win, text=header,
+                 font=("Segoe UI", 11, "bold"),
+                 fg=self.TEXT, bg=self.BG,
+                 wraplength=W - 30, justify="left", anchor="w").pack(
+            anchor="w", padx=14, pady=(12, 6))
+
+        text_frame = tk.Frame(win, bg=self.BG)
+        text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        txt = tk.Text(text_frame,
+            font=("Consolas", 10), bg=self.INPUT_BG, fg=self.TEXT,
+            insertbackground=self.TEXT, relief="flat", bd=5, wrap="word")
+        txt.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(text_frame, command=txt.yview)
+        scroll.pack(side="right", fill="y")
+        txt.config(yscrollcommand=scroll.set)
+
+        for c in commits:
+            sha = (c.get("sha", "") or "")[:7]
+            date = (c.get("commit", {}).get("author", {}).get("date", "")
+                     or "")[:10]
+            author = c.get("commit", {}).get("author", {}).get("name", "") or ""
+            msg = (c.get("commit", {}).get("message", "") or "").split("\n")[0]
+            txt.insert("end", f"{sha}  {date}  {author}\n  {msg}\n\n")
+        txt.config(state="disabled")
+
+        top_sha = (commits[0].get("sha", "") or "") if commits else ""
+
+        def mark_seen():
+            self.app.config["last_seen_upstream_sha"] = top_sha
+            self._save()
+            self._notice(f"Marked as seen up to {top_sha[:7]}.", "ok")
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def open_in_browser():
+            last_seen = (self.app.config.get("last_seen_upstream_sha", "")
+                          or "")
+            if last_seen and last_seen != top_sha:
+                url = (f"https://github.com/Danaor/WhisperType/compare/"
+                       f"{last_seen[:12]}...{top_sha[:12]}")
+            else:
+                url = "https://github.com/Danaor/WhisperType/commits/master"
+            try:
+                webbrowser.open(url)
+            except Exception as e:
+                self._notice(f"Could not open browser: {e}", "err")
+
+        btn_row = tk.Frame(win, bg=self.BG)
+        btn_row.pack(fill="x", padx=14, pady=(0, 12))
+        self._make_btn(btn_row, "Mark as seen", mark_seen,
+                       self.OK_GREEN, self.OK_HOVER).pack(side="left")
+        self._make_btn(btn_row, "Open in browser",
+                       open_in_browser).pack(side="left", padx=(8, 0))
+        self._make_btn(btn_row, "Close", win.destroy,
+                       self.ERR, self.ERR_HOVER).pack(side="right")
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.transient(self._root)
+
     def _build_about_tab(self, parent):
         import tkinter as tk
         frame = tk.Frame(parent, bg=self.BG)
@@ -5357,6 +5519,8 @@ class SettingsWindow:
                 self._notice(f"Could not open folder: {e}", "err")
         self._make_btn(btn_row, "Open WhisperType folder",
                        open_folder).pack(side="left")
+        self._make_btn(btn_row, "Check for upstream updates",
+                       self._check_for_updates).pack(side="left", padx=(8, 0))
 
         self._section_label(frame, "License").pack(
             anchor="w", padx=14, pady=(20, 4))

@@ -7,7 +7,7 @@ datas += collect_data_files('ctranslate2')
 
 
 a = Analysis(
-    ['C:\\Users\\Naor\\Downloads\\WhisperType\\WhisperType\\whispertype.py'],
+    ['C:\\Users\\agas\\Projects\\WhisperType-Golan\\WhisperType\\whispertype.py'],
     pathex=[],
     binaries=[],
     datas=datas,
@@ -41,5 +41,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
-    icon=['C:\\Users\\Naor\\Downloads\\WhisperType\\WhisperType\\whispertype.ico'],
+    icon=['C:\\Users\\agas\\Projects\\WhisperType-Golan\\WhisperType\\whispertype.ico'],
 )
