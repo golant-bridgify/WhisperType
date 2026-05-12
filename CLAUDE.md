@@ -1,3 +1,76 @@
+# Golan's Personal Fork
+
+This is a personal fork of [Danaor/WhisperType](https://github.com/Danaor/WhisperType),
+customised for Golan Thomas (Chief Product, Digital, and AI Officer at Bridgify)
+and his bilingual Hebrew/English dictation workflow.
+
+- **Fork (origin):** https://github.com/golant-bridgify/WhisperType
+- **Upstream:** https://github.com/Danaor/WhisperType
+- **Customisations branch:** `golan-customizations`
+- **Upstream sync workflow:** see [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md)
+
+## Customisations on top of upstream
+
+1. **Default hotkey: `ctrl+alt+space`** (was `ctrl+space`). The upstream default
+   collides with IDE autocomplete on VS Code, Cursor, IntelliJ, and with Hebrew
+   keyboard layout switchers on Windows.
+2. **Default custom vocabulary** populated with Bridgify product terms (Bridgify,
+   B2B2C, Merchant API, white-label, partner brand, cashback, gift cards), the
+   working stack (Next.js, Django, Postgres, Azure), partner brand names
+   (Lametayel, Tiuli), and family names (Gal, Mila, Emma, Dylan, Golan).
+3. **`email` cleanup prompt rewritten** to enforce Golan's writing rules:
+   never use em dashes (U+2014), never use emojis, plain English over
+   corporate jargon, preserve content and intent, warm and direct tone.
+4. **New `whatsapp` cleanup style** for informal messaging. Surfaced in the
+   tray menu under Options, AI Cleanup. Informal and conversational, fragments
+   are fine, no em dashes, no emojis unless the source had them.
+5. **`cleanup_style` persists across launches.** The upstream force-reset on
+   startup is removed. New-install default flipped from `off` to `email`.
+
+## Settings window (additive)
+
+A new top-level tray entry `Settings...` opens a `ttk.Notebook` with eight tabs:
+General, Models, API Keys, AI Cleanup, Vocabulary, Snippets (placeholder), Audio,
+About. The existing tray menu stays fully functional. API key and hotkey edits
+delegate to the existing dialogs so verified-against-the-live-API flows are
+preserved.
+
+The AI Cleanup tab adds **per-style prompt overrides** stored under
+`cleanup_prompts_override` in `config.json`. Overrides take precedence over the
+built-in `GroqLLMCleaner.STYLE_PROMPTS` at runtime. Reset clears the override.
+
+## Writing style for future Claude Code sessions
+
+These rules apply to anything Claude generates for Golan — commit messages, doc
+edits, AI cleanup prompts, code comments, in-chat replies.
+
+- **Never use em dashes** (U+2014). Use commas or periods.
+- **Minimise standard hyphens** as sentence connectors.
+- **Never use emojis** unless Golan asks, or they were in source input being preserved.
+- **Plain English over jargon.** Avoid buzzwords like synergy, leverage,
+  ecosystem, robust, seamless, holistic, paradigm, streamline.
+- **Professional but down to earth.** Warm, clear, direct.
+- **Explain the why and what,** not low-level implementation narration.
+
+The same rules are encoded in the `email` and `whatsapp` cleanup prompts in
+`whispertype.py` so the LLM applies them to dictation output too.
+
+## Working with this fork
+
+- All changes live on the `golan-customizations` branch.
+- **Never push to `upstream`.** It is the read-only Danaor remote.
+- Pull upstream updates via [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
+- Tests live in `WhisperType/run_tests.py`. Run with
+  `PYTHONIOENCODING=utf-8 python run_tests.py`. Expect 34/34 with a Groq key
+  configured. Without one, section 6 (LIVE Groq) fails by design.
+- Build the standalone exe via `python WhisperType/build.py`.
+
+The section below is the upstream author's project documentation. Treat it as
+read-only history. Where it conflicts with the customisations above, the
+customisations are authoritative.
+
+---
+
 # WhisperType — Development Context
 
 ## Project Overview

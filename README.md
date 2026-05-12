@@ -1,5 +1,14 @@
 # WhisperType
 
+> **Personal fork of [Danaor/WhisperType](https://github.com/Danaor/WhisperType).**
+> Customisations on the `golan-customizations` branch: default hotkey
+> `ctrl+alt+space`, Bridgify-tuned custom vocabulary, rewritten `email` cleanup
+> prompt (no em dashes, no emojis, plain English), new `whatsapp` cleanup style,
+> persisted `cleanup_style` across launches, and a tabbed Settings window
+> (General, Models, API Keys, AI Cleanup, Vocabulary, Snippets, Audio, About).
+> See [CLAUDE.md](CLAUDE.md) for the full list and
+> [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) for the upstream merge workflow.
+
 > **Push-to-talk speech-to-text for Windows. Local or cloud, Hebrew-first, zero friction.**
 
 Hold a hotkey, speak, release — your words appear wherever your cursor is. Works fully offline with local Whisper, or lightning-fast via Groq Cloud. No subscription, no telemetry, no catch.
