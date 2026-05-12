@@ -2870,6 +2870,24 @@ class GroqLLMCleaner:
             "- Remove filler words.\n"
             "- Keep the same language."
         ),
+        "whatsapp": (
+            "- Informal and conversational, as if speaking to friends "
+            "or family.\n"
+            "- Match the input language (Hebrew or English). Do NOT "
+            "translate.\n"
+            "- Short, readable. Sentence fragments are fine.\n"
+            "- Fix typos and obvious mis-hearings.\n"
+            "- Do NOT over-correct slang or casual phrasing. Keep "
+            "informal constructions, contractions, and casual vocabulary "
+            "as the speaker said them.\n"
+            "- NEVER use em dashes (the character U+2014). Replace any "
+            "with a comma or a period.\n"
+            "- NEVER use emojis unless they were already in the source "
+            "input. If the source had emojis, preserve them as-is.\n"
+            "- Aim for the tone of a real WhatsApp message, not a "
+            "polished email. Casual, direct, easy to read on a phone "
+            "screen."
+        ),
     }
 
     def __init__(self, api_key, model="llama-3.3-70b-versatile"):
@@ -2992,6 +3010,7 @@ class GroqLLMCleaner:
                 "proofread": 0.80,   # grammar+punctuation: keep content words
                 "code":      0.80,
                 "email":     0.55,   # email polish: permits real filler removal
+                "whatsapp":  0.55,   # informal: fragments allowed, similar floor to email
             }
             min_ratio = MIN_RATIOS.get(style, 0.55)
             min_len = max(3, int(len(payload_text) * min_ratio))
@@ -7405,6 +7424,7 @@ class WhisperTypeApp:
         ("Casual ⭐ — fillers, typos, basic grammar", "casual"),
         ("Proofread — full spelling + grammar polish", "proofread"),
         ("Email polish — email-ready prose", "email"),
+        ("WhatsApp — informal, fragments OK", "whatsapp"),
         ("Technical/Code — preserve tech terms", "code"),
     ]
 

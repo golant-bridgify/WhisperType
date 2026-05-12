@@ -503,6 +503,27 @@ _test("cleaner: email style produces no em dashes across 3 samples",
       t_cleaner_email_no_em_dashes)
 
 
+def t_cleaner_whatsapp_style_recognised():
+    """The 'whatsapp' style must be in STYLE_PROMPTS and produce non-empty
+    cleaned output (proves the prompt was applied, not silently bypassed)."""
+    import whispertype as w
+    assert "whatsapp" in w.GroqLLMCleaner.STYLE_PROMPTS, \
+        "whatsapp style missing from GroqLLMCleaner.STYLE_PROMPTS"
+
+    cl = _cleaner()
+    raw = ("yo so I am thinking maybe we should grab dinner tomorrow "
+           "what do you think")
+    out = cl.clean(raw, style="whatsapp")
+    assert out and out.strip(), \
+        f"whatsapp cleanup returned empty output: {out!r}"
+    assert "—" not in out, \
+        f"whatsapp must not produce em dashes: {out!r}"
+
+
+_test("cleaner: whatsapp style is recognised and applied",
+      t_cleaner_whatsapp_style_recognised)
+
+
 # ============================================================
 # 7. MeetingSession end-to-end
 # ============================================================
