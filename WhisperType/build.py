@@ -25,8 +25,12 @@ PyInstaller.__main__.run([
     # Collect all data files for faster-whisper / ctranslate2
     "--collect-data", "faster_whisper",
     "--collect-data", "ctranslate2",
-    # UAC: request admin (needed for global hotkeys)
-    "--uac-admin",
+    # NOTE: --uac-admin removed deliberately. We rely on the WhisperType
+    # Scheduled Task (/rl HIGHEST) to provide admin elevation when launched
+    # from the desktop shortcut / launch.bat. Combining --uac-admin with
+    # a /rl HIGHEST task caused Windows to silently refuse the launch.
+    # Direct double-click on this exe will run non-admin; global hotkeys
+    # need admin, so always launch via the desktop shortcut or the task.
     # Clean build
     "--clean",
     # Output directory
