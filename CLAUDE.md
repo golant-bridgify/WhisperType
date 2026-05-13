@@ -63,7 +63,35 @@ The same rules are encoded in the `email` and `whatsapp` cleanup prompts in
 - Tests live in `WhisperType/run_tests.py`. Run with
   `PYTHONIOENCODING=utf-8 python run_tests.py`. Expect 34/34 with a Groq key
   configured. Without one, section 6 (LIVE Groq) fails by design.
-- Build the standalone exe via `python WhisperType/build.py`.
+- Build the standalone exe via `python WhisperType/build.py`. The PyInstaller
+  bundle lands at `WhisperType/dist/WhisperType.exe`.
+
+## Scheduled Task target — important fork-specific gotcha
+
+The WhisperType Scheduled Task on Golan's machine must point at the
+**PyInstaller-built `dist\WhisperType.exe`**, not at the upstream-default
+`WhisperType\WhisperType.exe` (which is a pythonw.exe launcher running the
+`.py` source).
+
+**Why:** the pythonw.exe path crashes silently in Golan's environment
+shortly after the "Cannot load the vocabulary from the model directory"
+warning. pythonw.exe has no stdio streams; a secondary error during the
+local-model-fail path kills the process invisibly. python.exe (console
+attached) survives the same path fine, which is why running
+`python whispertype.py` works on the same machine. The PyInstaller exe
+bundles its own Python with proper stdio handles, so it also survives.
+
+**How to apply:**
+
+- After rebuilding the exe (`python WhisperType\build.py`), the task already
+  points at the dist path. No re-registration needed.
+- If a sync from upstream changes `install_no_uac.bat` and you re-run it,
+  it will set the wrong task target. Run
+  `WhisperType\fix_task_use_pyinstaller.bat` as administrator afterward to
+  switch the task back to `dist\WhisperType.exe`.
+- The desktop shortcut points at `launch.bat` which calls
+  `schtasks /run /tn WhisperType`. It does not care which exe the task
+  invokes, so the shortcut keeps working unchanged after any task fix.
 
 The section below is the upstream author's project documentation. Treat it as
 read-only history. Where it conflicts with the customisations above, the
